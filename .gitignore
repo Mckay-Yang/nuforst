@@ -1,6 +1,9 @@
 .idea/
 .DS_Store
 .vscode/
+.continue/
+*/__pycache__/
+*.pyc
 target/
 Cargo.lock
 data/
