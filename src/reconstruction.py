@@ -1,6 +1,6 @@
 import os
 import time
-from typing import Tuple, Sequence, cast
+from typing import Tuple, Sequence, cast, Optional
 import numpy as np
 
 try:
