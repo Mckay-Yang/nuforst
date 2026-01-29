@@ -30,7 +30,7 @@ class Args:
     output_path: str
 
 
-def build_args() -> Args:
+def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
     ap.add_argument("-i", "--image", help="path to input multi-band time-series GeoTIFF", type=str,
                     default="drive/MyDrive/test_cube_0.1_degree/cube_test_B2_0.1.tif")
@@ -71,9 +71,29 @@ def build_args() -> Args:
     ap.add_argument("--output-path", type=str, default="./recon.tif",
                     help="output GeoTIFF path for reconstructed image")
 
+    return ap
+
+
+def build_args() -> Args:
+    ap = build_arg_parser()
     # FIX 2: Removed [] to allow command line arguments
     args = ap.parse_args()
 
     if args.target_time is None:
         args.target_time = args.start_time
     return Args(**vars(args))
+
+
+def build_args_from_dict(overrides: Optional[dict] = None) -> Args:
+    """Build Args using default parser values and override with a dict.
+
+    This is useful for notebook usage without command-line parsing.
+    """
+    ap = build_arg_parser()
+    defaults = ap.parse_args([])
+    payload = vars(defaults)
+    if overrides:
+        payload.update(overrides)
+    if payload.get("target_time") is None:
+        payload["target_time"] = payload.get("start_time")
+    return Args(**payload)

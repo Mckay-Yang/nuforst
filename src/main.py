@@ -2,14 +2,12 @@ import rasterio
 from pathlib import Path
 from typing import Optional, cast
 import numpy as np
-from .config import build_args
+from .config import build_args, Args
 from .data_loader import RSCube
 from .reconstruction import revive
 
 
-def main():
-    args = build_args()
-
+def run_reconstruction(args: Args) -> Path:
     print(f"[System] Input Image: {args.image}")
 
     try:
@@ -18,7 +16,7 @@ def main():
     except FileNotFoundError as e:
         print(f"\n[Error] {e}")
         print("Please check the --image path.")
-        return
+        raise
 
     cube = cast(np.ndarray, cube_data["cube"])
     timestamps = cast(np.ndarray, cube_data["timestamps"])
@@ -54,6 +52,13 @@ def main():
     ) as dst:
         dst.write(recon, 1)
     print(f"[Success] Saved to: {output_path}")
+    return output_path
+
+
+def main():
+    args = build_args()
+
+    run_reconstruction(args)
 
 if __name__ == "__main__":
     main()
