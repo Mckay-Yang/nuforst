@@ -4,6 +4,12 @@ from datetime import datetime
 import numpy as np
 
 try:
+    import pandas as pd
+    PANDAS_AVAILABLE = True
+except ImportError:
+    PANDAS_AVAILABLE = False
+
+try:
     import finufft  # type: ignore
 except ModuleNotFoundError:
     raise ModuleNotFoundError("finufft is required. Install with: pip install finufft")
@@ -13,7 +19,15 @@ def _to_seconds_since_start(ts_utc: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(ts_utc - t0, dtype=np.float64)
 
 def _parse_timestamp_str(ts: str) -> Optional[datetime]:
-    ts = ts.strip()
+    if PANDAS_AVAILABLE:
+        try:
+            # 优先使用 pandas 解析，并统一转为 UTC，这与 bak/revive_test.py 逻辑一致
+            dt = pd.to_datetime(ts, utc=True)
+            return dt.to_pydatetime()
+        except Exception:
+            pass
+
+    ts = str(ts).strip()
     fmts = (
         "%Y-%m-%dT%H:%M:%S",
         "%Y-%m-%d %H:%M:%S",
@@ -106,9 +120,11 @@ def huber_weights(r: np.ndarray, delta: float) -> np.ndarray:
     return w
 
 def _safe_lstsq(X: np.ndarray, y: np.ndarray, rcond: Optional[float] = None) -> np.ndarray:
+    """更稳健的 lstsq：失败则小抖动回退；再失败提升 ridge。"""
     try:
         return np.linalg.lstsq(X, y, rcond=rcond)[0]
     except Exception:
+        # 加一个小的对角抖动
         try:
             eps = 1e-8
             p = X.shape[1]
@@ -118,6 +134,7 @@ def _safe_lstsq(X: np.ndarray, y: np.ndarray, rcond: Optional[float] = None) -> 
                 rcond=None
             )[0]
         except Exception:
+            # 再失败就进一步增大 ridge
             eps2 = 1e-4
             p = X.shape[1]
             return np.linalg.lstsq(

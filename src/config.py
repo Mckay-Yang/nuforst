@@ -5,29 +5,29 @@ from typing import Optional
 
 @dataclass
 class Args:
-    image: str
-    cache_dir: str
-    force_refresh: bool
-    start_time: str
-    end_time: str
-    target_time: str
-    time_unit: str
-    modes: int
-    eps: float
-    num_peaks: int
-    power_cum: float
-    ignore_dc_hz: float
-    refine_peaks: bool
-    include_trend: bool
-    ridge: float
-    freq_weight: float
-    huber_iters: int
-    huber_delta: float
-    min_obs: int
-    n_jobs: int
-    show_progress: bool
-    progress_every: int
-    output_path: str
+    image: str = ""
+    cache_dir: str = "./cache"
+    force_refresh: bool = False
+    start_time: str = "2015-01-01T00:00:00"
+    end_time: str = "2024-01-01T00:00:00"
+    target_time: Optional[str] = None
+    time_unit: str = "seconds"
+    modes: int = 4096
+    eps: float = 1e-12
+    num_peaks: int = 8
+    power_cum: float = 0.7
+    ignore_dc_hz: float = 1e-6
+    refine_peaks: bool = True
+    include_trend: bool = True
+    ridge: float = 1e-2
+    freq_weight: float = 2.0
+    huber_iters: int = 3
+    huber_delta: float = 1.5
+    min_obs: int = 12
+    n_jobs: int = -1
+    show_progress: bool = True
+    progress_every: int = 50
+    output_path: str = "./recon.tif"
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -74,26 +74,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return ap
 
 
-def build_args() -> Args:
+def build_args(overrides: Optional[dict] = None) -> Args:
+    """解析命令行参数或从字典构建参数对象"""
+    if overrides is not None:
+        # 从默认值开始，应用 overrides
+        args_obj = Args()
+        for k, v in overrides.items():
+            if hasattr(args_obj, k):
+                setattr(args_obj, k, v)
+        if args_obj.target_time is None:
+            args_obj.target_time = args_obj.start_time
+        return args_obj
+
+    # 命令行模式
     ap = build_arg_parser()
-    # FIX 2: Removed [] to allow command line arguments
-    args = ap.parse_args()
-
-    if args.target_time is None:
-        args.target_time = args.start_time
-    return Args(**vars(args))
-
-
-def build_args_from_dict(overrides: Optional[dict] = None) -> Args:
-    """Build Args using default parser values and override with a dict.
-
-    This is useful for notebook usage without command-line parsing.
-    """
-    ap = build_arg_parser()
-    defaults = ap.parse_args([])
-    payload = vars(defaults)
-    if overrides:
-        payload.update(overrides)
-    if payload.get("target_time") is None:
-        payload["target_time"] = payload.get("start_time")
-    return Args(**payload)
+    parsed = ap.parse_args()
+    if parsed.target_time is None:
+        parsed.target_time = parsed.start_time
+    return Args(**vars(parsed))
