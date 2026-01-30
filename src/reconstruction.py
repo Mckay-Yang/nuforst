@@ -77,6 +77,19 @@ def revive(cube: np.ndarray, timestamps: np.ndarray, target_time: str, args: Opt
     # 并行执行
     assert Parallel is not None and delayed is not None
     try:
+        if args.show_progress and TQDM_AVAILABLE:
+            # 尝试使用 generator 模式配合 tqdm 显示进度
+            try:
+                results_gen = Parallel(n_jobs=n_jobs, prefer="processes", return_as="generator")(
+                    delayed(_predict_row)(i) for i in range(H)
+                )
+                for i, row in tqdm(results_gen, total=H, desc="Processing Rows"):
+                    out[i, :] = row
+                return out
+            except TypeError:
+                # 如果 joblib 版本太老不支持 return_as="generator"，回退到普通模式
+                pass
+
         results = Parallel(n_jobs=n_jobs, prefer="processes")(
             delayed(_predict_row)(i) for i in range(H)
         )
