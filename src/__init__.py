@@ -1,4 +1,6 @@
 from .reconstruction import revive
+from .zhu2015 import reconstruct_zhu2015
+from .hants import reconstruct_hants
 from .config import Args, build_args
 from .data_loader import RSCube
 from pathlib import Path
@@ -61,4 +63,4 @@ def reconstruct(
 
     return recon
 
-__all__ = ["reconstruct", "revive", "Args", "RSCube", "build_args"]
+__all__ = ["reconstruct", "reconstruct_zhu2015", "reconstruct_hants", "revive", "Args", "RSCube", "build_args"]
