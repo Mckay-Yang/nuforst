@@ -1,13 +1,89 @@
-.idea/
+# MacOS
 .DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.Spotlight-V100/
+.Trashes/
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# IDE/Editor
+.idea/
 .vscode/
-.continue/
+
+# Python: bytecode & caches
 */__pycache__/
 *.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Python: coverage
+.coverage
+coverage.xml
+htmlcov/
+
+# Python: virtual environments
+.venv/
+venv/
+env/
+conda_env/
+.conda/
+*.conda
+
+# Rust
 target/
 Cargo.lock
-data/
-database/
+**/*.rs.bk
+
+# C/C++: build outputs
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.obj
+*.exe
+*.out
+*.ilk
+*.pdb
+
+# C/C++: build directories
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+build/
+
+# Logs & temp files
+*.log
+*.tmp
+*.swp
+*.swo
+*.bak
+*~
+*.cache
+
+# Data Outputs
+data/*
+database/*
 bak/
+
+# Jupyter
+.ipynb_checkpoints
+
+# Project Specific
+cache/
+*.tif
+*.npz
+*.nc
 test.*
-*_test.*

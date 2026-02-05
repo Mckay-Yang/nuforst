@@ -4,7 +4,7 @@ from sklearn.linear_model import Lasso
 from typing import Tuple, Optional, Union
 from datetime import datetime
 from .data_loader import RSCube
-from .config import Args, build_args
+from config import Args, build_args
 import rasterio
 from pathlib import Path
 from tqdm import tqdm

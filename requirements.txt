@@ -1,7 +1,0 @@
-numpy
-rasterio
-finufft
-joblib
-tqdm
-pandas
-scikit-learn

@@ -2,7 +2,7 @@ import rasterio
 from pathlib import Path
 from typing import Optional, cast
 import numpy as np
-from .config import build_args, Args
+from config import build_args, Args
 from .data_loader import RSCube
 from .reconstruction import revive
 

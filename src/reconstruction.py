@@ -18,14 +18,14 @@ except ModuleNotFoundError:
     tqdm = None  # type: ignore
     TQDM_AVAILABLE = False
 
-from .config import Args
+from config import Args
 from .algorithms import timestamps_to_seconds, parse_timestamp_str, predict_single_pixel
 
 def revive(cube: np.ndarray, timestamps: np.ndarray, target_time: str, args: Optional[Args] = None, **kwargs) -> np.ndarray:
     """核心重建函数，支持直接传入参数或 Args 对象"""
     # 合并参数
     if args is None:
-        from .config import Args
+        from config import Args
         args = Args(**kwargs)
 
     t_sec = timestamps_to_seconds(timestamps, unit=args.time_unit)

@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 from typing import Tuple, Optional, Union, List
 from .data_loader import RSCube
-from .config import Args, build_args
+from config import Args, build_args
 import rasterio
 from pathlib import Path
 from tqdm import tqdm
