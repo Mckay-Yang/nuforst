@@ -20,6 +20,8 @@ class RSCube:
         self.meta: Dict[str, object] = {}
 
     def _file_signature(self) -> str:
+        if not self.tif_path.exists():
+            raise FileNotFoundError(f"Input image not found: {self.tif_path}")
         stat = self.tif_path.stat()
         payload = f"{self.tif_path.resolve()}:{stat.st_size}:{stat.st_mtime}"
         return hashlib.md5(payload.encode("utf-8")).hexdigest()[:12]
