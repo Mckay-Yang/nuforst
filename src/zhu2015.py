@@ -4,6 +4,7 @@ from sklearn.linear_model import Lasso
 from typing import Tuple, Optional, Union
 from datetime import datetime
 from .data_loader import RSCube
+from .algorithms import timestamps_to_seconds
 from config import Args, build_args
 import rasterio
 from pathlib import Path
@@ -133,8 +134,9 @@ def reconstruct_zhu2015(
 
     # We need a reference time (t0) to convert everything to days relative to t0
     # Let's use the min timestamp in the cube as t0
-    t0_sec = np.min(timestamps)
-    t_days = (timestamps - t0_sec) / 86400.0
+    timestamps_sec = timestamps_to_seconds(timestamps)
+    t0_sec = np.min(timestamps_sec)
+    t_days = (timestamps_sec - t0_sec) / 86400.0
 
     target_ts_sec = dt_target.timestamp()
     target_t_day = (target_ts_sec - t0_sec) / 86400.0

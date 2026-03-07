@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 from typing import Tuple, Optional, Union, List
 from .data_loader import RSCube
+from .algorithms import timestamps_to_seconds
 from config import Args, build_args
 import rasterio
 from pathlib import Path
@@ -187,8 +188,9 @@ def reconstruct_hants(
     except:
         dt_target = pd.to_datetime(target_time)
 
-    t0_sec = np.min(timestamps)
-    t_days = (timestamps - t0_sec) / 86400.0
+    timestamps_sec = timestamps_to_seconds(timestamps)
+    t0_sec = np.min(timestamps_sec)
+    t_days = (timestamps_sec - t0_sec) / 86400.0
 
     target_ts_sec = dt_target.timestamp()
     target_t_day = (target_ts_sec - t0_sec) / 86400.0
