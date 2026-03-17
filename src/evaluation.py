@@ -30,7 +30,7 @@ except ModuleNotFoundError:
     tqdm = None
     TQDM_AVAILABLE = False
 
-from .algorithms import timestamps_to_seconds, parse_timestamp_str, predict_single_pixel
+from .nufrost import timestamps_to_seconds, parse_timestamp_str, predict_single_pixel
 from .data_loader import RSCube
 from .hants import hants_pixel
 from .zhu2015 import fit_predict_pixel

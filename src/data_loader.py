@@ -1,21 +1,29 @@
+import os
 import hashlib
 import json
+import rasterio
+import numpy as np
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Tuple, Optional, List
-import numpy as np
-import rasterio
+from typing import Dict, Tuple, Optional
 
 class RSCube:
     """
     Handle spatiotemporal data cube from a multi-band GeoTIFF where each band is a timestamped slice.
     Data are cached as compressed npz to avoid repeatedly reading the large TIFF.
     """
-    def __init__(self, tif_path: str, cache_dir: str = "./cache", npz_path: Optional[str] = None, force_refresh: bool = False) -> None:
+    def __init__(
+            self,
+            tif_path: str,
+            cache_dir: Optional[str] = None,
+            force_refresh: bool = False
+        ) -> None:
         self.tif_path = Path(tif_path)
-        self.cache_dir = Path(cache_dir)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.npz_path = Path(npz_path) if npz_path else None
+        if cache_dir is None:
+            self.cache_dir = None
+        else:
+            self.cache_dir = Path(cache_dir)
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.force_refresh = force_refresh
         self.meta: Dict[str, object] = {}
 
@@ -27,8 +35,8 @@ class RSCube:
         return hashlib.md5(payload.encode("utf-8")).hexdigest()[:12]
 
     def _cache_path(self) -> Path:
-        if self.npz_path:
-            return self.npz_path
+        if not self.cache_dir.exists():
+            os.mkdir(self.cache_dir, exist_ok=True)
         stem = self.tif_path.stem
         return self.cache_dir / f"{stem}_{self._file_signature()}.npz"
 
