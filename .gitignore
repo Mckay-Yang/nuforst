@@ -87,3 +87,4 @@ cache/
 *.npz
 *.nc
 test.*
+.env
