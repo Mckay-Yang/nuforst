@@ -29,7 +29,7 @@ class Args:
     eps: float = 1e-12
     num_peaks: int = 8
     power_cum: float = 0.7
-    ignore_dc_hz: float = 1e-6
+    ignore_dc_hz: float = 1e-9
     refine_peaks: bool = True
     include_trend: bool = True
     ridge: float = 1e-2
@@ -71,7 +71,7 @@ def build_arg_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     ap.add_argument("--eps", type=float, default=d("eps", 1e-12))
     ap.add_argument("--num-peaks", type=int, default=d("num_peaks", 8))
     ap.add_argument("--power-cum", type=float, default=d("power_cum", 0.7))
-    ap.add_argument("--ignore-dc-hz", type=float, default=d("ignore_dc_hz", 1e-6))
+    ap.add_argument("--ignore-dc-hz", type=float, default=d("ignore_dc_hz", 1e-9))
 
     # Boolean flags handling
     # If default is True, we want a flag to disable it (store_false)

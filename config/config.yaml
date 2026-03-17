@@ -7,9 +7,9 @@ target_time: null
 time_unit: "seconds"
 modes: 4096
 eps: 1.0e-12
-num_peaks: 8
+num_peaks: 10
 power_cum: 0.7
-ignore_dc_hz: 1.0e-6
+ignore_dc_hz: 1.0e-9
 refine_peaks: true
 include_trend: true
 ridge: 0.01
