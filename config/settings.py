@@ -30,6 +30,11 @@ class Args:
     num_peaks: int = 8
     power_cum: float = 0.7
     ignore_dc_hz: float = 1e-9
+    frequency_selection: str = "hybrid"
+    preferred_periods_days: str = "365.25,182.625,91.3125,30.4375"
+    preferred_top_k: int = 4da ta q
+    spectral_top_k: int = 4
+    spectral_merge_tol: float = 0.15
     refine_peaks: bool = True
     include_trend: bool = True
     ridge: float = 1e-2
@@ -72,6 +77,14 @@ def build_arg_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     ap.add_argument("--num-peaks", type=int, default=d("num_peaks", 8))
     ap.add_argument("--power-cum", type=float, default=d("power_cum", 0.7))
     ap.add_argument("--ignore-dc-hz", type=float, default=d("ignore_dc_hz", 1e-9))
+    ap.add_argument("--frequency-selection", type=str, default=d("frequency_selection", "hybrid"),
+                    choices=("spectral", "preferred", "hybrid"))
+    ap.add_argument("--preferred-periods-days", type=str, default=d("preferred_periods_days", "365.25,182.625,91.3125,30.4375"),
+                    help="comma-separated preferred periods in days, e.g. annual/semiannual/seasonal/monthly")
+    ap.add_argument("--preferred-top-k", type=int, default=d("preferred_top_k", 4))
+    ap.add_argument("--spectral-top-k", type=int, default=d("spectral_top_k", 4))
+    ap.add_argument("--spectral-merge-tol", type=float, default=d("spectral_merge_tol", 0.15),
+                    help="relative tolerance for merging spectral peaks with preferred frequencies")
 
     # Boolean flags handling
     # If default is True, we want a flag to disable it (store_false)

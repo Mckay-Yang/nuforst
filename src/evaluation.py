@@ -177,7 +177,7 @@ def evaluate_timeseries_comprehensive(
     print(f"Image: {Path(image_path).name}")
     print(f"Simulating continuous gap: {simulate_gap_days} days")
     
-    loader = RSCube(image_path, cache_dir="./cache")
+    loader = RSCube(image_path, cache_dir=args.cache_dir)
     data = loader.load()
     cube = data["cube"]
     timestamps = data["timestamps"]
@@ -318,7 +318,7 @@ def evaluate_algorithms(
     print(f"Image: {Path(image_path).name}")
     print(f"Masking {num_points} random points across all space and time.")
     
-    loader = RSCube(image_path, cache_dir="./cache")
+    loader = RSCube(image_path, cache_dir=args.cache_dir)
     data = loader.load()
     cube = data["cube"]
     timestamps = data["timestamps"]
