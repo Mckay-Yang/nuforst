@@ -1,11 +1,10 @@
-import os
 import hashlib
 import json
 import rasterio
 import numpy as np
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, Union
 
 class RSCube:
     """
@@ -14,8 +13,8 @@ class RSCube:
     """
     def __init__(
             self,
-            tif_path: str,
-            cache_dir: Optional[str] = None,
+            tif_path: Union[str, Path],
+            cache_dir: Optional[Union[str, Path]] = None,
             force_refresh: bool = False
         ) -> None:
         self.tif_path = Path(tif_path)
@@ -35,9 +34,11 @@ class RSCube:
         return hashlib.md5(payload.encode("utf-8")).hexdigest()[:12]
 
     def _cache_path(self) -> Path:
-        if not self.cache_dir.exists():
-            os.mkdir(self.cache_dir, exist_ok=True)
+        if self.cache_dir is not None and not self.cache_dir.exists():
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
         stem = self.tif_path.stem
+        if self.cache_dir is None:
+            return self.tif_path.parent / f"{stem}_{self._file_signature()}.npz"
         return self.cache_dir / f"{stem}_{self._file_signature()}.npz"
 
     def _parse_band_timestamp(self, name: str) -> str:
@@ -100,3 +101,4 @@ class RSCube:
         cube, timestamps, band_names = self._read_tif()
         self._save_npz(cache_path, cube, timestamps, band_names)
         return {"cube": cube, "timestamps": timestamps, "band_names": band_names, **self.meta, "cache_path": str(cache_path)}
+

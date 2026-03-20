@@ -161,7 +161,7 @@ def _process_pixel_ts(r: int, c: int, y_ts: np.ndarray, t_days: np.ndarray, t_se
     }
 
 def evaluate_timeseries_comprehensive(
-    image_path: str,
+    image_path: Union[str, Path],
     args: Args,
     num_samples: int = 1000,
     simulate_gap_days: int = 60,
@@ -177,7 +177,7 @@ def evaluate_timeseries_comprehensive(
     print(f"Image: {Path(image_path).name}")
     print(f"Simulating continuous gap: {simulate_gap_days} days")
     
-    loader = RSCube(image_path, cache_dir="./cache")
+    loader = RSCube(image_path, cache_dir=args.cache_dir)
     data = loader.load()
     cube = data["cube"]
     timestamps = data["timestamps"]
@@ -285,8 +285,11 @@ def evaluate_timeseries_comprehensive(
     return df_results
 
 
-def _process_slice_pixel(r: int, c: int, y_ts: np.ndarray, t_sec: np.ndarray, t_days: np.ndarray, target_t_sec: float, target_t_day: float, args: Args) -> Dict:
-    """处理单一时间截面的单像素预测（用于并行计算）"""
+def _process_random_point(t_idx: int, r: int, c: int, y_ts: np.ndarray, t_sec: np.ndarray, t_days: np.ndarray, args: Args) -> Dict:
+    """处理单个随机三维点的预测"""
+    target_t_sec = t_sec[t_idx]
+    target_t_day = t_days[t_idx]
+
     pred_n, _ = predict_single_pixel(
         t_sec, y_ts, target_t_sec,
         nufft_modes=args.modes, eps=args.eps,
@@ -298,23 +301,24 @@ def _process_slice_pixel(r: int, c: int, y_ts: np.ndarray, t_sec: np.ndarray, t_
     pred_z, _ = fit_predict_pixel(t_days, y_ts, target_t_day, lasso_alpha=0.0001)
     pred_h = hants_pixel(t_days, y_ts, target_t_day, nof=3, sf='low', fet=0.05, dod=5)
     
-    return {"r": r, "c": c, "nufrost": pred_n, "zhu": pred_z, "hants": pred_h}
+    return {"t_idx": t_idx, "r": r, "c": c, "nufrost": pred_n, "zhu": pred_z, "hants": pred_h}
 
 
 def evaluate_algorithms(
-    image_path: str,
+    image_path: Union[str, Path],
     args: Args,
-    mask_type: str = "block",
-    mask_ratio: float = 0.3,
-    top_k_slices: int = 1,
+    num_points: int = 1000,
     n_jobs: int = -1
 ) -> pd.DataFrame:
     """
-    保留原有的单期评测方法，供对比参考 (支持并行)。
+    随机三维点评估方法 (支持并行)：
+    在整个时空数据集中随机选取一定数量的有效点进行敲除，然后利用剩余数据对这些点进行预测并评估。
     """
-    print(f"\n========== Starting Evaluation for {Path(image_path).name} ==========")
+    print(f"\n========== Starting 3D Random Points Evaluation ==========")
+    print(f"Image: {Path(image_path).name}")
+    print(f"Masking {num_points} random points across all space and time.")
     
-    loader = RSCube(image_path, cache_dir="./cache")
+    loader = RSCube(image_path, cache_dir=args.cache_dir)
     data = loader.load()
     cube = data["cube"]
     timestamps = data["timestamps"]
@@ -325,104 +329,97 @@ def evaluate_algorithms(
     t0_sec = np.min(t_sec)
     t_days = (t_sec - t0_sec) / 86400.0
     
-    nan_counts = np.sum(np.isnan(cube), axis=(1, 2))
-    best_indices = np.argsort(nan_counts)[:top_k_slices]
+    # 找到所有有效的非 nan 点
+    valid_mask = np.isfinite(cube)
+    
+    # 确保像元有足够的有效观测次数 (至少 args.min_obs + 1 次)，敲除一个点后还能拟合
+    valid_counts = np.sum(valid_mask, axis=0)
+    valid_pixels_mask = valid_counts >= max(args.min_obs + 1, 3)
+    
+    candidate_mask = valid_mask & np.broadcast_to(valid_pixels_mask[np.newaxis, :, :], (T, H, W))
+    candidate_indices = np.argwhere(candidate_mask)
+    
+    if len(candidate_indices) == 0:
+        print("Not enough valid points to evaluate.")
+        return pd.DataFrame()
+        
+    if len(candidate_indices) > num_points:
+        np.random.seed(42)
+        selected_idx = np.random.choice(len(candidate_indices), num_points, replace=False)
+        sampled_points = candidate_indices[selected_idx]
+    else:
+        sampled_points = candidate_indices
+
+    print(f"Selected {len(sampled_points)} valid points for evaluation.")
+    
+    corrupted_cube = cube.copy()
+    
+    for t_idx, r, c in sampled_points:
+        corrupted_cube[t_idx, r, c] = np.nan
+        
+    start_time = time.time()
     
     if n_jobs <= 0:
         n_jobs = max(1, int(os.cpu_count() or 1)) if cpu_count is None else max(1, int(cpu_count()))
     
-    results = []
+    print(f"--> Running predictions with {n_jobs} parallel workers...")
     
-    for idx in best_indices:
-        target_t_sec = t_sec[idx]
-        target_t_day = t_days[idx]
-        target_time_str = str(timestamps[idx])
-        
-        print(f"\n--> Evaluating on Slice {idx} (Time: {target_time_str}), Original NaNs: {nan_counts[idx]}")
-        
-        y_true_full = cube[idx, :, :].copy()
-        
-        if mask_type == "block":
-            mask = generate_block_mask((H, W), ratio=mask_ratio)
+    tasks = [
+        delayed(_process_random_point)(
+            t_idx, r, c, corrupted_cube[:, r, c].copy(), t_sec, t_days, args
+        )
+        for t_idx, r, c in sampled_points
+    ]
+    
+    point_results = []
+    if JOBLIB_AVAILABLE and n_jobs > 1:
+        if TQDM_AVAILABLE:
+            try:
+                gen = Parallel(n_jobs=n_jobs, return_as="generator")(tasks)
+                point_results = list(tqdm(gen, total=len(tasks), desc="Evaluating Points"))
+            except TypeError:
+                point_results = Parallel(n_jobs=n_jobs)(tasks)
         else:
-            mask = generate_random_mask((H, W), ratio=mask_ratio)
+            point_results = Parallel(n_jobs=n_jobs)(tasks)
+    else:
+        iterator = tasks
+        if TQDM_AVAILABLE:
+            iterator = tqdm(iterator, total=len(tasks), desc="Evaluating Points")
+        for t in iterator:
+            func, func_args, func_kwargs = t
+            point_results.append(func(*func_args, **func_kwargs))
             
-        mask = mask & np.isfinite(y_true_full)
-        mask_pixels_count = np.sum(mask)
-        print(f"--> Mask generated ({mask_type}). Masked pixels: {mask_pixels_count} ({(mask_pixels_count/(H*W))*100:.1f}%)")
+    print(f"--> Prediction finished in {time.time() - start_time:.2f}s.")
+    
+    true_all = []
+    pred_all_nufrost = []
+    pred_all_zhu = []
+    pred_all_hants = []
+    
+    for (t_idx, r, c), res in zip(sampled_points, point_results):
+        true_val = cube[t_idx, r, c]
+        true_all.append(true_val)
+        pred_all_nufrost.append(res["nufrost"])
+        pred_all_zhu.append(res["zhu"])
+        pred_all_hants.append(res["hants"])
         
-        corrupted_cube = cube.copy()
-        corrupted_cube[idx, mask] = np.nan
-        
-        mask_indices = np.where(mask)
-        y_pred_nufrost = np.full((H, W), np.nan, dtype=np.float32)
-        y_pred_zhu = np.full((H, W), np.nan, dtype=np.float32)
-        y_pred_hants = np.full((H, W), np.nan, dtype=np.float32)
-        
-        start_time = time.time()
-        
-        # 准备并行任务
-        print(f"--> Running predictions on masked pixels with {n_jobs} parallel workers...")
-        tasks = [
-            delayed(_process_slice_pixel)(
-                r, c, corrupted_cube[:, r, c].copy(), t_sec, t_days, target_t_sec, target_t_day, args
-            )
-            for r, c in zip(mask_indices[0], mask_indices[1])
-        ]
-        
-        slice_results = []
-        if JOBLIB_AVAILABLE and n_jobs > 1:
-            if TQDM_AVAILABLE:
-                try:
-                    gen = Parallel(n_jobs=n_jobs, return_as="generator")(tasks)
-                    slice_results = list(tqdm(gen, total=len(tasks), desc="Processing Mask"))
-                except TypeError:
-                    slice_results = Parallel(n_jobs=n_jobs)(tasks)
-            else:
-                slice_results = Parallel(n_jobs=n_jobs)(tasks)
-        else:
-            iterator = tasks
-            if TQDM_AVAILABLE:
-                iterator = tqdm(iterator, total=len(tasks), desc="Processing Mask")
-            for t in iterator:
-                # delayed() 返回一个 (func, args, kwargs) 的 tuple，可以直接调用
-                func, func_args, func_kwargs = t
-                slice_results.append(func(*func_args, **func_kwargs))
-                
-        # 填充结果矩阵
-        for res in slice_results:
-            r, c = res["r"], res["c"]
-            y_pred_nufrost[r, c] = res["nufrost"]
-            y_pred_zhu[r, c] = res["zhu"]
-            y_pred_hants[r, c] = res["hants"]
-            
-        print(f"--> Prediction finished in {time.time() - start_time:.2f}s.")
-        
-        metrics_nufrost = compute_metrics(y_true_full[mask], y_pred_nufrost[mask])
-        metrics_zhu = compute_metrics(y_true_full[mask], y_pred_zhu[mask])
-        metrics_hants = compute_metrics(y_true_full[mask], y_pred_hants[mask])
-        
-        if ssim is not None:
-            full_pred_nufrost = np.where(mask, y_pred_nufrost, y_true_full)
-            full_pred_zhu = np.where(mask, y_pred_zhu, y_true_full)
-            full_pred_hants = np.where(mask, y_pred_hants, y_true_full)
-            
-            metrics_nufrost["SSIM"] = compute_metrics(y_true_full, full_pred_nufrost).get("SSIM", np.nan)
-            metrics_zhu["SSIM"] = compute_metrics(y_true_full, full_pred_zhu).get("SSIM", np.nan)
-            metrics_hants["SSIM"] = compute_metrics(y_true_full, full_pred_hants).get("SSIM", np.nan)
-
-        for algo, m in zip(["NuFrost", "Zhu2015", "HANTS"], [metrics_nufrost, metrics_zhu, metrics_hants]):
-            results.append({
-                "Algorithm": algo,
-                "TimeSlice": target_time_str,
-                "RMSE": m["RMSE"],
-                "MAE": m["MAE"],
-                "R": m["R"],
-                "OutlierRatio": m.get("OutlierRatio", np.nan),
-                "SSIM": m.get("SSIM", np.nan)
-            })
-
+    true_all = np.array(true_all)
+    pred_all_nufrost = np.array(pred_all_nufrost)
+    pred_all_zhu = np.array(pred_all_zhu)
+    pred_all_hants = np.array(pred_all_hants)
+    
+    metrics_nufrost = compute_metrics(true_all, pred_all_nufrost)
+    metrics_zhu = compute_metrics(true_all, pred_all_zhu)
+    metrics_hants = compute_metrics(true_all, pred_all_hants)
+    
+    # 既然是散点，计算 SSIM 就不太合适了，这里不包含 SSIM
+    results = [
+        {"Algorithm": "NuFrost", "RMSE": metrics_nufrost["RMSE"], "MAE": metrics_nufrost["MAE"], "R": metrics_nufrost["R"], "OutlierRatio": metrics_nufrost.get("OutlierRatio", np.nan)},
+        {"Algorithm": "Zhu2015", "RMSE": metrics_zhu["RMSE"], "MAE": metrics_zhu["MAE"], "R": metrics_zhu["R"], "OutlierRatio": metrics_zhu.get("OutlierRatio", np.nan)},
+        {"Algorithm": "HANTS", "RMSE": metrics_hants["RMSE"], "MAE": metrics_hants["MAE"], "R": metrics_hants["R"], "OutlierRatio": metrics_hants.get("OutlierRatio", np.nan)},
+    ]
+    
     df_results = pd.DataFrame(results)
-    print("\n========== Single-Slice Evaluation Summary ==========")
+    print("\n========== Random 3D Points Evaluation Summary ==========")
     print(df_results.to_string(index=False))
     return df_results

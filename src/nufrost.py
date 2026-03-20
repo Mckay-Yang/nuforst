@@ -37,6 +37,33 @@ import rasterio
 from config import Args, build_args
 from .data_loader import RSCube
 
+
+def _make_frequency_penalty(
+    freqs: Optional[np.ndarray],
+    freq_weight: float,
+) -> np.ndarray:
+    """为谐波项构建随频率递增但更平滑的 ridge 惩罚系数。"""
+    if freqs is None or len(freqs) == 0:
+        return np.zeros(0, dtype=np.float64)
+
+    freqs = np.asarray(freqs, dtype=np.float64)
+    positive = freqs[np.isfinite(freqs) & (freqs > 0)]
+    if positive.size == 0:
+        return np.ones(len(freqs), dtype=np.float64)
+
+    base_freq = float(np.min(positive))
+    if not np.isfinite(base_freq) or base_freq <= 0:
+        base_freq = 1.0
+
+    rel = np.maximum(freqs / base_freq, 1.0)
+    # 使用对数型增长而非幂律增长，避免高频惩罚过强。
+    # freq_weight=0 -> 所有频率等权；
+    # freq_weight>0 -> 高频相对低频受到更强惩罚，但增长更平滑。
+    penalty_scale = 1.0 + max(0.0, freq_weight) * np.log2(rel)
+    # 这里返回 sqrt(scale)，因为后续增广矩阵里还会再乘一次平方根的 lam，
+    # 最终目标函数中的惩罚项就是 lam * scale * beta^2。
+    return np.sqrt(penalty_scale)
+
 def _to_seconds_since_start(ts_utc: np.ndarray) -> np.ndarray:
     t0 = np.min(ts_utc)
     return np.ascontiguousarray(ts_utc - t0, dtype=np.float64)
@@ -106,6 +133,100 @@ def refine_parabolic(f: np.ndarray, P: np.ndarray, i: int) -> float:
         return float(f[i])
     delta = 0.5*(y0 - y2)/denom
     return float(f[i] + delta*(f[i+1] - f[i]))
+
+
+def _parse_preferred_periods_days(periods_spec: Union[str, Sequence[float], np.ndarray]) -> np.ndarray:
+    if isinstance(periods_spec, str):
+        parts = [p.strip() for p in periods_spec.split(',') if p.strip()]
+        vals = [float(p) for p in parts]
+    else:
+        vals = [float(v) for v in periods_spec]
+    vals = [v for v in vals if np.isfinite(v) and v > 0]
+    return np.array(vals, dtype=np.float64)
+
+
+def _preferred_periods_to_freqs(periods_days: Union[str, Sequence[float], np.ndarray], time_unit: str = "seconds") -> np.ndarray:
+    periods_days_arr = _parse_preferred_periods_days(periods_days)
+    if periods_days_arr.size == 0:
+        return np.zeros(0, dtype=np.float64)
+    if time_unit == "days":
+        return 1.0 / periods_days_arr
+    return 1.0 / (periods_days_arr * 86400.0)
+
+
+def _snap_frequency_to_spectrum(target_freq: float, f_pos: np.ndarray, P_pos: np.ndarray, rel_tol: float) -> float:
+    if not np.isfinite(target_freq) or target_freq <= 0:
+        return float(target_freq)
+    valid = np.isfinite(f_pos) & np.isfinite(P_pos) & (f_pos > 0)
+    if not np.any(valid):
+        return float(target_freq)
+    cand_f = f_pos[valid]
+    cand_p = P_pos[valid]
+    rel_err = np.abs(cand_f - target_freq) / max(target_freq, 1e-12)
+    nearby = np.where(rel_err <= max(rel_tol, 0.0))[0]
+    if nearby.size == 0:
+        return float(target_freq)
+    best_local = nearby[np.argmax(cand_p[nearby])]
+    return float(cand_f[best_local])
+
+
+def select_frequencies(
+    f_pos: np.ndarray,
+    P_pos: np.ndarray,
+    fmax: float,
+    selection_mode: str,
+    preferred_freqs: np.ndarray,
+    preferred_top_k: int,
+    spectral_top_k: int,
+    spectral_merge_tol: float,
+    power_cum: float,
+    ignore_dc_hz: float,
+    refine_peaks: bool,
+) -> np.ndarray:
+    """
+    频率选择策略：
+    - spectral: 纯谱峰选择
+    - preferred: 优先使用先验周期频率，并吸附到附近谱峰
+    - hybrid: 先验频率 + 数据驱动谱峰联合选择
+    """
+    selected: list[float] = []
+
+    if selection_mode in ("preferred", "hybrid") and preferred_freqs.size > 0:
+        preferred_valid = preferred_freqs[np.isfinite(preferred_freqs) & (preferred_freqs > ignore_dc_hz)]
+        preferred_valid = preferred_valid[preferred_valid <= fmax]
+        for f in preferred_valid[:max(0, preferred_top_k)]:
+            selected.append(_snap_frequency_to_spectrum(f, f_pos, P_pos, spectral_merge_tol))
+
+    if selection_mode in ("spectral", "hybrid"):
+        peak_idx = select_peaks_adaptive(
+            f_pos, P_pos,
+            k_max=max(0, spectral_top_k),
+            power_cum=power_cum,
+            ignore_dc_hz=ignore_dc_hz,
+            fmax=fmax,
+        )
+        if len(peak_idx) > 0:
+            if refine_peaks:
+                spectral_freqs = [refine_parabolic(f_pos, P_pos, i) for i in peak_idx]
+            else:
+                spectral_freqs = [float(f_pos[i]) for i in peak_idx]
+            selected.extend(spectral_freqs)
+
+    if not selected:
+        return np.zeros(0, dtype=np.float64)
+
+    selected = sorted(float(f) for f in selected if np.isfinite(f) and f > ignore_dc_hz and f <= fmax)
+    merged: list[float] = []
+    for f in selected:
+        if not merged:
+            merged.append(f)
+            continue
+        rel = abs(f - merged[-1]) / max(merged[-1], 1e-12)
+        if rel <= max(spectral_merge_tol, 0.0):
+            merged[-1] = 0.5 * (merged[-1] + f)
+        else:
+            merged.append(f)
+    return np.array(merged, dtype=np.float64)
 
 def select_peaks_adaptive(f_pos: np.ndarray, P_pos: np.ndarray, k_max: int, power_cum: float, ignore_dc_hz: float, fmax: float) -> np.ndarray:
     lower = max(ignore_dc_hz, 0.0)
@@ -188,11 +309,8 @@ def ridge_with_freq_weights(X: np.ndarray, y: np.ndarray, freqs: Optional[np.nda
     if include_trend:
         col += 1
     if freqs is not None and len(freqs) > 0:
-        fmax_local = np.max(freqs) if np.max(freqs) > 0 else 1.0
-        if not np.isfinite(fmax_local) or fmax_local <= 0:
-            fmax_local = 1.0
-        for f in freqs:
-            w_f = (max(f, 0.0) / fmax_local) ** max(0.0, freq_weight)
+        penalty = _make_frequency_penalty(np.asarray(freqs, dtype=np.float64), freq_weight)
+        for w_f in penalty:
             if col < p:
                 R[col] = w_f
                 col += 1
@@ -227,9 +345,10 @@ def robust_fit_freq_ridge(X: np.ndarray, y: np.ndarray, freqs: np.ndarray, lam: 
 def predict_single_pixel(t_sec: np.ndarray, y: np.ndarray, target_t: float,
                          nufft_modes: int, eps: float,
                          num_peaks: int, power_cum: float, ignore_dc_hz: float,
-                         refine_peaks: bool, include_trend: bool,
-                         ridge_lam: float, freq_weight: float, huber_iters: int, huber_delta: float,
-                         min_obs: int) -> Tuple[float, int]:
+                         frequency_selection: str = "hybrid", preferred_periods_days: Union[str, Sequence[float], np.ndarray] = "365.25,182.625,91.3125,30.4375", preferred_top_k: int = 4, spectral_top_k: int = 4, spectral_merge_tol: float = 0.15,
+                         refine_peaks: bool = True, include_trend: bool = True,
+                         ridge_lam: float = 1e-2, freq_weight: float = 2.0, huber_iters: int = 3, huber_delta: float = 1.5,
+                         min_obs: int = 12) -> Tuple[float, int]:
     m = np.isfinite(y) & np.isfinite(t_sec)
     if m.sum() < max(3, min_obs):
         return np.nan, 0
@@ -259,16 +378,21 @@ def predict_single_pixel(t_sec: np.ndarray, y: np.ndarray, target_t: float,
     dt_med = float(np.median(dt_pos)) if dt_pos.size else Tspan/len(t_rel)
     fmax = 0.5 / max(dt_med, 1e-12)
 
-    pos_idx = select_peaks_adaptive(f_pos, P_pos, k_max=num_peaks,
-                                    power_cum=power_cum,
-                                    ignore_dc_hz=ignore_dc_hz, fmax=fmax)
-    if len(pos_idx) == 0:
-        freqs_sel = np.array([], dtype=np.float64)
-    else:
-        if refine_peaks:
-            freqs_sel = np.array([refine_parabolic(f_pos, P_pos, i) for i in pos_idx], dtype=np.float64)
-        else:
-            freqs_sel = np.array(f_pos[pos_idx], dtype=np.float64)
+    preferred_freqs = _preferred_periods_to_freqs(preferred_periods_days, time_unit="seconds")
+    spectral_top_k_eff = spectral_top_k if spectral_top_k > 0 else num_peaks
+    freqs_sel = select_frequencies(
+        f_pos=f_pos,
+        P_pos=P_pos,
+        fmax=fmax,
+        selection_mode=frequency_selection,
+        preferred_freqs=preferred_freqs,
+        preferred_top_k=preferred_top_k,
+        spectral_top_k=spectral_top_k_eff,
+        spectral_merge_tol=spectral_merge_tol,
+        power_cum=power_cum,
+        ignore_dc_hz=ignore_dc_hz,
+        refine_peaks=refine_peaks,
+    )
 
     X = design_matrix(t_rel, freqs_sel, include_trend=include_trend, include_dc=True)
     beta, _ = robust_fit_freq_ridge(X, yy, freqs_sel,
@@ -291,10 +415,83 @@ def predict_single_pixel(t_sec: np.ndarray, y: np.ndarray, target_t: float,
         y_star = float(np.nanmean(yy))
     return y_star, len(freqs_sel)
 
+def predict_curve_pixel(t_sec: np.ndarray, y: np.ndarray, target_t_secs: np.ndarray,
+                         nufft_modes: int, eps: float,
+                         num_peaks: int, power_cum: float, ignore_dc_hz: float,
+                         frequency_selection: str = "hybrid", preferred_periods_days: Union[str, Sequence[float], np.ndarray] = "365.25,182.625,91.3125,30.4375", preferred_top_k: int = 4, spectral_top_k: int = 4, spectral_merge_tol: float = 0.15,
+                         refine_peaks: bool = True, include_trend: bool = True,
+                         ridge_lam: float = 1e-2, freq_weight: float = 2.0, huber_iters: int = 3, huber_delta: float = 1.5,
+                         min_obs: int = 12) -> np.ndarray:
+    m = np.isfinite(y) & np.isfinite(t_sec)
+    if m.sum() < max(3, min_obs):
+        return np.full(len(target_t_secs), np.nan)
+    t = np.asarray(t_sec[m], dtype=np.float64)
+    yy = np.asarray(y[m], dtype=np.float64)
+
+    t_rel = _to_seconds_since_start(t)
+    t_rel_mean = float(t_rel.mean())
+    Tspan = float(t_rel.max() - t_rel.min())
+    if not np.isfinite(Tspan) or Tspan <= 0:
+        return np.full(len(target_t_secs), np.nan)
+
+    x = 2*np.pi*(t_rel - t_rel.min())/Tspan - np.pi
+    x = np.ascontiguousarray(x, dtype=np.float64)
+    c = np.ascontiguousarray(yy.astype(np.complex128))
+    ms = next_even(nufft_modes)
+    Fk = finufft.nufft1d1(x, c, ms, eps=eps, isign=-1)
+    k = np.arange(-ms//2, ms//2, dtype=np.int64)
+    freqs = k.astype(np.float64)/Tspan
+
+    pos = freqs >= 0
+    f_pos = freqs[pos]
+    P_pos = (np.abs(Fk[pos])**2)
+
+    dt = np.diff(np.sort(t_rel))
+    dt_pos = dt[dt > 0]
+    dt_med = float(np.median(dt_pos)) if dt_pos.size else Tspan/len(t_rel)
+    fmax = 0.5 / max(dt_med, 1e-12)
+
+    preferred_freqs = _preferred_periods_to_freqs(preferred_periods_days, time_unit="seconds")
+    spectral_top_k_eff = spectral_top_k if spectral_top_k > 0 else num_peaks
+    freqs_sel = select_frequencies(
+        f_pos=f_pos,
+        P_pos=P_pos,
+        fmax=fmax,
+        selection_mode=frequency_selection,
+        preferred_freqs=preferred_freqs,
+        preferred_top_k=preferred_top_k,
+        spectral_top_k=spectral_top_k_eff,
+        spectral_merge_tol=spectral_merge_tol,
+        power_cum=power_cum,
+        ignore_dc_hz=ignore_dc_hz,
+        refine_peaks=refine_peaks,
+    )
+
+    X = design_matrix(t_rel, freqs_sel, include_trend=include_trend, include_dc=True)
+    beta, _ = robust_fit_freq_ridge(X, yy, freqs_sel,
+                                    lam=ridge_lam, iters=huber_iters, delta=huber_delta,
+                                    include_dc=True, include_trend=include_trend, freq_weight=freq_weight)
+
+    t_star_rel = target_t_secs - t.min()
+    cols = [np.ones_like(t_star_rel)]
+    if include_trend:
+        cols.append(t_star_rel - t_rel_mean)
+    for f in freqs_sel:
+        w = 2*np.pi*f
+        cols.append(np.cos(w*t_star_rel))
+        cols.append(np.sin(w*t_star_rel))
+    X_star = np.column_stack(cols) if len(cols) else np.zeros((len(t_star_rel), 0))
+
+    if X.shape[1] > 0:
+        y_star = X_star @ beta
+    else:
+        y_star = np.full(len(target_t_secs), np.nanmean(yy))
+    return y_star
+
 def reconstruct_nufrost(
-    image: str,
+    image: Union[str, Path],
     target_time: str,
-    output_path: Optional[str] = None,
+    output_path: Optional[Union[str, Path]] = None,
     **kwargs
 ) -> np.ndarray:
     """
@@ -373,6 +570,11 @@ def nufrost_core(cube: np.ndarray, timestamps: np.ndarray, target_time: str, arg
                 t_sec, y, target_t,
                 nufft_modes=args.modes, eps=args.eps,
                 num_peaks=args.num_peaks, power_cum=args.power_cum, ignore_dc_hz=args.ignore_dc_hz,
+                frequency_selection=args.frequency_selection,
+                preferred_periods_days=args.preferred_periods_days,
+                preferred_top_k=args.preferred_top_k,
+                spectral_top_k=args.spectral_top_k,
+                spectral_merge_tol=args.spectral_merge_tol,
                 refine_peaks=args.refine_peaks, include_trend=args.include_trend,
                 ridge_lam=args.ridge, freq_weight=args.freq_weight, huber_iters=args.huber_iters, huber_delta=args.huber_delta,
                 min_obs=args.min_obs
