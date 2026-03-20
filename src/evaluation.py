@@ -161,7 +161,7 @@ def _process_pixel_ts(r: int, c: int, y_ts: np.ndarray, t_days: np.ndarray, t_se
     }
 
 def evaluate_timeseries_comprehensive(
-    image_path: str,
+    image_path: Union[str, Path],
     args: Args,
     num_samples: int = 1000,
     simulate_gap_days: int = 60,
@@ -305,7 +305,7 @@ def _process_random_point(t_idx: int, r: int, c: int, y_ts: np.ndarray, t_sec: n
 
 
 def evaluate_algorithms(
-    image_path: str,
+    image_path: Union[str, Path],
     args: Args,
     num_points: int = 1000,
     n_jobs: int = -1

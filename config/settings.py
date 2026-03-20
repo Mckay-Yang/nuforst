@@ -18,8 +18,8 @@ def load_yaml_config() -> Dict[str, Any]:
 @dataclass
 class Args:
     # Defaults here serve as code-level fallbacks if YAML is missing/incomplete
-    image: str = ""
-    cache_dir: str = "./cache"
+    image: Path = field(default_factory=Path)
+    cache_dir: Path = field(default_factory=Path)
     force_refresh: bool = False
     start_time: str = "2015-01-01T00:00:00"
     end_time: str = "2024-01-01T00:00:00"
@@ -32,7 +32,7 @@ class Args:
     ignore_dc_hz: float = 1e-9
     frequency_selection: str = "hybrid"
     preferred_periods_days: str = "365.25,182.625,91.3125,30.4375"
-    preferred_top_k: int = 4da ta q
+    preferred_top_k: int = 4
     spectral_top_k: int = 4
     spectral_merge_tol: float = 0.15
     refine_peaks: bool = True
@@ -45,7 +45,7 @@ class Args:
     n_jobs: int = -1
     show_progress: bool = True
     progress_every: int = 50
-    output_path: str = "./recon.tif"
+    output_path: Path = field(default_factory=Path)
 
 def build_arg_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
@@ -54,9 +54,9 @@ def build_arg_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     def d(key, fallback):
         return defaults.get(key, fallback)
 
-    ap.add_argument("-i", "--image", help="path to input multi-band time-series GeoTIFF", type=str,
-                    default=d("image", ""))
-    ap.add_argument("-c", "--cache-dir", type=str, default=d("cache_dir", "./cache"),
+    ap.add_argument("-i", "--image", help="path to input multi-band time-series GeoTIFF", type=Path,
+                    default=Path(d("image", "")) if d("image", "") else Path())
+    ap.add_argument("-c", "--cache-dir", type=Path, default=Path(d("cache_dir", "./cache")),
                     help="directory for cached npz cubes")
     ap.add_argument("--force-refresh", action="store_true", default=d("force_refresh", False),
                     help="ignore cached npz and rebuild from the tif")
@@ -123,7 +123,7 @@ def build_arg_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
                     help="serial mode: print progress every N rows when tqdm is unavailable")
 
     # Output settings
-    ap.add_argument("--output-path", type=str, default=d("output_path", "./recon.tif"),
+    ap.add_argument("--output-path", type=Path, default=Path(d("output_path", "./recon.tif")),
                     help="output GeoTIFF path for reconstructed image")
 
     # Set defaults explicitly to ensure they are propagated
@@ -145,7 +145,10 @@ def build_args(overrides: Optional[dict] = None) -> Args:
         args_obj = Args()
         for k, v in merged.items():
             if hasattr(args_obj, k):
-                setattr(args_obj, k, v)
+                if k in ("image", "cache_dir", "output_path") and v is not None:
+                    setattr(args_obj, k, Path(v))
+                else:
+                    setattr(args_obj, k, v)
 
         if args_obj.target_time is None:
             args_obj.target_time = args_obj.start_time

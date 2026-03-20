@@ -223,15 +223,15 @@ def hants_curve_pixel(
     return X_target @ coeffs
 
 def reconstruct_hants(
-    image: str,
+    image: Union[str, Path],
     target_time: str,
-    output_path: Optional[str] = None,
+    output_path: Optional[Union[str, Path]] = None,
     nof: int = 3,
     sf: str = 'low',
     fet: float = 0.05,
     dod: int = 5,
     n_jobs: int = -1,
-    cache_dir: str = "./cache",
+    cache_dir: Union[str, Path] = "./cache",
     force_refresh: bool = False
 ) -> np.ndarray:
     """

@@ -10,7 +10,6 @@ import rasterio
 from pathlib import Path
 from tqdm import tqdm
 from joblib import Parallel, delayed, cpu_count
-import os
 
 # Constants
 DAYS_PER_YEAR = 365.25
@@ -304,12 +303,12 @@ def predict_curve_pixel(
     return preds
 
 def reconstruct_zhu2015(
-    image: str,
+    image: Union[str, Path],
     target_time: str,
-    output_path: Optional[str] = None,
+    output_path: Optional[Union[str, Path]] = None,
     lasso_alpha: float = 0.0001,
     n_jobs: int = -1,
-    cache_dir: str = "./cache",
+    cache_dir: Union[str, Path] = "./cache",
     force_refresh: bool = False
 ) -> np.ndarray:
     """

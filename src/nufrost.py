@@ -489,9 +489,9 @@ def predict_curve_pixel(t_sec: np.ndarray, y: np.ndarray, target_t_secs: np.ndar
     return y_star
 
 def reconstruct_nufrost(
-    image: str,
+    image: Union[str, Path],
     target_time: str,
-    output_path: Optional[str] = None,
+    output_path: Optional[Union[str, Path]] = None,
     **kwargs
 ) -> np.ndarray:
     """
