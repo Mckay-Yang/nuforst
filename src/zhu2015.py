@@ -269,7 +269,7 @@ def fit_predict_pixel(
     target_t_day: float,
     lasso_alpha: float = 0.001
 ) -> Tuple[float, int]:
-    valid_mask = np.isfinite(y)
+    valid_mask = np.isfinite(y) & np.isfinite(t_days)
     if not np.any(valid_mask):
         return np.nan, 255
 
@@ -287,7 +287,7 @@ def predict_curve_pixel(
     target_t_days: np.ndarray,
     lasso_alpha: float = 0.001
 ) -> np.ndarray:
-    valid_mask = np.isfinite(y)
+    valid_mask = np.isfinite(y) & np.isfinite(t_days)
     if not np.any(valid_mask):
         return np.full(len(target_t_days), np.nan)
 
