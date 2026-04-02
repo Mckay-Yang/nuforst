@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import time
 import os
-from typing import Tuple, Dict, List, Optional
+from typing import Tuple, Dict, List, Optional, Union
 from pathlib import Path
 import warnings
 
@@ -161,7 +161,7 @@ def _process_pixel_ts(r: int, c: int, y_ts: np.ndarray, t_days: np.ndarray, t_se
     }
 
 def evaluate_timeseries_comprehensive(
-    image_path: Union[str, Path],
+    image_path: Union[str, Path, List[Union[str, Path]]],
     args: Args,
     num_samples: int = 1000,
     simulate_gap_days: int = 60,
@@ -174,20 +174,29 @@ def evaluate_timeseries_comprehensive(
     3. 分别用各种算法预测这些人为挖去的点，并计算综合指标。
     """
     print(f"\n========== Starting Comprehensive Time-Series Evaluation ==========")
-    print(f"Image: {Path(image_path).name}")
+    
+    img_name = Path(image_path[0] if isinstance(image_path, list) else image_path).name
+    import re
+    m = re.search(r"([A-Z0-9]+_lon[0-9.]+_lat[0-9.]+)", img_name)
+    if m:
+        img_name = m.group(1)
+    print(f"Image: {img_name}")
     print(f"Simulating continuous gap: {simulate_gap_days} days")
     
-    loader = RSCube(image_path, cache_dir=args.cache_dir)
+    loader = RSCube(image_path, cache_dir=args.cache_dir, force_refresh=getattr(args, "force_refresh", False))
     data = loader.load()
-    cube = data["cube"]
+    cube = np.ma.filled(data["cube"], np.nan)
     timestamps = data["timestamps"]
     
     T, H, W = cube.shape
     t_sec = timestamps_to_seconds(timestamps, unit="seconds")
-    t0_sec = np.min(t_sec)
+    t0_sec = np.nanmin(t_sec)
     t_days = (t_sec - t0_sec) / 86400.0
     
-    valid_counts = np.sum(np.isfinite(cube), axis=0)
+    t_valid_mask = np.isfinite(t_days)
+    valid_mask = np.isfinite(cube) & t_valid_mask[:, np.newaxis, np.newaxis]
+    valid_counts = np.sum(valid_mask, axis=0)
+    
     valid_pixels = np.argwhere(valid_counts >= max(args.min_obs + 3, 15))
     
     if len(valid_pixels) == 0:
@@ -305,7 +314,7 @@ def _process_random_point(t_idx: int, r: int, c: int, y_ts: np.ndarray, t_sec: n
 
 
 def evaluate_algorithms(
-    image_path: Union[str, Path],
+    image_path: Union[str, Path, List[Union[str, Path]]],
     args: Args,
     num_points: int = 1000,
     n_jobs: int = -1
@@ -315,23 +324,29 @@ def evaluate_algorithms(
     在整个时空数据集中随机选取一定数量的有效点进行敲除，然后利用剩余数据对这些点进行预测并评估。
     """
     print(f"\n========== Starting 3D Random Points Evaluation ==========")
-    print(f"Image: {Path(image_path).name}")
+    img_name = Path(image_path[0] if isinstance(image_path, list) else image_path).name
+    import re
+    m = re.search(r"([A-Z0-9]+_lon[0-9.]+_lat[0-9.]+)", img_name)
+    if m:
+        img_name = m.group(1)
+    print(f"Image: {img_name}")
     print(f"Masking {num_points} random points across all space and time.")
     
-    loader = RSCube(image_path, cache_dir=args.cache_dir)
+    loader = RSCube(image_path, cache_dir=args.cache_dir, force_refresh=getattr(args, "force_refresh", False))
     data = loader.load()
-    cube = data["cube"]
+    cube = np.ma.filled(data["cube"], np.nan)
     timestamps = data["timestamps"]
     
     T, H, W = cube.shape
-    
+
     t_sec = timestamps_to_seconds(timestamps, unit="seconds")
-    t0_sec = np.min(t_sec)
+    t0_sec = np.nanmin(t_sec)
     t_days = (t_sec - t0_sec) / 86400.0
-    
-    # 找到所有有效的非 nan 点
-    valid_mask = np.isfinite(cube)
-    
+
+    # 找到所有有效的非 nan 点，并且时间也不能为 nan
+    t_valid_mask = np.isfinite(t_days)
+    valid_mask = np.isfinite(cube) & t_valid_mask[:, np.newaxis, np.newaxis]
+
     # 确保像元有足够的有效观测次数 (至少 args.min_obs + 1 次)，敲除一个点后还能拟合
     valid_counts = np.sum(valid_mask, axis=0)
     valid_pixels_mask = valid_counts >= max(args.min_obs + 1, 3)

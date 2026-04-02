@@ -513,7 +513,7 @@ def reconstruct_nufrost(
     # 2. 加载数据
     loader = RSCube(args.image, cache_dir=args.cache_dir, force_refresh=args.force_refresh)
     data = loader.load()
-    cube = data["cube"]
+    cube = np.ma.filled(data["cube"], np.nan)
     timestamps = data["timestamps"]
 
     # 3. 执行重建

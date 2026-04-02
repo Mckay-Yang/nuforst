@@ -320,7 +320,7 @@ def reconstruct_zhu2015(
     # 1. Load Data
     loader = RSCube(image, cache_dir=cache_dir, force_refresh=force_refresh)
     data = loader.load()
-    cube = data["cube"]
+    cube = np.ma.filled(data["cube"], np.nan)
     timestamps = data["timestamps"] # seconds
 
     # 2. Prepare Time

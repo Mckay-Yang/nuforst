@@ -86,10 +86,10 @@ def hants_pixel(
     """
     Apply HANTS algorithm to a single pixel.
     """
-    valid_mask = _apply_hants_valid_mask(y, sf=sf, idrt=idrt)
+    valid_mask = _apply_hants_valid_mask(y, sf=sf, idrt=idrt) & np.isfinite(t)
 
-    if np.sum(valid_mask) == 0:
-        return np.nan
+    t_valid = t[valid_mask]
+    y_valid = y[valid_mask]
 
     t_curr = t[valid_mask]
     y_curr = y[valid_mask]
@@ -162,7 +162,7 @@ def hants_curve_pixel(
     """
     Apply HANTS algorithm to a single pixel and predict for an array of times.
     """
-    valid_mask = _apply_hants_valid_mask(y, sf=sf, idrt=idrt)
+    valid_mask = _apply_hants_valid_mask(y, sf=sf, idrt=idrt) & np.isfinite(t)
 
     if np.sum(valid_mask) == 0:
         return np.full(len(target_t_array), np.nan)
@@ -247,7 +247,7 @@ def reconstruct_hants(
     # 1. Load Data
     loader = RSCube(image, cache_dir=cache_dir, force_refresh=force_refresh)
     data = loader.load()
-    cube = data["cube"]
+    cube = np.ma.filled(data["cube"], np.nan)
     timestamps = data["timestamps"]
 
     # 2. Prepare Time
