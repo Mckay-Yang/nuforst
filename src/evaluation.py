@@ -186,6 +186,7 @@ def evaluate_timeseries_comprehensive(
     loader = RSCube(image_path, cache_dir=args.cache_dir, force_refresh=getattr(args, "force_refresh", False))
     data = loader.load()
     cube = np.ma.filled(data["cube"], np.nan)
+    del data["cube"]
     timestamps = data["timestamps"]
     
     T, H, W = cube.shape
@@ -335,6 +336,7 @@ def evaluate_algorithms(
     loader = RSCube(image_path, cache_dir=args.cache_dir, force_refresh=getattr(args, "force_refresh", False))
     data = loader.load()
     cube = np.ma.filled(data["cube"], np.nan)
+    del data["cube"]
     timestamps = data["timestamps"]
     
     T, H, W = cube.shape
@@ -367,10 +369,10 @@ def evaluate_algorithms(
 
     print(f"Selected {len(sampled_points)} valid points for evaluation.")
     
-    corrupted_cube = cube.copy()
-    
+    from collections import defaultdict
+    rc_to_t_idx = defaultdict(list)
     for t_idx, r, c in sampled_points:
-        corrupted_cube[t_idx, r, c] = np.nan
+        rc_to_t_idx[(r, c)].append(t_idx)
         
     start_time = time.time()
     
@@ -379,12 +381,18 @@ def evaluate_algorithms(
     
     print(f"--> Running predictions with {n_jobs} parallel workers...")
     
-    tasks = [
-        delayed(_process_random_point)(
-            t_idx, r, c, corrupted_cube[:, r, c].copy(), t_sec, t_days, args
-        )
-        for t_idx, r, c in sampled_points
-    ]
+    tasks = []
+    for (r, c), t_idxs in rc_to_t_idx.items():
+        y_ts = cube[:, r, c].copy()
+        for t in t_idxs:
+            y_ts[t] = np.nan
+            
+        for target_t_idx in t_idxs:
+            tasks.append(
+                delayed(_process_random_point)(
+                    target_t_idx, r, c, y_ts, t_sec, t_days, args
+                )
+            )
     
     point_results = []
     if JOBLIB_AVAILABLE and n_jobs > 1:

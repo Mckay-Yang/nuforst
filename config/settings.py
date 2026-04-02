@@ -3,7 +3,7 @@ import argparse
 import yaml
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Optional, Any, Dict
+from typing import Optional, Any, Dict, Union, List
 
 # Define path to config.yaml (assumed to be in the same directory)
 CONFIG_PATH = Path(__file__).parent / "config.yaml"
@@ -18,7 +18,7 @@ def load_yaml_config() -> Dict[str, Any]:
 @dataclass
 class Args:
     # Defaults here serve as code-level fallbacks if YAML is missing/incomplete
-    image: Path = field(default_factory=Path)
+    image: Union[Path, List[Path], List[str], str] = field(default_factory=Path)
     cache_dir: Path = field(default_factory=Path)
     force_refresh: bool = False
     start_time: str = "2015-01-01T00:00:00"
@@ -145,8 +145,13 @@ def build_args(overrides: Optional[dict] = None) -> Args:
         args_obj = Args()
         for k, v in merged.items():
             if hasattr(args_obj, k):
-                if k in ("image", "cache_dir", "output_path") and v is not None:
+                if k in ("cache_dir", "output_path") and v is not None:
                     setattr(args_obj, k, Path(v))
+                elif k == "image" and v is not None:
+                    if isinstance(v, list):
+                        setattr(args_obj, k, v)
+                    else:
+                        setattr(args_obj, k, Path(v))
                 else:
                     setattr(args_obj, k, v)
 

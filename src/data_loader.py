@@ -113,7 +113,12 @@ class RSCube:
 
         for path in self.tif_paths:
             with rasterio.open(path) as src:
-                arr = src.read(masked=True).astype(np.float32)
+                # Memory safety: restrict to top-left 512x512 to prevent OOM on 19GB cubes in Colab
+                read_w = min(src.width, 512)
+                read_h = min(src.height, 512)
+                window = rasterio.windows.Window(0, 0, read_w, read_h)
+                
+                arr = src.read(window=window, masked=True).astype(np.float32)
                 if np.ma.isMaskedArray(arr):
                     arr = arr.filled(np.nan)
 
