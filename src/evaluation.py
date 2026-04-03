@@ -382,6 +382,7 @@ def evaluate_algorithms(
     print(f"--> Running predictions with {n_jobs} parallel workers...")
     
     tasks = []
+    ordered_points = []
     for (r, c), t_idxs in rc_to_t_idx.items():
         y_ts = cube[:, r, c].copy()
         for t in t_idxs:
@@ -393,6 +394,7 @@ def evaluate_algorithms(
                     target_t_idx, r, c, y_ts, t_sec, t_days, args
                 )
             )
+            ordered_points.append((target_t_idx, r, c))
     
     point_results = []
     if JOBLIB_AVAILABLE and n_jobs > 1:
@@ -419,7 +421,7 @@ def evaluate_algorithms(
     pred_all_zhu = []
     pred_all_hants = []
     
-    for (t_idx, r, c), res in zip(sampled_points, point_results):
+    for (t_idx, r, c), res in zip(ordered_points, point_results):
         true_val = cube[t_idx, r, c]
         true_all.append(true_val)
         pred_all_nufrost.append(res["nufrost"])
