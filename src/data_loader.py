@@ -10,6 +10,216 @@ import re
 from collections import defaultdict
 import subprocess
 import os
+import xml.etree.ElementTree as ET
+
+
+GDAL_DTYPE_MAP = {
+    "uint8": "Byte",
+    "int8": "Byte",
+    "uint16": "UInt16",
+    "int16": "Int16",
+    "uint32": "UInt32",
+    "int32": "Int32",
+    "uint64": "UInt64",
+    "int64": "Int64",
+    "float32": "Float32",
+    "float64": "Float64",
+    "complex64": "CFloat32",
+    "complex128": "CFloat64",
+}
+
+
+def _gdal_dtype_name(dtype: str) -> str:
+    return GDAL_DTYPE_MAP.get(np.dtype(dtype).name, str(dtype))
+
+
+def _log_cache_event(kind: str, status: str, path: Union[str, Path], detail: Optional[str] = None) -> None:
+    msg = f"[DataLoader] {kind} cache {status}: {Path(path)}"
+    if detail:
+        msg += f" ({detail})"
+    print(msg, flush=True)
+
+
+def _is_stale(target: Path, sources: List[Path]) -> bool:
+    if not target.exists():
+        return True
+
+    target_mtime = target.stat().st_mtime
+    for src in sources:
+        if (not src.exists()) or src.stat().st_mtime > target_mtime:
+            return True
+    return False
+
+
+def _part_sort_key(part_name: str) -> Tuple[int, int, str]:
+    if part_name == "full":
+        return (0, 0, part_name)
+
+    match = re.fullmatch(r"part(\d+)", part_name)
+    if match:
+        return (1, int(match.group(1)), part_name)
+
+    return (2, 0, part_name)
+
+
+def _write_stacked_vrt(vrt_path: Path, ordered_part_files: List[List[Path]]) -> None:
+    if not ordered_part_files:
+        raise ValueError("No source TIFF parts were provided.")
+
+    crs = None
+    res_x: Optional[float] = None
+    res_y: Optional[float] = None
+    min_x = float("inf")
+    min_y = float("inf")
+    max_x = float("-inf")
+    max_y = float("-inf")
+    part_infos = []
+
+    for part_files in ordered_part_files:
+        if not part_files:
+            continue
+
+        tile_infos = []
+        descriptions = None
+        band_count = None
+        nodata = None
+        data_type = None
+
+        for tile_path in part_files:
+            with rasterio.open(tile_path) as src:
+                transform = src.transform
+                if not np.isclose(transform.b, 0.0) or not np.isclose(transform.d, 0.0):
+                    raise ValueError(f"Rotated geotransform is not supported: {tile_path}")
+
+                if crs is None:
+                    crs = src.crs
+                elif src.crs != crs:
+                    raise ValueError(f"CRS mismatch while building VRT: {tile_path}")
+
+                tile_res_x = float(transform.a)
+                tile_res_y = float(abs(transform.e))
+                if res_x is None or res_y is None:
+                    res_x = tile_res_x
+                    res_y = tile_res_y
+                elif (not np.isclose(tile_res_x, res_x)) or (not np.isclose(tile_res_y, res_y)):
+                    raise ValueError(f"Pixel size mismatch while building VRT: {tile_path}")
+
+                if band_count is None:
+                    band_count = src.count
+                    descriptions = list(src.descriptions)
+                    if not descriptions or all(name is None or name == "" for name in descriptions):
+                        descriptions = [f"band_{i+1}" for i in range(src.count)]
+                    nodata = src.nodatavals[0] if src.nodatavals else None
+                    data_type = _gdal_dtype_name(src.dtypes[0])
+                elif src.count != band_count:
+                    raise ValueError(f"Band count mismatch within part for {tile_path}")
+
+                block_h, block_w = src.block_shapes[0] if src.block_shapes else (src.height, src.width)
+                bounds = src.bounds
+                min_x = min(min_x, float(bounds.left))
+                min_y = min(min_y, float(bounds.bottom))
+                max_x = max(max_x, float(bounds.right))
+                max_y = max(max_y, float(bounds.top))
+
+                tile_infos.append({
+                    "path": tile_path,
+                    "width": src.width,
+                    "height": src.height,
+                    "block_w": block_w,
+                    "block_h": block_h,
+                    "x_origin": float(transform.c),
+                    "y_origin": float(transform.f),
+                })
+
+        if band_count is None or data_type is None:
+            continue
+
+        part_infos.append({
+            "band_count": band_count,
+            "descriptions": descriptions,
+            "nodata": nodata,
+            "data_type": data_type,
+            "tiles": tile_infos,
+        })
+
+    if not part_infos or crs is None or res_x is None or res_y is None:
+        raise ValueError("No valid TIFF metadata found to build the VRT.")
+
+    width = int(round((max_x - min_x) / res_x))
+    height = int(round((max_y - min_y) / res_y))
+    transform = rasterio.transform.from_origin(min_x, max_y, res_x, res_y)
+
+    root = ET.Element("VRTDataset", rasterXSize=str(width), rasterYSize=str(height))
+
+    srs = ET.SubElement(root, "SRS")
+    srs.text = crs.to_wkt()
+
+    geotransform = ET.SubElement(root, "GeoTransform")
+    geotransform.text = ", ".join(f"{v:.16g}" for v in transform.to_gdal())
+
+    out_band_idx = 1
+    for part_info in part_infos:
+        for src_band_idx in range(1, part_info["band_count"] + 1):
+            vrt_band = ET.SubElement(
+                root,
+                "VRTRasterBand",
+                dataType=part_info["data_type"],
+                band=str(out_band_idx),
+            )
+
+            description = part_info["descriptions"][src_band_idx - 1]
+            desc_elem = ET.SubElement(vrt_band, "Description")
+            desc_elem.text = str(description)
+
+            if part_info["nodata"] is not None:
+                nodata_elem = ET.SubElement(vrt_band, "NoDataValue")
+                nodata_elem.text = str(part_info["nodata"])
+
+            color_interp = ET.SubElement(vrt_band, "ColorInterp")
+            color_interp.text = "Gray"
+
+            for tile_info in part_info["tiles"]:
+                col_off_f, row_off_f = (~transform) * (tile_info["x_origin"], tile_info["y_origin"])
+                col_off = int(round(col_off_f))
+                row_off = int(round(row_off_f))
+
+                simple_source = ET.SubElement(vrt_band, "SimpleSource")
+                src_filename = ET.SubElement(simple_source, "SourceFilename", relativeToVRT="1")
+                src_filename.text = Path(os.path.relpath(tile_info["path"], start=vrt_path.parent)).as_posix()
+                src_band = ET.SubElement(simple_source, "SourceBand")
+                src_band.text = str(src_band_idx)
+
+                ET.SubElement(
+                    simple_source,
+                    "SourceProperties",
+                    RasterXSize=str(tile_info["width"]),
+                    RasterYSize=str(tile_info["height"]),
+                    DataType=part_info["data_type"],
+                    BlockXSize=str(tile_info["block_w"]),
+                    BlockYSize=str(tile_info["block_h"]),
+                )
+                ET.SubElement(
+                    simple_source,
+                    "SrcRect",
+                    xOff="0",
+                    yOff="0",
+                    xSize=str(tile_info["width"]),
+                    ySize=str(tile_info["height"]),
+                )
+                ET.SubElement(
+                    simple_source,
+                    "DstRect",
+                    xOff=str(col_off),
+                    yOff=str(row_off),
+                    xSize=str(tile_info["width"]),
+                    ySize=str(tile_info["height"]),
+                )
+
+            out_band_idx += 1
+
+    tree = ET.ElementTree(root)
+    ET.indent(tree, space="  ")
+    tree.write(vrt_path, encoding="utf-8")
 
 class RSCube:
     """
@@ -25,11 +235,11 @@ class RSCube:
         ) -> None:
         self.tif_paths = self._resolve_paths(tif_path)
         if cache_dir is None:
-            # Default to data/cache relative to the project root (parent of src)
-            self.cache_dir = Path(__file__).resolve().parent.parent / "data" / "cache"
+            # Default to data/local_cache relative to the project root (parent of src)
+            self.cache_dir = Path(__file__).resolve().parent.parent / "data" / "local_cache"
         else:
             self.cache_dir = Path(cache_dir)
-            
+
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.force_refresh = force_refresh
         self.meta: Dict[str, object] = {}
@@ -117,7 +327,7 @@ class RSCube:
                 read_w = min(src.width, 512)
                 read_h = min(src.height, 512)
                 window = rasterio.windows.Window(0, 0, read_w, read_h)
-                
+
                 arr = src.read(window=window, masked=True).astype(np.float32)
                 if np.ma.isMaskedArray(arr):
                     arr = arr.filled(np.nan)
@@ -193,44 +403,100 @@ class RSCube:
     def load(self) -> Dict[str, object]:
         cache_path = self._cache_path()
         if cache_path.exists() and (not self.force_refresh):
-            print(f"[System] Loading from cache: {cache_path}")
+            _log_cache_event("NPZ", "hit", cache_path)
             return self._load_npz(cache_path)
-        print(f"[System] Reading {len(self.tif_paths)} TIFF(s) into memory...")
+
+        if cache_path.exists() and self.force_refresh:
+            _log_cache_event("NPZ", "refresh", cache_path, detail="force_refresh=True")
+        else:
+            _log_cache_event("NPZ", "miss", cache_path, detail=f"building from {len(self.tif_paths)} TIFF(s)")
+
         cube, timestamps, band_names = self._read_tif()
         self._save_npz(cache_path, cube, timestamps, band_names)
+        _log_cache_event("NPZ", "saved", cache_path)
         return {"cube": cube, "timestamps": timestamps, "band_names": band_names, **self.meta, "cache_path": str(cache_path)}
 
 
-def find_image_chunks(data_dir: str, lon: float, lat: float, band: str) -> List[List[str]]:
+def find_image_chunks(
+    data_dir: str,
+    lon: float,
+    lat: float,
+    band: str,
+    cache_dir: Optional[Union[str, Path]] = None,
+) -> List[str]:
     """
-    Finds ALL spatial tiles and temporal parts for a given location and band.
-    Mosaics the spatial tiles of the SAME temporal part into a VRT.
-    Returns a list containing ONE inner list, which holds the ordered VRT paths (e.g., [part1.vrt, part2.vrt, ...]).
+    Build one time-stacked VRT for a given location and spectral band.
+
+    Notes
+    -----
+    - The spectral band is encoded in the filename (e.g. ``BLUE`` / ``RED``).
+    - The TIFF's internal bands represent the time series.
+    - ``partN`` in the filename represents temporal chunking.
+    - GEE auto-generated spatial tiles (``-row-col`` suffixes) are first mosaiced
+      per part, then all parts are stacked into a single final VRT.
+
+    Returns
+    -------
+    List[str]
+        A one-element list containing the final VRT path for this
+        coordinate/band. The list wrapper is kept for caller compatibility.
     """
     pattern = str(Path(data_dir) / f"*_{band}_lon{lon}_lat{lat}*.tif")
-    files = glob.glob(pattern)
+    files = sorted(glob.glob(pattern))
     if not files:
+        _log_cache_event(
+            "VRT",
+            "miss",
+            Path(data_dir) / f"{band}_lon{lon}_lat{lat}.vrt",
+            detail="no matching TIFF files",
+        )
         return []
-    
+
     # Group files by their temporal part
     parts = defaultdict(list)
     for f in files:
         match = re.search(r"_(part\d+)(?:-\d{10}-\d{10})?\.tif$", Path(f).name)
         part_name = match.group(1) if match else "full"
         parts[part_name].append(f)
-        
-    vrt_dir = Path(data_dir).parent / "cache" / "vrts"
-    vrt_dir.mkdir(parents=True, exist_ok=True)
-    
-    vrt_paths = []
-    for part_name in sorted(parts.keys()):
-        part_files = parts[part_name]
-        vrt_filename = f"{band}_lon{lon}_lat{lat}_{part_name}.vrt"
-        vrt_path = vrt_dir / vrt_filename
-        if not vrt_path.exists():
-            subprocess.run(["gdalbuildvrt", "-q", str(vrt_path)] + part_files, check=True)
-        vrt_paths.append(str(vrt_path))
-             
-    # Return as a single chunk containing the temporal sequence of VRTs
-    return [vrt_paths]
 
+    cache_root = Path(cache_dir) if cache_dir is not None else (Path(data_dir).parent / "local_cache")
+    vrt_dir = cache_root / "vrts"
+    vrt_dir.mkdir(parents=True, exist_ok=True)
+
+    ordered_part_files = [
+        sorted(Path(f) for f in parts[part_name])
+        for part_name in sorted(parts.keys(), key=_part_sort_key)
+    ]
+
+    final_vrt_path = vrt_dir / f"{band}_lon{lon}_lat{lat}.vrt"
+    all_source_files = [tile_path for part_files in ordered_part_files for tile_path in part_files]
+    if _is_stale(final_vrt_path, all_source_files):
+        if final_vrt_path.exists():
+            _log_cache_event("VRT", "refresh", final_vrt_path, detail="source TIFFs changed")
+        else:
+            _log_cache_event("VRT", "miss", final_vrt_path, detail=f"building from {len(all_source_files)} TIFF tile(s)")
+        _write_stacked_vrt(final_vrt_path, ordered_part_files)
+        _log_cache_event("VRT", "saved", final_vrt_path)
+    else:
+        _log_cache_event("VRT", "hit", final_vrt_path)
+
+    for legacy_vrt in vrt_dir.glob(f"{band}_lon{lon}_lat{lat}_part*.vrt"):
+        try:
+            legacy_vrt.unlink()
+        except OSError:
+            pass
+
+    legacy_part_dir = cache_root / ".vrt_parts"
+    if legacy_part_dir.exists():
+        for legacy_vrt in legacy_part_dir.glob(f"{band}_lon{lon}_lat{lat}_part*.vrt"):
+            try:
+                legacy_vrt.unlink()
+            except OSError:
+                pass
+        try:
+            if not any(legacy_part_dir.iterdir()):
+                legacy_part_dir.rmdir()
+        except OSError:
+            pass
+
+    return [str(final_vrt_path)]

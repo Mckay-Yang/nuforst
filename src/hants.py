@@ -231,7 +231,7 @@ def reconstruct_hants(
     fet: float = 0.05,
     dod: int = 5,
     n_jobs: int = -1,
-    cache_dir: Union[str, Path] = "./cache",
+    cache_dir: Union[str, Path] = "data/local_cache",
     force_refresh: bool = False
 ) -> np.ndarray:
     """

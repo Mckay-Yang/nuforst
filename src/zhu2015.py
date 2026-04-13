@@ -308,7 +308,7 @@ def reconstruct_zhu2015(
     output_path: Optional[Union[str, Path]] = None,
     lasso_alpha: float = 0.0001,
     n_jobs: int = -1,
-    cache_dir: Union[str, Path] = "./cache",
+    cache_dir: Union[str, Path] = "data/local_cache",
     force_refresh: bool = False
 ) -> np.ndarray:
     """

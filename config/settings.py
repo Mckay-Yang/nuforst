@@ -19,7 +19,7 @@ def load_yaml_config() -> Dict[str, Any]:
 class Args:
     # Defaults here serve as code-level fallbacks if YAML is missing/incomplete
     image: Union[Path, List[Path], List[str], str] = field(default_factory=Path)
-    cache_dir: Path = field(default_factory=Path)
+    cache_dir: Path = field(default_factory=lambda: Path("data/local_cache"))
     force_refresh: bool = False
     start_time: str = "2015-01-01T00:00:00"
     end_time: str = "2024-01-01T00:00:00"
@@ -56,7 +56,7 @@ def build_arg_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
 
     ap.add_argument("-i", "--image", help="path to input multi-band time-series GeoTIFF", type=Path,
                     default=Path(d("image", "")) if d("image", "") else Path())
-    ap.add_argument("-c", "--cache-dir", type=Path, default=Path(d("cache_dir", "./cache")),
+    ap.add_argument("-c", "--cache-dir", type=Path, default=Path(d("cache_dir", "data/local_cache")),
                     help="directory for cached npz cubes")
     ap.add_argument("--force-refresh", action="store_true", default=d("force_refresh", False),
                     help="ignore cached npz and rebuild from the tif")
