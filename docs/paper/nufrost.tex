@@ -271,6 +271,14 @@ The results, visualized in Fig.~\ref{fig_sim} (bottom panels), demonstrate that 
 
 \section{Conclusion}
 
+This paper presented NUFROST, a robust reconstruction framework for irregularly sampled optical remote sensing time series. By combining the Non-Uniform Fast Fourier Transform with Huber-Ridge regression, NUFROST addresses two fundamental challenges in temporal reconstruction: the spectral distortion introduced by interpolation-based preprocessing, and the sensitivity of least-squares fitting to outliers and high-frequency noise.
+
+The NUFFT enables direct spectrum estimation from irregularly sampled observations without temporal regularization, preserving the true spectral characteristics of the signal. The hybrid frequency selection strategy, combining prior phenological knowledge with data-driven spectral peak detection and parabolic refinement, ensures robust identification of dominant frequencies across diverse observation conditions. The Huber-Ridge objective function simultaneously suppresses outlier contamination and regularizes high-frequency noise, with the frequency-weighted Ridge penalty guaranteeing a strictly positive-definite normal equation and thus numerical stability even under severe temporal gaps.
+
+Experiments on Sentinel-2 Harmonized time series across 13 scenes and six spectral bands demonstrate that NUFROST outperforms both HANTS and Zhu2015 in terms of RMSE, MAE, Pearson correlation, and outlier ratio. The advantage is consistent across spectral bands and particularly pronounced under sparse-observation and continuous-gap scenarios. Ablation analysis confirms that each design component contributes positively to overall performance.
+
+Future work may extend NUFROST to multi-sensor fusion scenarios and explore adaptive hyperparameter selection based on per-pixel observation characteristics.
+
 \begin{thebibliography}{14}
 \bibliographystyle{IEEEtran}
 
