@@ -19,7 +19,7 @@ def load_yaml_config() -> Dict[str, Any]:
 class Args:
     # Defaults here serve as code-level fallbacks if YAML is missing/incomplete
     image: Union[Path, List[Path], List[str], str] = field(default_factory=Path)
-    cache_dir: Path = field(default_factory=lambda: Path("data/local_cache"))
+    cache_dir: Path = field(default_factory=lambda: Path("data/cache/local"))
     force_refresh: bool = False
     start_time: str = "2015-01-01T00:00:00"
     end_time: str = "2024-01-01T00:00:00"
@@ -27,9 +27,9 @@ class Args:
     time_unit: str = "seconds"
     modes: int = 4096
     eps: float = 1e-12
-    num_peaks: int = 8
+    num_peaks: int = 10
     power_cum: float = 0.7
-    ignore_dc_hz: float = 1e-9
+    ignore_dc_hz: float = 1e-10
     frequency_selection: str = "hybrid"
     preferred_periods_days: str = "365.25,182.625,91.3125,30.4375"
     preferred_top_k: int = 4
@@ -37,7 +37,7 @@ class Args:
     spectral_merge_tol: float = 0.15
     refine_peaks: bool = True
     include_trend: bool = True
-    ridge: float = 1e-2
+    ridge: float = 0.005
     freq_weight: float = 2.0
     huber_iters: int = 3
     huber_delta: float = 1.5
@@ -56,7 +56,7 @@ def build_arg_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
 
     ap.add_argument("-i", "--image", help="path to input multi-band time-series GeoTIFF", type=Path,
                     default=Path(d("image", "")) if d("image", "") else Path())
-    ap.add_argument("-c", "--cache-dir", type=Path, default=Path(d("cache_dir", "data/local_cache")),
+    ap.add_argument("-c", "--cache-dir", type=Path, default=Path(d("cache_dir", "data/cache/local")),
                     help="directory for cached npz cubes")
     ap.add_argument("--force-refresh", action="store_true", default=d("force_refresh", False),
                     help="ignore cached npz and rebuild from the tif")
@@ -74,9 +74,9 @@ def build_arg_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     # Frequency/fitting settings
     ap.add_argument("--modes", type=int, default=d("modes", 4096))
     ap.add_argument("--eps", type=float, default=d("eps", 1e-12))
-    ap.add_argument("--num-peaks", type=int, default=d("num_peaks", 8))
+    ap.add_argument("--num-peaks", type=int, default=d("num_peaks", 10))
     ap.add_argument("--power-cum", type=float, default=d("power_cum", 0.7))
-    ap.add_argument("--ignore-dc-hz", type=float, default=d("ignore_dc_hz", 1e-9))
+    ap.add_argument("--ignore-dc-hz", type=float, default=d("ignore_dc_hz", 1e-10))
     ap.add_argument("--frequency-selection", type=str, default=d("frequency_selection", "hybrid"),
                     choices=("spectral", "preferred", "hybrid"))
     ap.add_argument("--preferred-periods-days", type=str, default=d("preferred_periods_days", "365.25,182.625,91.3125,30.4375"),
@@ -104,7 +104,7 @@ def build_arg_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
         ap.add_argument("--include-trend", action="store_true", default=False,
                         help="enable linear trend in fit")
 
-    ap.add_argument("--ridge", type=float, default=d("ridge", 1e-2))
+    ap.add_argument("--ridge", type=float, default=d("ridge", 0.005))
     ap.add_argument("--freq-weight", type=float, default=d("freq_weight", 2.0))
     ap.add_argument("--huber-iters", type=int, default=d("huber_iters", 3))
     ap.add_argument("--huber-delta", type=float, default=d("huber_delta", 1.5))
