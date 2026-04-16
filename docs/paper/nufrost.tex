@@ -182,6 +182,32 @@ It is worth noting that the frequency-weighted Ridge penalty serves a crucial du
 
 \section{Experiment and Results}
 
+\subsection{Hyperparameter Settings}
+Table~\ref{tab:hyper} summarizes the hyperparameters used for all experiments. NUFROST parameters were fixed across all scenes; Zhu2015 and HANTS used their published default settings.
+
+\begin{table*}[b]
+\centering
+\caption{Hyperparameter settings for NUFROST}
+\label{tab:hyper}
+\begin{tabular}{llcr}
+\hline
+\textbf{Symbol} & \textbf{Parameter} & \textbf{Value} & \textbf{Reference} \\
+\hline
+$n$ & NUFFT modes & 4096 & Sec.~III-A \\
+$\eta$ & Cumulative energy threshold (\texttt{power\_cum}) & 0.7 & Eq.~(6) \\
+$\nu_{min}$ & Min.\ frequency threshold (\texttt{ignore\_dc\_hz}) & $10^{-10}$ & Sec.~III-B.1 \\
+$\epsilon_{tol}$ & Frequency snapping tolerance (\texttt{spectral\_merge\_tol}) & 0.15 & Sec.~III-B.1 \\
+  & Preferred periods (days) & \multicolumn{2}{c}{365.25, 182.625, 91.3125, 30.4375} \\
+  & Number of data-driven peaks & 10 & Sec.~III-B.1 \\
+$\delta$ & Huber threshold (\texttt{huber\_delta}) & 1.5 & Eq.~(5) \\
+  & IRLS iterations (\texttt{huber\_iters}) & 3 & Sec.~III-B.2 \\
+$\lambda$ & Ridge regularization (\texttt{ridge}) & 0.005 & Eq.~(7) \\
+$\gamma$ & Frequency penalty weight (\texttt{freq\_weight}) & 2.0 & Eq.~(8) \\
+  & Min.\ observations per pixel (\texttt{min\_obs}) & 12 & -- \\
+\hline
+\end{tabular}
+\end{table*}
+
 To evaluate the robustness and accuracy of the proposed NUFROST algorithm, we conducted simulation experiments using real Sentinel-2 Harmonized time-series data. The performance of NUFROST was systematically compared against two widely used time-series reconstruction methods: the Lasso-based fitting algorithm by Zhu et al. (2015)~\cite{ref14} (hereafter referred to as Zhu2015) and the Harmonic Analysis of Time Series (HANTS) algorithm~\cite{ref10}.
 
 \begin{figure*}[!b]
@@ -212,31 +238,7 @@ To rigorously test the resilience of the algorithms to missing data, we designed
 
 For all experiments, NUFROST, Zhu2015, and HANTS were evaluated on the same masked targets. Hyperparameters for each method were kept fixed throughout the comparison in order to avoid case-specific tuning. This protocol emphasizes robustness under a unified evaluation pipeline rather than per-scene manual optimization. Final summaries were reported over repeated masking experiments and aggregated across ROIs to reduce sensitivity to any single random split.
 
-\subsection{Hyperparameter Settings}
-Table~\ref{tab:hyper} summarizes the hyperparameters used for all experiments. NUFROST parameters were fixed across all scenes; Zhu2015 and HANTS used their published default settings.
 
-\begin{table*}[ht]
-\centering
-\caption{Hyperparameter settings for NUFROST}
-\label{tab:hyper}
-\begin{tabular}{llcr}
-\hline
-\textbf{Symbol} & \textbf{Parameter} & \textbf{Value} & \textbf{Reference} \\
-\hline
-$n$ & NUFFT modes & 4096 & Sec.~III-A \\
-$\eta$ & Cumulative energy threshold (\texttt{power\_cum}) & 0.7 & Eq.~(6) \\
-$\nu_{min}$ & Min.\ frequency threshold (\texttt{ignore\_dc\_hz}) & $10^{-10}$ & Sec.~III-B.1 \\
-$\epsilon_{tol}$ & Frequency snapping tolerance (\texttt{spectral\_merge\_tol}) & 0.15 & Sec.~III-B.1 \\
-  & Preferred periods (days) & \multicolumn{2}{c}{365.25, 182.625, 91.3125, 30.4375} \\
-  & Number of data-driven peaks & 10 & Sec.~III-B.1 \\
-$\delta$ & Huber threshold (\texttt{huber\_delta}) & 1.5 & Eq.~(5) \\
-  & IRLS iterations (\texttt{huber\_iters}) & 3 & Sec.~III-B.2 \\
-$\lambda$ & Ridge regularization (\texttt{ridge}) & 0.005 & Eq.~(7) \\
-$\gamma$ & Frequency penalty weight (\texttt{freq\_weight}) & 2.0 & Eq.~(8) \\
-  & Min.\ observations per pixel (\texttt{min\_obs}) & 12 & -- \\
-\hline
-\end{tabular}
-\end{table*}
 
 \subsection{Evaluation Metrics}
 The predicted reflectance values were compared against the original valid observations treated as reference values. We report four complementary metrics to assess both reconstruction accuracy and robustness:
@@ -255,7 +257,7 @@ The overall reconstruction accuracy of NUFROST, Zhu2015, and HANTS is visualized
 The per-band analysis reveals that NUFROST consistently outperformed the baseline methods across all six Sentinel-2 bands (B2, B3, B4, B8, B11, B12). The improvement is particularly pronounced in the visible bands (B2, B3, B4) where atmospheric scattering and residual cloud effects are more severe. For instance, in the blue band (B2) NUFROST reduced the median RMSE to 130.1 (vs. 312.3 for Zhu2015 and 394.0 for HANTS) while increasing $R$ to 0.717 (vs. 0.325 and 0.579). The near-infrared and short-wave infrared bands (B8, B11, B12) also benefited from NUFROST’s robust frequency-weighted regularization, with $R$ values exceeding 0.87 in all three bands. These results confirm that NUFROST’s direct spectral estimation from irregular samples, combined with Huber-Ridge robust regression, delivers more accurate and stable reconstructions than conventional interpolation-based or harmonic-fitting approaches.
 
 \subsection{Sparse-Observation Resilience}
-To evaluate the resilience of each algorithm under sparse temporal sampling, we conducted random point-masking experiments where valid observations were randomly removed from otherwise complete pixel-wise time series. Figure~\ref{fig_sim} (left panels) illustrates the reconstruction error as a function of the fraction of retained observations. NUFROST maintained stable performance even when only 20--30\% of the original observations were available, with its median RMSE increasing by less than 15\% compared to the full-observation case. In contrast, both Zhu2015 and HANTS showed a rapid degradation of accuracy as the observation density decreased, with RMSE increases exceeding 50\% for retention rates below 40\%. 
+To evaluate the resilience of each algorithm under sparse temporal sampling, we conducted random point-masking experiments where valid observations were randomly removed from otherwise complete pixel-wise time series. Figure~\ref{fig_sim} (left panels) illustrates the reconstruction error as a function of the fraction of retained observations. NUFROST maintained stable performance even when only 20--30\% of the original observations were available, with its median RMSE increasing by less than 15\% compared to the full-observation case. In contrast, both Zhu2015 and HANTS showed a rapid degradation of accuracy as the observation density decreased, with RMSE increases exceeding 50\% for retention rates below 40\%.
 
 The advantage of NUFROST stems from its ability to estimate dominant frequencies directly from irregular samples via NUFFT, avoiding the spectral distortion introduced by interpolation-based regularization. When observations become extremely sparse, the conventional methods struggle to capture the true seasonal trajectory because their implicit or explicit interpolation steps amplify high-frequency noise and create artificial periodicities. NUFROST’s frequency-weighted Ridge penalty further stabilizes the solution by suppressing unreliable high-frequency components, yielding a reconstruction that remains faithful to the underlying phenological signal even under severe observation sparsity.
 
