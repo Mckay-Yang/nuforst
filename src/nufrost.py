@@ -343,14 +343,17 @@ def robust_fit_freq_ridge(X: np.ndarray, y: np.ndarray, freqs: np.ndarray, lam: 
     return beta, y_hat
 
 
-def fit_nufrost_pixel_params(t_sec: np.ndarray, y: np.ndarray, target_t: Optional[float] = None,
+def fit_nufrost_pixel_params(t_sec: np.ndarray, y: np.ndarray, target_t: Optional[float] = None,  # reserved for future prediction at specific time
                              nufft_modes: int = 4096, eps: float = 1e-12,
                              num_peaks: int = 10, power_cum: float = 0.7, ignore_dc_hz: float = 1e-10,
                               frequency_selection: str = "hybrid", preferred_periods_days: Union[str, Sequence[float], np.ndarray] = "365.25,182.625,91.3125,30.4375", preferred_top_k: int = 4, spectral_top_k: int = 4, spectral_merge_tol: float = 0.15,
                               refine_peaks: bool = True, include_trend: bool = True,
                               ridge_lam: float = 0.005, freq_weight: float = 2.0, huber_iters: int = 3, huber_delta: float = 1.5,
-                              min_obs: int = 12, max_freqs: int = 10) -> Dict[str, Any]:
-    beta_size = 1 + (1 if include_trend else 0) + 2 * max(0, max_freqs)
+                              min_obs: int = 12, max_freqs: Optional[int] = None) -> Dict[str, Any]:
+    if max_freqs is None:
+        max_freqs = max(num_peaks, preferred_top_k + spectral_top_k, 10)
+    max_freqs = max(0, max_freqs)
+    beta_size = 1 + (1 if include_trend else 0) + 2 * max_freqs
     params: Dict[str, Any] = {
         "valid": False,
         "include_trend": bool(include_trend),
@@ -358,7 +361,7 @@ def fit_nufrost_pixel_params(t_sec: np.ndarray, y: np.ndarray, target_t: Optiona
         "t_min": np.nan,
         "t_rel_mean": np.nan,
         "fill_value": np.nan,
-        "freqs": np.full(max(0, max_freqs), np.nan, dtype=np.float64),
+        "freqs": np.full(max_freqs, np.nan, dtype=np.float64),
         "beta": np.full(beta_size, np.nan, dtype=np.float64),
     }
 
@@ -407,7 +410,7 @@ def fit_nufrost_pixel_params(t_sec: np.ndarray, y: np.ndarray, target_t: Optiona
         ignore_dc_hz=ignore_dc_hz,
         refine_peaks=refine_peaks,
     )
-    freqs_sel = np.asarray(freqs_sel[:max(0, max_freqs)], dtype=np.float64)
+    freqs_sel = np.asarray(freqs_sel[:max_freqs], dtype=np.float64)
     X = design_matrix(t_rel, freqs_sel, include_trend=include_trend, include_dc=True)
     beta, _ = robust_fit_freq_ridge(
         X,
@@ -479,7 +482,7 @@ def predict_single_pixel(t_sec: np.ndarray, y: np.ndarray, target_t: float,
         huber_iters=huber_iters,
         huber_delta=huber_delta,
         min_obs=min_obs,
-        max_freqs=max(num_peaks, spectral_top_k, preferred_top_k, 1),
+        max_freqs=max(num_peaks, preferred_top_k + spectral_top_k, 1),
     )
     return predict_nufrost_from_params(params, target_t), int(params["n_freqs_used"])
 
@@ -510,7 +513,7 @@ def predict_curve_pixel(t_sec: np.ndarray, y: np.ndarray, target_t_secs: np.ndar
         huber_iters=huber_iters,
         huber_delta=huber_delta,
         min_obs=min_obs,
-        max_freqs=max(num_peaks, spectral_top_k, preferred_top_k, 1),
+        max_freqs=max(num_peaks, preferred_top_k + spectral_top_k, 1),
     )
     return predict_nufrost_curve_from_params(params, target_t_secs)
 

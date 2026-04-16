@@ -1,5 +1,5 @@
 image: ""
-cache_dir: "data/local_cache"
+cache_dir: "data/cache/local"
 force_refresh: false
 start_time: "2015-01-01T00:00:00"
 end_time: "2024-01-01T00:00:00"
