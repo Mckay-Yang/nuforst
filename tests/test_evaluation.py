@@ -126,3 +126,22 @@ def test_evaluate_algorithms_from_source_parallel(single_tile_path: str, cache_d
         )
     assert set(df["Algorithm"]) == {"NuFrost", "Zhu2015", "HANTS"}
     assert np.isfinite(df["RMSE"]).all()
+
+
+def test_evaluate_timeseries_from_source_parallel(single_tile_path: str, cache_dir) -> None:
+    args = build_args({"cache_dir": cache_dir, "force_refresh": False, "min_obs": 6, "n_jobs": 2})
+    with open_evaluation_source([single_tile_path], args) as prepared:
+        sampled_pixels = sample_gap_pixels_from_source(
+            prepared["source"], prepared["t_days"], min_obs=args.min_obs, num_samples=10, seed=123
+        )
+        df = evaluate_timeseries_from_source(
+            prepared["source"],
+            prepared["t_sec"],
+            prepared["t_days"],
+            args,
+            simulate_gap_days=30,
+            sampled_pixels=sampled_pixels,
+            n_jobs=2,
+        )
+    assert set(df["Algorithm"]) == {"NuFrost", "Zhu2015", "HANTS"}
+    assert np.isfinite(df["MAE"]).all()

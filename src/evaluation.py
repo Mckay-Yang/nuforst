@@ -395,6 +395,8 @@ def evaluate_timeseries_from_source(
     num_samples: Optional[int] = None,
     sampled_pixels: Optional[np.ndarray] = None,
     n_jobs: int = -1,
+    batch_size: int = 500,
+    on_batch_done=None,
 ) -> pd.DataFrame:
     if sampled_pixels is None:
         if num_samples is None:
@@ -406,11 +408,52 @@ def evaluate_timeseries_from_source(
         return pd.DataFrame()
 
     print(f"Selected {len(sampled_pixels)} valid pixels for time-series evaluation.")
+    n_jobs_resolved = _resolve_n_jobs(n_jobs)
+    T = len(t_days)
     start_time = time.time()
+
     pixel_results = []
-    for r, c in sampled_pixels:
-        y_ts = source.read_pixel_series(int(r), int(c)).copy()
-        pixel_results.append(_process_pixel_ts(int(r), int(c), y_ts, t_days, t_sec, len(t_days), simulate_gap_days, args))
+    if JOBLIB_AVAILABLE and n_jobs_resolved > 1:
+        print(f"Running predictions with {n_jobs_resolved} parallel workers...")
+        n_pixels = len(sampled_pixels)
+        for batch_start in range(0, n_pixels, batch_size):
+            batch_end = min(batch_start + batch_size, n_pixels)
+            batch_pixels = sampled_pixels[batch_start:batch_end]
+            tasks = [
+                delayed(_process_pixel_ts)(
+                    int(r), int(c),
+                    source.read_pixel_series(int(r), int(c)).copy(),
+                    t_days, t_sec, T, simulate_gap_days, args
+                )
+                for r, c in batch_pixels
+            ]
+            if TQDM_AVAILABLE:
+                try:
+                    gen = Parallel(n_jobs=n_jobs_resolved, return_as="generator")(tasks)
+                    batch_results = list(tqdm(gen, total=len(tasks), desc=f"Pixels {batch_start}-{batch_end}"))
+                except TypeError:
+                    batch_results = Parallel(n_jobs=n_jobs_resolved)(tasks)
+            else:
+                batch_results = Parallel(n_jobs=n_jobs_resolved)(tasks)
+            pixel_results.extend(batch_results)
+            if on_batch_done is not None:
+                on_batch_done(batch_results, batch_start, batch_end)
+    else:
+        iterator = sampled_pixels
+        if TQDM_AVAILABLE:
+            iterator = tqdm(iterator, total=len(sampled_pixels), desc="Evaluating Pixels")
+        batch_results = []
+        for i, (r, c) in enumerate(iterator):
+            y_ts = source.read_pixel_series(int(r), int(c)).copy()
+            res = _process_pixel_ts(int(r), int(c), y_ts, t_days, t_sec, T, simulate_gap_days, args)
+            pixel_results.append(res)
+            batch_results.append(res)
+            if on_batch_done is not None and len(batch_results) >= batch_size:
+                on_batch_done(batch_results, i + 1 - len(batch_results), i + 1)
+                batch_results = []
+        if on_batch_done is not None and batch_results:
+            on_batch_done(batch_results, len(sampled_pixels) - len(batch_results), len(sampled_pixels))
+
     true_all_nufrost, pred_all_nufrost = [], []
     true_all_zhu, pred_all_zhu = [], []
     true_all_hants, pred_all_hants = [], []
