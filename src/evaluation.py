@@ -3,7 +3,7 @@ import pandas as pd
 import time
 import os
 from contextlib import contextmanager
-from typing import Iterator, Tuple, Dict, List, Optional, Union
+from typing import Iterator, Tuple, Dict, List, Optional, Union, Callable
 from pathlib import Path
 import warnings
 from collections import defaultdict
@@ -50,6 +50,37 @@ def _resolve_n_jobs(n_jobs: int) -> int:
     if n_jobs <= 0:
         return max(1, int(os.cpu_count() or 1)) if cpu_count is None else max(1, int(cpu_count()))
     return n_jobs
+
+
+def _handle_batch_callback(
+    batch_results: List[Optional[Dict]],
+    batch_start: int,
+    batch_end: int,
+    on_batch_done: Optional[Callable[[List[Optional[Dict]], int, int], None]],
+) -> None:
+    """Handle on_batch_done callback with exception protection.
+    
+    Args:
+        batch_results: List of results from _process_pixel_ts (may contain None).
+        batch_start: Start index of batch in the overall pixel list.
+        batch_end: End index (exclusive) of batch in the overall pixel list.
+        on_batch_done: Callback function, if provided.
+    
+    Returns:
+        None. If callback raises an exception, a warning is logged and execution continues.
+    """
+    if on_batch_done is None:
+        return
+    try:
+        on_batch_done(batch_results, batch_start, batch_end)
+    except Exception as e:
+        import warnings
+        warnings.warn(
+            f"on_batch_done callback failed with error: {e}. "
+            "Batch results will still be accumulated in memory.",
+            RuntimeWarning,
+            stacklevel=2
+        )
 
 
 def load_evaluation_cube(
@@ -396,8 +427,32 @@ def evaluate_timeseries_from_source(
     sampled_pixels: Optional[np.ndarray] = None,
     n_jobs: int = -1,
     batch_size: int = 500,
-    on_batch_done=None,
+    on_batch_done: Optional[Callable[[List[Optional[Dict]], int, int], None]] = None,
 ) -> pd.DataFrame:
+    """Evaluate reconstruction algorithms on sampled pixels from a streaming source.
+    
+    This function performs gap-filling evaluation by simulating gaps of specified
+    length in pixel time series. It can run in parallel using joblib and supports
+    incremental saving of results via the on_batch_done callback.
+    
+    Args:
+        source: TimeSeriesRasterSource providing pixel time series.
+        t_sec: Timestamps in seconds (1D array).
+        t_days: Timestamps in days relative to start (1D array).
+        args: Configuration arguments (min_obs, ridge, etc.).
+        simulate_gap_days: Length of continuous gap to simulate (days).
+        num_samples: Number of pixels to sample (if sampled_pixels not provided).
+        sampled_pixels: Pre-sampled pixel coordinates (row, col) as (N,2) array.
+        n_jobs: Number of parallel jobs (-1 uses all cores, 1 disables parallel).
+        batch_size: Number of pixels processed per batch (for incremental saving).
+        on_batch_done: Callback invoked after each batch with arguments
+            (batch_results, batch_start, batch_end). Exceptions in the callback
+            are caught and logged as warnings, without interrupting evaluation.
+    
+    Returns:
+        DataFrame with columns Algorithm, RMSE, MAE, R, OutlierRatio for each
+        of the three algorithms (NuFrost, Zhu2015, HANTS).
+    """
     if sampled_pixels is None:
         if num_samples is None:
             raise ValueError("Either num_samples or sampled_pixels must be provided.")
@@ -436,8 +491,7 @@ def evaluate_timeseries_from_source(
             else:
                 batch_results = Parallel(n_jobs=n_jobs_resolved)(tasks)
             pixel_results.extend(batch_results)
-            if on_batch_done is not None:
-                on_batch_done(batch_results, batch_start, batch_end)
+            _handle_batch_callback(batch_results, batch_start, batch_end, on_batch_done)
     else:
         iterator = sampled_pixels
         if TQDM_AVAILABLE:
@@ -448,11 +502,11 @@ def evaluate_timeseries_from_source(
             res = _process_pixel_ts(int(r), int(c), y_ts, t_days, t_sec, T, simulate_gap_days, args)
             pixel_results.append(res)
             batch_results.append(res)
-            if on_batch_done is not None and len(batch_results) >= batch_size:
-                on_batch_done(batch_results, i + 1 - len(batch_results), i + 1)
+            if len(batch_results) >= batch_size:
+                _handle_batch_callback(batch_results, i + 1 - len(batch_results), i + 1, on_batch_done)
                 batch_results = []
-        if on_batch_done is not None and batch_results:
-            on_batch_done(batch_results, len(sampled_pixels) - len(batch_results), len(sampled_pixels))
+        if batch_results:
+            _handle_batch_callback(batch_results, len(sampled_pixels) - len(batch_results), len(sampled_pixels), on_batch_done)
 
     true_all_nufrost, pred_all_nufrost = [], []
     true_all_zhu, pred_all_zhu = [], []

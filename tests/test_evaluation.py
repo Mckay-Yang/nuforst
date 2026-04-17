@@ -145,3 +145,82 @@ def test_evaluate_timeseries_from_source_parallel(single_tile_path: str, cache_d
         )
     assert set(df["Algorithm"]) == {"NuFrost", "Zhu2015", "HANTS"}
     assert np.isfinite(df["MAE"]).all()
+
+
+def test_evaluate_timeseries_from_source_callback(single_tile_path: str, cache_dir) -> None:
+    """Test that on_batch_done callback is invoked correctly."""
+    import warnings
+    args = build_args({"cache_dir": cache_dir, "force_refresh": False, "min_obs": 6, "n_jobs": 1})
+    
+    call_log = []
+    def mock_callback(batch_results, batch_start, batch_end):
+        call_log.append({
+            "batch_start": batch_start,
+            "batch_end": batch_end,
+            "num_results": len(batch_results)
+        })
+    
+    with open_evaluation_source([single_tile_path], args) as prepared:
+        sampled_pixels = sample_gap_pixels_from_source(
+            prepared["source"], prepared["t_days"], min_obs=args.min_obs, num_samples=15, seed=123
+        )
+        df = evaluate_timeseries_from_source(
+            prepared["source"],
+            prepared["t_sec"],
+            prepared["t_days"],
+            args,
+            simulate_gap_days=30,
+            sampled_pixels=sampled_pixels,
+            n_jobs=1,
+            batch_size=5,
+            on_batch_done=mock_callback,
+        )
+    
+    assert set(df["Algorithm"]) == {"NuFrost", "Zhu2015", "HANTS"}
+    assert np.isfinite(df["MAE"]).all()
+    # Should have 3 batches (15 pixels, batch_size=5)
+    assert len(call_log) == 3
+    assert call_log[0]["batch_start"] == 0
+    assert call_log[0]["batch_end"] == 5
+    assert call_log[0]["num_results"] == 5
+    assert call_log[1]["batch_start"] == 5
+    assert call_log[1]["batch_end"] == 10
+    assert call_log[2]["batch_start"] == 10
+    assert call_log[2]["batch_end"] == 15
+
+
+def test_evaluate_timeseries_from_source_callback_exception(single_tile_path: str, cache_dir) -> None:
+    """Test that exceptions in on_batch_done are caught and warned."""
+    import warnings
+    args = build_args({"cache_dir": cache_dir, "force_refresh": False, "min_obs": 6, "n_jobs": 1})
+    
+    call_count = 0
+    def failing_callback(batch_results, batch_start, batch_end):
+        nonlocal call_count
+        call_count += 1
+        raise RuntimeError("Test error in callback")
+    
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        with open_evaluation_source([single_tile_path], args) as prepared:
+            sampled_pixels = sample_gap_pixels_from_source(
+                prepared["source"], prepared["t_days"], min_obs=args.min_obs, num_samples=10, seed=123
+            )
+            df = evaluate_timeseries_from_source(
+                prepared["source"],
+                prepared["t_sec"],
+                prepared["t_days"],
+                args,
+                simulate_gap_days=30,
+                sampled_pixels=sampled_pixels,
+                n_jobs=1,
+                batch_size=5,
+                on_batch_done=failing_callback,
+            )
+        
+        assert call_count > 0  # Callback should have been called
+        assert len(w) >= call_count  # Should have warnings for each failed callback
+        assert any("on_batch_done callback failed" in str(warning.message) for warning in w)
+    
+    assert set(df["Algorithm"]) == {"NuFrost", "Zhu2015", "HANTS"}
+    assert np.isfinite(df["MAE"]).all()
