@@ -94,8 +94,8 @@ nufrost/
 
 - `data/hls/`: expected location for HLS time-series GeoTIFF inputs.
 - `data/sentinel-2/`: expected location for Sentinel-2 time-series GeoTIFF inputs.
-- `data/local_cache/`: local `npz` cube cache and VRT cache.
-- `data/colab_cache/`: Colab-specific cache location used by the Colab notebooks.
+- `data/cache/local/`: local `npz` cube cache and VRT cache.
+- `data/cache/colab/`: Colab-specific cache location used by the Colab notebooks.
 - `data/output/`: reconstructed GeoTIFFs, evaluation CSVs, and generated figures.
 - `data/test_sample/`: small sample data used for loader testing and local checks.
 
@@ -198,7 +198,7 @@ from config import build_args
 
 args = build_args({})
 args.image = image_paths
-args.cache_dir = "data/local_cache"
+args.cache_dir = "data/cache/local"
 args.n_jobs = -1
 ```
 
@@ -215,14 +215,14 @@ image_paths = find_image_chunks(
     lon=91.2734,
     lat=29.7904,
     band="BLUE",
-    cache_dir="data/local_cache",
+    cache_dir="data/cache/local",
 )
 
 recon = src.reconstruct_nufrost(
     image=image_paths,
     target_time="2023-06-15T00:00:00",
     output_path="data/output/example_nufrost.tif",
-    cache_dir="data/local_cache",
+    cache_dir="data/cache/local",
     n_jobs=-1,
 )
 ```
@@ -241,12 +241,12 @@ image_paths = find_image_chunks(
     lon=91.2734,
     lat=29.7904,
     band="BLUE",
-    cache_dir="data/local_cache",
+    cache_dir="data/cache/local",
 )
 
 args = build_args({})
 args.image = image_paths
-args.cache_dir = "data/local_cache"
+args.cache_dir = "data/cache/local"
 args.n_jobs = -1
 
 df = evaluation.evaluate_algorithms(

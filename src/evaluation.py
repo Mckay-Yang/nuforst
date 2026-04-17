@@ -340,7 +340,10 @@ def evaluate_algorithms_from_source(
         for t in t_idxs:
             y_ts[t] = np.nan
         for target_t_idx in t_idxs:
-            tasks.append(delayed(_process_random_point)(target_t_idx, r, c, y_ts, t_sec, t_days, args))
+            if JOBLIB_AVAILABLE:
+                tasks.append(delayed(_process_random_point)(target_t_idx, r, c, y_ts, t_sec, t_days, args))
+            else:
+                tasks.append((_process_random_point, (target_t_idx, r, c, y_ts, t_sec, t_days, args), {}))
             ordered_points.append((target_t_idx, r, c))
 
     point_results = []
@@ -471,7 +474,10 @@ def evaluate_algorithms_on_cube(
             y_ts[t] = np.nan
 
         for target_t_idx in t_idxs:
-            tasks.append(delayed(_process_random_point)(target_t_idx, r, c, y_ts, t_sec, t_days, args))
+            if JOBLIB_AVAILABLE:
+                tasks.append(delayed(_process_random_point)(target_t_idx, r, c, y_ts, t_sec, t_days, args))
+            else:
+                tasks.append((_process_random_point, (target_t_idx, r, c, y_ts, t_sec, t_days, args), {}))
             ordered_points.append((target_t_idx, r, c))
 
     point_results = []

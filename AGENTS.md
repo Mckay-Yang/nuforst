@@ -15,7 +15,7 @@
 - `find_image_chunks()` returns a `List[str]`, usually a one-element list containing the final VRT path. Do not treat it as a single string.
 - `find_image_chunks()` writes cached VRTs under `<cache_dir>/vrts/`.
 - `RSCube._read_tif()` only reads the top-left `512x512` window of each source raster for memory safety.
-- Default caches are `data/local_cache` for local runs and `data/colab_cache` for Colab-oriented notebooks.
+- Default caches are `data/cache/local` for local runs and `data/cache/colab` for Colab-oriented notebooks.
 
 ## Output And Verification
 

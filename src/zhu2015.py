@@ -13,6 +13,7 @@ from joblib import Parallel, delayed, cpu_count
 
 # Constants
 DAYS_PER_YEAR = 365.25
+MAX_ZHU_ORDER = 3
 
 
 def _select_model_order(n_obs: int) -> int:
@@ -233,6 +234,113 @@ def extract_segments(t_days: np.ndarray, y: np.ndarray, lasso_alpha: float = 0.0
 
     return segments
 
+
+def _pack_zhu_coefficients(coef: np.ndarray, order: int, max_order: int = MAX_ZHU_ORDER) -> np.ndarray:
+    packed = np.zeros(2 * max_order + 1, dtype=np.float64)
+    if order <= 0:
+        return packed
+    harmonic_terms = min(2 * order, max(0, len(coef) - 1))
+    if harmonic_terms > 0:
+        packed[:harmonic_terms] = coef[:harmonic_terms]
+    packed[-1] = coef[-1]
+    return packed
+
+
+def _make_full_design_matrix(x: np.ndarray, max_order: int = MAX_ZHU_ORDER) -> np.ndarray:
+    cols = []
+    w = 2 * np.pi / DAYS_PER_YEAR
+    for k in range(1, max_order + 1):
+        cols.append(np.cos(k * w * x))
+        cols.append(np.sin(k * w * x))
+    cols.append(x)
+    return np.column_stack(cols)
+
+
+def fit_zhu2015_pixel_params(
+    t_days: np.ndarray,
+    y: np.ndarray,
+    lasso_alpha: float = 0.001,
+    max_segments: int = 10,
+    max_order: int = MAX_ZHU_ORDER,
+) -> Dict[str, Any]:
+    params: Dict[str, Any] = {
+        "valid": False,
+        "n_segments": 0,
+        "max_order": int(max_order),
+        "segment_start_days": np.full(max_segments, np.nan, dtype=np.float64),
+        "segment_end_days": np.full(max_segments, np.nan, dtype=np.float64),
+        "segment_orders": np.zeros(max_segments, dtype=np.int16),
+        "segment_unit_qas": np.full(max_segments, 255, dtype=np.int16),
+        "segment_has_model": np.zeros(max_segments, dtype=np.int8),
+        "segment_median_values": np.full(max_segments, np.nan, dtype=np.float64),
+        "segment_intercepts": np.zeros(max_segments, dtype=np.float64),
+        "segment_coefficients": np.zeros((max_segments, 2 * max_order + 1), dtype=np.float64),
+    }
+
+    valid_mask = np.isfinite(y) & np.isfinite(t_days)
+    if not np.any(valid_mask):
+        return params
+
+    t_valid = np.asarray(t_days[valid_mask], dtype=np.float64)
+    y_valid = np.asarray(y[valid_mask], dtype=np.float64)
+    segments = extract_segments(t_valid, y_valid, lasso_alpha)
+    if not segments:
+        return params
+
+    n_segments = min(len(segments), max_segments)
+    params["valid"] = True
+    params["n_segments"] = n_segments
+
+    for idx, seg in enumerate(segments[:n_segments]):
+        params["segment_start_days"][idx] = float(t_valid[seg['start_idx']])
+        params["segment_end_days"][idx] = float(t_valid[seg['end_idx']])
+        params["segment_orders"][idx] = int(seg['order'])
+        params["segment_unit_qas"][idx] = int(seg['unit_qa'])
+        params["segment_median_values"][idx] = float(seg['median_val'])
+        if seg['clf'] is not None:
+            params["segment_has_model"][idx] = 1
+            params["segment_intercepts"][idx] = float(seg['clf'].intercept_)
+            params["segment_coefficients"][idx] = _pack_zhu_coefficients(np.asarray(seg['clf'].coef_, dtype=np.float64), int(seg['order']), max_order=max_order)
+
+    return params
+
+
+def predict_zhu2015_from_params(params: Dict[str, Any], target_t_day: float) -> Tuple[float, int]:
+    if not bool(params.get("valid", False)) or int(params.get("n_segments", 0)) == 0:
+        return np.nan, 255
+
+    n_segments = int(params["n_segments"])
+    starts = np.asarray(params["segment_start_days"], dtype=np.float64)[:n_segments]
+    ends = np.asarray(params["segment_end_days"], dtype=np.float64)[:n_segments]
+    orders = np.asarray(params["segment_orders"], dtype=np.int16)[:n_segments]
+    unit_qas = np.asarray(params["segment_unit_qas"], dtype=np.int16)[:n_segments]
+    has_model = np.asarray(params["segment_has_model"], dtype=np.int8)[:n_segments]
+    median_vals = np.asarray(params["segment_median_values"], dtype=np.float64)[:n_segments]
+    intercepts = np.asarray(params["segment_intercepts"], dtype=np.float64)[:n_segments]
+    coeffs = np.asarray(params["segment_coefficients"], dtype=np.float64)[:n_segments]
+
+    seg_idx = None
+    qa_prefix = 0
+    for idx, (start_day, end_day) in enumerate(zip(starts, ends)):
+        if start_day <= target_t_day <= end_day:
+            seg_idx = idx
+            break
+    if seg_idx is None:
+        if target_t_day < starts[0]:
+            seg_idx = 0
+            qa_prefix = 1
+        else:
+            seg_idx = n_segments - 1
+            qa_prefix = 2
+
+    qa = qa_prefix * 10 + int(unit_qas[seg_idx])
+    if not has_model[seg_idx]:
+        return float(median_vals[seg_idx]), qa
+
+    X = _make_full_design_matrix(np.array([target_t_day], dtype=np.float64), max_order=int(params["max_order"]))
+    pred = float(intercepts[seg_idx] + (X @ coeffs[seg_idx]).item())
+    return pred, qa
+
 def predict_target(segments: List[Dict[str, Any]], t_days: np.ndarray, target_t_day: float) -> Tuple[float, int]:
     if not segments:
         return np.nan, 255
@@ -269,17 +377,8 @@ def fit_predict_pixel(
     target_t_day: float,
     lasso_alpha: float = 0.001
 ) -> Tuple[float, int]:
-    valid_mask = np.isfinite(y) & np.isfinite(t_days)
-    if not np.any(valid_mask):
-        return np.nan, 255
-
-    t_valid = t_days[valid_mask]
-    y_valid = y[valid_mask]
-
-    segments = extract_segments(t_valid, y_valid, lasso_alpha)
-    pred, qa = predict_target(segments, t_valid, target_t_day)
-
-    return pred, qa
+    params = fit_zhu2015_pixel_params(t_days, y, lasso_alpha=lasso_alpha)
+    return predict_zhu2015_from_params(params, target_t_day)
 
 def predict_curve_pixel(
     t_days: np.ndarray,
@@ -287,19 +386,11 @@ def predict_curve_pixel(
     target_t_days: np.ndarray,
     lasso_alpha: float = 0.001
 ) -> np.ndarray:
-    valid_mask = np.isfinite(y) & np.isfinite(t_days)
-    if not np.any(valid_mask):
-        return np.full(len(target_t_days), np.nan)
-
-    t_valid = t_days[valid_mask]
-    y_valid = y[valid_mask]
-
-    segments = extract_segments(t_valid, y_valid, lasso_alpha)
+    params = fit_zhu2015_pixel_params(t_days, y, lasso_alpha=lasso_alpha)
     preds = np.zeros(len(target_t_days), dtype=np.float32)
     for i, target_t in enumerate(target_t_days):
-        pred, _ = predict_target(segments, t_valid, target_t)
+        pred, _ = predict_zhu2015_from_params(params, float(target_t))
         preds[i] = pred
-
     return preds
 
 def reconstruct_zhu2015(
@@ -308,7 +399,7 @@ def reconstruct_zhu2015(
     output_path: Optional[Union[str, Path]] = None,
     lasso_alpha: float = 0.0001,
     n_jobs: int = -1,
-    cache_dir: Union[str, Path] = "data/local_cache",
+    cache_dir: Union[str, Path] = "data/cache/local",
     force_refresh: bool = False
 ) -> np.ndarray:
     """

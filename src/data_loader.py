@@ -4,13 +4,14 @@ import rasterio
 import numpy as np
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Tuple, Optional, Union, List
+from typing import Dict, Iterator, Tuple, Optional, Union, List
 import glob
 import re
 from collections import defaultdict
 import subprocess
 import os
 import xml.etree.ElementTree as ET
+from rasterio.windows import Window
 
 
 GDAL_DTYPE_MAP = {
@@ -27,6 +28,45 @@ GDAL_DTYPE_MAP = {
     "complex64": "CFloat32",
     "complex128": "CFloat64",
 }
+
+READ_LAYOUT_VERSION = "full-image-v1"
+
+
+def _resolve_cache_root(cache_dir: Optional[Union[str, Path]]) -> Path:
+    if cache_dir is None:
+        return Path(__file__).resolve().parent.parent / "data" / "cache" / "local"
+    return Path(cache_dir)
+
+
+def _cache_subdir(cache_root: Path, kind: str) -> Path:
+    path = cache_root / kind
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _parse_band_timestamp(name: str) -> str:
+    tokens = [name.strip()]
+
+    match = re.search(r'(\d{8}T\d{6})', name)
+    if match:
+        try:
+            return datetime.strptime(match.group(1), "%Y%m%dT%H%M%S").isoformat()
+        except ValueError:
+            pass
+
+    digits = "".join(ch for ch in name if ch.isdigit())
+    if len(digits) >= 8:
+        tokens.append(digits[:8])
+    if len(digits) >= 14:
+        tokens.append(digits[:14])
+    fmts = ("%Y%m%d", "%Y-%m-%d", "%Y/%m/%d", "%Y%m%dT%H%M%S", "%Y-%m-%dT%H:%M:%S")
+    for tok in tokens:
+        for fmt in fmts:
+            try:
+                return datetime.strptime(tok, fmt).isoformat()
+            except ValueError:
+                continue
+    return name.strip() or "band"
 
 
 def _gdal_dtype_name(dtype: str) -> str:
@@ -184,8 +224,8 @@ def _write_stacked_vrt(vrt_path: Path, ordered_part_files: List[List[Path]]) -> 
                 row_off = int(round(row_off_f))
 
                 simple_source = ET.SubElement(vrt_band, "SimpleSource")
-                src_filename = ET.SubElement(simple_source, "SourceFilename", relativeToVRT="1")
-                src_filename.text = Path(os.path.relpath(tile_info["path"], start=vrt_path.parent)).as_posix()
+                src_filename = ET.SubElement(simple_source, "SourceFilename", relativeToVRT="0")
+                src_filename.text = str(Path(tile_info["path"]).resolve())
                 src_band = ET.SubElement(simple_source, "SourceBand")
                 src_band.text = str(src_band_idx)
 
@@ -234,11 +274,7 @@ class RSCube:
             force_refresh: bool = False
         ) -> None:
         self.tif_paths = self._resolve_paths(tif_path)
-        if cache_dir is None:
-            # Default to data/local_cache relative to the project root (parent of src)
-            self.cache_dir = Path(__file__).resolve().parent.parent / "data" / "local_cache"
-        else:
-            self.cache_dir = Path(cache_dir)
+        self.cache_dir = _resolve_cache_root(cache_dir)
 
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.force_refresh = force_refresh
@@ -269,12 +305,14 @@ class RSCube:
             stat = p.stat()
             payloads.append(f"{p.resolve()}:{stat.st_size}:{stat.st_mtime}")
 
-        combined_payload = "|".join(payloads)
+        combined_payload = "|".join(payloads + [READ_LAYOUT_VERSION])
         return hashlib.md5(combined_payload.encode("utf-8")).hexdigest()[:12]
 
     def _cache_path(self) -> Path:
-        if self.cache_dir is not None and not self.cache_dir.exists():
+        if not self.cache_dir.exists():
             self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        npz_dir = _cache_subdir(self.cache_dir, "npz")
 
         # Use the first file's stem as a base name
         base_stem = self.tif_paths[0].stem
@@ -283,36 +321,11 @@ class RSCube:
         if len(parts) > 1 and (parts[-1].startswith('part') or (parts[-1].isdigit() and len(parts[-1]) == 4)):
             base_stem = '_'.join(parts[:-1])
 
-        if self.cache_dir is None:
-            return self.tif_paths[0].parent / f"{base_stem}_{self._file_signature()}.npz"
-        return self.cache_dir / f"{base_stem}_{self._file_signature()}.npz"
+        return npz_dir / f"{base_stem}_{self._file_signature()}.npz"
 
     def _parse_band_timestamp(self, name: str) -> str:
         """Best-effort parse; fall back to the raw band name."""
-        tokens = [name.strip()]
-
-        # Special handling for HLS '2_T46RET_20150114T041054' or '1_T01FBE_20190216T214619_BLUE'
-        import re
-        match = re.search(r'(\d{8}T\d{6})', name)
-        if match:
-            try:
-                return datetime.strptime(match.group(1), "%Y%m%dT%H%M%S").isoformat()
-            except ValueError:
-                pass
-
-        digits = "".join(ch for ch in name if ch.isdigit())
-        if len(digits) >= 8:
-            tokens.append(digits[:8])
-        if len(digits) >= 14:
-            tokens.append(digits[:14])
-        fmts = ("%Y%m%d", "%Y-%m-%d", "%Y/%m/%d", "%Y%m%dT%H%M%S", "%Y-%m-%dT%H:%M:%S")
-        for tok in tokens:
-            for fmt in fmts:
-                try:
-                    return datetime.strptime(tok, fmt).isoformat()
-                except ValueError:
-                    continue
-        return name.strip() or "band"
+        return _parse_band_timestamp(name)
 
     def _read_tif(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         all_arrs = []
@@ -323,12 +336,7 @@ class RSCube:
 
         for path in self.tif_paths:
             with rasterio.open(path) as src:
-                # Memory safety: restrict to top-left 512x512 to prevent OOM on 19GB cubes in Colab
-                read_w = min(src.width, 512)
-                read_h = min(src.height, 512)
-                window = rasterio.windows.Window(0, 0, read_w, read_h)
-
-                arr = src.read(window=window, masked=True).astype(np.float32)
+                arr = src.read(masked=True).astype(np.float32)
                 if np.ma.isMaskedArray(arr):
                     arr = arr.filled(np.nan)
 
@@ -409,12 +417,105 @@ class RSCube:
         if cache_path.exists() and self.force_refresh:
             _log_cache_event("NPZ", "refresh", cache_path, detail="force_refresh=True")
         else:
-            _log_cache_event("NPZ", "miss", cache_path, detail=f"building from {len(self.tif_paths)} TIFF(s)")
+            # Determine file type for logging
+            has_vrt = any(str(p).endswith('.vrt') for p in self.tif_paths)
+            has_tif = any(str(p).endswith('.tif') for p in self.tif_paths)
+            if has_vrt and not has_tif:
+                file_type = "VRT"
+            elif has_tif and not has_vrt:
+                file_type = "TIFF"
+            else:
+                file_type = "file"
+            plural = "s" if len(self.tif_paths) > 1 else ""
+            _log_cache_event("NPZ", "miss", cache_path, detail=f"building from {len(self.tif_paths)} {file_type}{plural}")
 
         cube, timestamps, band_names = self._read_tif()
         self._save_npz(cache_path, cube, timestamps, band_names)
         _log_cache_event("NPZ", "saved", cache_path)
         return {"cube": cube, "timestamps": timestamps, "band_names": band_names, **self.meta, "cache_path": str(cache_path)}
+
+
+class TimeSeriesRasterSource:
+    """Streaming reader for VRT/TIFF time-series stacks that does not create NPZ caches."""
+
+    def __init__(
+        self,
+        tif_path: Union[str, Path, List[Union[str, Path]]],
+        cache_dir: Optional[Union[str, Path]] = None,
+    ) -> None:
+        self.tif_paths = RSCube(tif_path, cache_dir=cache_dir)._resolve_paths(tif_path)
+        if len(self.tif_paths) != 1:
+            raise ValueError("TimeSeriesRasterSource expects exactly one VRT/TIFF path.")
+        self.path = self.tif_paths[0]
+        self.cache_dir = _resolve_cache_root(cache_dir)
+        self._src: Optional[rasterio.io.DatasetReader] = None
+        self._meta_cache: Optional[Dict[str, object]] = None
+
+    def __enter__(self) -> "TimeSeriesRasterSource":
+        self.open()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def open(self) -> None:
+        if self._src is None:
+            self._src = rasterio.open(self.path)
+
+    def close(self) -> None:
+        if self._src is not None:
+            self._src.close()
+            self._src = None
+
+    @property
+    def src(self):
+        if self._src is None:
+            self.open()
+        assert self._src is not None
+        return self._src
+
+    def metadata(self) -> Dict[str, object]:
+        if self._meta_cache is not None:
+            return self._meta_cache
+
+        src = self.src
+        band_names = list(src.descriptions)
+        if not band_names or all(name is None or name == "" for name in band_names):
+            band_names = [f"band_{i+1}" for i in range(src.count)]
+        timestamps = np.array([_parse_band_timestamp(name) for name in band_names], dtype="U32")
+        band_names_arr = np.array(band_names, dtype="U64")
+
+        self._meta_cache = {
+            "transform": list(src.transform),
+            "crs_wkt": src.crs.to_wkt() if src.crs else None,
+            "height": src.height,
+            "width": src.width,
+            "count": src.count,
+            "timestamps": timestamps,
+            "band_names": band_names_arr,
+            "source_files": [str(self.path)],
+        }
+        return self._meta_cache
+
+    def iter_windows(self, block_shape: Tuple[int, int] = (256, 256)) -> Iterator[Tuple[slice, slice]]:
+        height = int(self.metadata()["height"])
+        width = int(self.metadata()["width"])
+        block_h, block_w = block_shape
+        for row0 in range(0, height, block_h):
+            for col0 in range(0, width, block_w):
+                yield (slice(row0, min(row0 + block_h, height)), slice(col0, min(col0 + block_w, width)))
+
+    def read_window(self, row_slice: slice, col_slice: slice) -> np.ndarray:
+        src = self.src
+        window = Window.from_slices(row_slice, col_slice)
+        arr = src.read(window=window, masked=True).astype(np.float32)
+        if np.ma.isMaskedArray(arr):
+            arr = arr.filled(np.nan)
+        return arr
+
+    def read_pixel_series(self, row: int, col: int) -> np.ndarray:
+        arr = self.read_window(slice(row, row + 1), slice(col, col + 1))
+        return arr[:, 0, 0]
 
 
 def find_image_chunks(
@@ -459,9 +560,8 @@ def find_image_chunks(
         part_name = match.group(1) if match else "full"
         parts[part_name].append(f)
 
-    cache_root = Path(cache_dir) if cache_dir is not None else (Path(data_dir).parent / "local_cache")
-    vrt_dir = cache_root / "vrts"
-    vrt_dir.mkdir(parents=True, exist_ok=True)
+    cache_root = _resolve_cache_root(cache_dir) if cache_dir is not None else (Path(data_dir).parent / "cache" / "local")
+    vrt_dir = _cache_subdir(cache_root, "vrts")
 
     ordered_part_files = [
         sorted(Path(f) for f in parts[part_name])
