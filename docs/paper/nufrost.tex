@@ -182,31 +182,7 @@ It is worth noting that the frequency-weighted Ridge penalty serves a crucial du
 
 \section{Experiment and Results}
 
-\subsection{Hyperparameter Settings}
-Table~\ref{tab:hyper} summarizes the hyperparameters used for all experiments. NUFROST parameters were fixed across all scenes; Zhu2015 and HANTS used their published default settings.
 
-\begin{table*}[b]
-\centering
-\caption{Hyperparameter settings for NUFROST}
-\label{tab:hyper}
-\begin{tabular}{llcr}
-\hline
-\textbf{Symbol} & \textbf{Parameter} & \textbf{Value} & \textbf{Reference} \\
-\hline
-$n$ & NUFFT modes & 4096 & Sec.~III-A \\
-$\eta$ & Cumulative energy threshold (\texttt{power\_cum}) & 0.7 & Eq.~(6) \\
-$\nu_{min}$ & Min.\ frequency threshold (\texttt{ignore\_dc\_hz}) & $10^{-10}$ & Sec.~III-B.1 \\
-$\epsilon_{tol}$ & Frequency snapping tolerance (\texttt{spectral\_merge\_tol}) & 0.15 & Sec.~III-B.1 \\
-  & Preferred periods (days) & \multicolumn{2}{c}{365.25, 182.625, 91.3125, 30.4375} \\
-  & Number of data-driven peaks & 10 & Sec.~III-B.1 \\
-$\delta$ & Huber threshold (\texttt{huber\_delta}) & 1.5 & Eq.~(5) \\
-  & IRLS iterations (\texttt{huber\_iters}) & 3 & Sec.~III-B.2 \\
-$\lambda$ & Ridge regularization (\texttt{ridge}) & 0.005 & Eq.~(7) \\
-$\gamma$ & Frequency penalty weight (\texttt{freq\_weight}) & 2.0 & Eq.~(8) \\
-  & Min.\ observations per pixel (\texttt{min\_obs}) & 12 & -- \\
-\hline
-\end{tabular}
-\end{table*}
 
 To evaluate the robustness and accuracy of the proposed NUFROST algorithm, we conducted simulation experiments using real Sentinel-2 Harmonized time-series data. The performance of NUFROST was systematically compared against two widely used time-series reconstruction methods: the Lasso-based fitting algorithm by Zhu et al. (2015)~\cite{ref14} (hereafter referred to as Zhu2015) and the Harmonic Analysis of Time Series (HANTS) algorithm~\cite{ref10}.
 
