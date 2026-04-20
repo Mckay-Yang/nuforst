@@ -142,7 +142,7 @@ With the extracted dominant frequencies, the time series can be modeled as a lin
 \label{eq:design}
 \begin{split}
 &X(t_j) = \\
-&\left[1, t_j - \bar{t}, \cos(2\pi\tilde{\nu}_1 t_j), \sin(2\pi\tilde{\nu}_1 t_j), \dots, \sin(2\pi\tilde{\nu}_m t_j)\right]
+&\left[1, t_j - \bar{t}, \cos(2\pi\tilde{\nu}_1 t_j), \sin(2\pi\tilde{\nu}_1 t_j), \dots, \cos(2\pi\tilde{\nu}_m t_j), \sin(2\pi\tilde{\nu}_m t_j)\right]
 \end{split}
 \end{equation}
 The observational model can be written in matrix form as $y \approx X\beta$, where $\beta$ contains the coefficients for the basis functions.
@@ -178,7 +178,7 @@ where $W$ is a diagonal matrix containing the Huber weights $w_j$, $\lambda$ con
 \end{equation}
 where $\nu_{base}$ is the lowest positive frequency in the selected set, and $\gamma$ regulates the weight of the frequency penalty. The penalty for the constant and trend terms is set to zero. This synergistic Huber-Ridge optimization yields a robust estimation of the time series, effectively mitigating both anomalous outliers and high-frequency noise.
 
-It is worth noting that the frequency-weighted Ridge penalty serves a crucial dual purpose. Beyond its physical interpretation of suppressing high-frequency noise, it mathematically ensures the numerical stability of the solution. In remote sensing scenarios with severe continuous missing data (e.g., prolonged monsoon seasons), the unregularized design matrix $X$ can become highly ill-conditioned or rank-deficient, causing ordinary least squares to fail or produce wild oscillations in data gaps. The objective function in Eq.~(\ref{eq:objective}) leads to the normal equation $(X^T W X + \lambda D^2) \beta = X^T W y$. Because the diagonal elements of $\lambda D^2$ strictly bound the norm of the harmonic coefficients away from zero, the combined Hessian matrix $(X^T W X + \lambda D^2)$ is guaranteed to be strictly positive-definite as long as the minimal non-penalized terms (constant and trend) are supported by valid observations. This rigorous Tikhonov regularization guarantees a unique and stable analytical solution regardless of the severity of the temporal gaps.
+It is worth noting that the frequency-weighted Ridge penalty serves a crucial dual purpose. Beyond its physical interpretation of suppressing high-frequency noise, it also improves the numerical stability of the solution. In remote sensing scenarios with severe continuous missing data (e.g., prolonged monsoon seasons), the unregularized design matrix $X$ can become highly ill-conditioned or rank-deficient, causing ordinary least squares to fail or produce wild oscillations in data gaps. The objective function in Eq.~(\ref{eq:objective}) leads to the normal equation $(X^T W X + \lambda D^2)\beta = X^T W y$. Under the retained model assumptions, the Tikhonov-style regularization term stabilizes the Hessian and makes the resulting system substantially better posed, yielding a unique and numerically stable solution in the severe-gap cases considered in this study.
 
 \section{Experiment and Results}
 
