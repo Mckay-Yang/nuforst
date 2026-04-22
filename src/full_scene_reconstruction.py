@@ -230,9 +230,15 @@ def build_output_path(output_root: Path, method_name: str, source_file: Path, ta
     return output_root / method_name / f"{source_file.stem}_{safe_time}__{method_name}.tif"
 
 
-def build_qa_output_path(output_root: Path, method_name: str, source_file: Path, target_time: str) -> Path:
+def build_ground_truth_output_path(
+    output_root: Path,
+    source_name: str,
+    lon: float,
+    lat: float,
+    target_time: str,
+) -> Path:
     safe_time = target_time.replace(":", "-")
-    return output_root / method_name / f"{source_file.stem}_{safe_time}__{method_name}_QA.tif"
+    return output_root / f"{source_name}_{_location_output_token(lon, lat)}_{safe_time}__grand_truth.tif"
 
 
 def build_scene_stack_output_path(
@@ -279,19 +285,12 @@ def make_masked_time_series(cube: np.ndarray, timestamps: Sequence[str], target_
     return masked_cube, masked_timestamps, target_idx
 
 
-def normalize_prediction_and_qa(
-    method_name: str,
-    prediction: np.ndarray,
-    held_out_truth: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray]:
+def extract_prediction_2d(method_name: str, prediction: np.ndarray) -> np.ndarray:
     if method_name == "zhu2015":
         if prediction.ndim != 3 or prediction.shape[0] < 1:
             raise ValueError("Zhu2015 prediction must have shape (2, H, W) or compatible.")
-        prediction_2d = np.asarray(prediction[0], dtype=np.float32)
-    else:
-        prediction_2d = np.asarray(prediction, dtype=np.float32)
-    qa_2d = np.abs(prediction_2d - np.asarray(held_out_truth, dtype=np.float32)).astype(np.float32)
-    return prediction_2d, qa_2d
+        return np.asarray(prediction[0], dtype=np.float32)
+    return np.asarray(prediction, dtype=np.float32)
 
 
 def write_run_summary(output_root: Path, payload: Dict[str, Any]) -> Path:
@@ -490,15 +489,13 @@ def reconstruct_full_scene_for_location(
     )
 
     output_map: Dict[str, Dict[str, str]] = {method: {} for method in methods}
-    qa_output_map: Dict[str, Dict[str, str]] = {method: {} for method in methods}
     merged_prediction_map: Dict[str, str] = {}
-    merged_qa_map: Dict[str, str] = {}
     source_map = {band: [str(path) for path in stack_paths] for band, stack_paths in band_stacks.items()}
     mask_indices: Dict[str, int] = {}
     counts_before: Dict[str, int] = {}
     counts_after: Dict[str, int] = {}
     prediction_arrays: Dict[str, Dict[str, np.ndarray]] = {method: {} for method in methods}
-    qa_arrays: Dict[str, Dict[str, np.ndarray]] = {method: {} for method in methods}
+    ground_truth_arrays: Dict[str, np.ndarray] = {}
     band_meta: Dict[str, Mapping[str, object]] = {}
 
     for band_name, stack_paths in band_stacks.items():
@@ -510,6 +507,7 @@ def reconstruct_full_scene_for_location(
         timestamps = deduped_timestamps.tolist()
         masked_cube, masked_timestamps, target_idx = make_masked_time_series(cube, timestamps, target_time)
         held_out_truth = cube[target_idx].astype(np.float32)
+        ground_truth_arrays[band_name] = held_out_truth
         mask_indices[band_name] = target_idx
         counts_before[band_name] = int(len(timestamps))
         counts_after[band_name] = int(len(masked_timestamps))
@@ -517,7 +515,6 @@ def reconstruct_full_scene_for_location(
 
         for method_name in methods:
             output_path = build_output_path(output_root=output_root, method_name=method_name, source_file=stack_paths[0], target_time=target_time)
-            qa_output_path = build_qa_output_path(output_root=output_root, method_name=method_name, source_file=stack_paths[0], target_time=target_time)
             if method_name == "nufrost":
                 args = build_args(
                     {
@@ -535,17 +532,24 @@ def reconstruct_full_scene_for_location(
             else:
                 raise ValueError(f"Unsupported method: {method_name}")
 
-            prediction_2d, qa_2d = normalize_prediction_and_qa(method_name, prediction, held_out_truth)
+            prediction_2d = extract_prediction_2d(method_name, prediction)
             _write_prediction(output_path, prediction_2d, data)
-            _write_prediction(qa_output_path, qa_2d, data)
             output_map[method_name][band_name] = str(output_path)
-            qa_output_map[method_name][band_name] = str(qa_output_path)
             prediction_arrays[method_name][band_name] = prediction_2d
-            qa_arrays[method_name][band_name] = qa_2d
 
     ordered_bands = list(band_stacks.keys())
     validate_band_metadata_consistency(ordered_bands, band_meta)
     first_meta = band_meta[ordered_bands[0]]
+
+    gt_path = build_ground_truth_output_path(
+        output_root=output_root,
+        source_name=source_name,
+        lon=lon,
+        lat=lat,
+        target_time=target_time,
+    )
+    write_band_stack(gt_path, ground_truth_arrays, ordered_bands, first_meta)
+
     for method_name in methods:
         merged_prediction_path = build_scene_stack_output_path(
             output_root=output_root,
@@ -556,19 +560,12 @@ def reconstruct_full_scene_for_location(
             target_time=target_time,
             suffix="prediction",
         )
-        merged_qa_path = build_scene_stack_output_path(
-            output_root=output_root,
-            method_name=method_name,
-            source_name=source_name,
-            lon=lon,
-            lat=lat,
-            target_time=target_time,
-            suffix="QA_stack",
-        )
         write_band_stack(merged_prediction_path, prediction_arrays[method_name], ordered_bands, first_meta)
-        write_band_stack(merged_qa_path, qa_arrays[method_name], ordered_bands, first_meta)
         merged_prediction_map[method_name] = str(merged_prediction_path)
-        merged_qa_map[method_name] = str(merged_qa_path)
+
+    for method_name in methods:
+        for band_name, per_band_path in output_map[method_name].items():
+            Path(per_band_path).unlink(missing_ok=True)
 
     payload: Dict[str, Any] = {
         "source": source_name,
@@ -581,10 +578,8 @@ def reconstruct_full_scene_for_location(
         "counts_before": counts_before,
         "counts_after": counts_after,
         "completeness": completeness,
-        "outputs": output_map,
-        "qa_outputs": qa_output_map,
         "merged_prediction_outputs": merged_prediction_map,
-        "merged_qa_outputs": merged_qa_map,
+        "ground_truth_output": str(gt_path),
     }
     summary_path = write_run_summary(output_root, payload)
     payload["summary_path"] = str(summary_path)

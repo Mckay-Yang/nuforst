@@ -4,14 +4,14 @@ import numpy as np
 import rasterio
 
 from src.full_scene_reconstruction import (
+    build_ground_truth_output_path,
     build_output_path,
-    build_qa_output_path,
     build_scene_stack_output_path,
     collapse_duplicate_timestamps,
     discover_location_band_stacks,
+    extract_prediction_2d,
     intersect_band_timestamps,
     make_masked_time_series,
-    normalize_prediction_and_qa,
     select_shared_target_timestamp,
     write_band_stack,
     write_run_summary,
@@ -125,35 +125,26 @@ def test_build_output_path_includes_timestamp_and_method(tmp_path: Path) -> None
     assert output_path.name == "COPERNICUS_S2_HARMONIZED_B2_lon94.2605_lat29.7733_2026-01-27T04-19-39__nufrost.tif"
 
 
-def test_build_qa_output_path_appends_qa_suffix(tmp_path: Path) -> None:
-    output_path = build_qa_output_path(
+def test_build_ground_truth_output_path(tmp_path: Path) -> None:
+    gt_path = build_ground_truth_output_path(
         output_root=tmp_path,
-        method_name="nufrost",
-        source_file=Path("COPERNICUS_S2_HARMONIZED_B2_lon94.2605_lat29.7733.tif"),
+        source_name="sentinel-2",
+        lon=94.2605,
+        lat=29.7733,
         target_time="2026-01-27T04:19:39",
     )
+    assert gt_path.name == "sentinel-2_lon94.260500_lat29.773300_2026-01-27T04-19-39__grand_truth.tif"
 
-    assert output_path.name == "COPERNICUS_S2_HARMONIZED_B2_lon94.2605_lat29.7733_2026-01-27T04-19-39__nufrost_QA.tif"
 
-
-def test_normalize_prediction_and_qa_uses_absolute_residual_for_all_methods() -> None:
-    held_out = np.array([[10.0, 20.0], [30.0, 40.0]], dtype=np.float32)
-    nufrost_prediction = np.array([[11.0, 18.0], [29.0, 42.0]], dtype=np.float32)
-    zhu_prediction = np.array(
-        [
-            [[9.0, 25.0], [32.0, 39.0]],
-            [[100.0, 101.0], [102.0, 103.0]],
-        ],
+def test_extract_prediction_2d_handles_nufrost_and_zhu2015() -> None:
+    nufrost_pred = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+    zhu_pred = np.array(
+        [[[5.0, 6.0], [7.0, 8.0]], [[99.0, 99.0], [99.0, 99.0]]],
         dtype=np.float32,
     )
 
-    nufrost_pred, nufrost_qa = normalize_prediction_and_qa("nufrost", nufrost_prediction, held_out)
-    zhu_pred, zhu_qa = normalize_prediction_and_qa("zhu2015", zhu_prediction, held_out)
-
-    assert np.array_equal(nufrost_pred, nufrost_prediction)
-    assert np.array_equal(nufrost_qa, np.array([[1.0, 2.0], [1.0, 2.0]], dtype=np.float32))
-    assert np.array_equal(zhu_pred, zhu_prediction[0])
-    assert np.array_equal(zhu_qa, np.array([[1.0, 5.0], [2.0, 1.0]], dtype=np.float32))
+    assert np.array_equal(extract_prediction_2d("nufrost", nufrost_pred), nufrost_pred)
+    assert np.array_equal(extract_prediction_2d("zhu2015", zhu_pred), zhu_pred[0])
 
 
 def test_write_band_stack_writes_ordered_multiband_geotiff(tmp_path: Path) -> None:
