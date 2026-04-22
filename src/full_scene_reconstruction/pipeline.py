@@ -227,7 +227,7 @@ def choose_shared_target_timestamp(
 
 def build_output_path(output_root: Path, method_name: str, source_file: Path, target_time: str) -> Path:
     safe_time = target_time.replace(":", "-")
-    return output_root / method_name / f"{source_file.stem}_{safe_time}__{method_name}.tif"
+    return output_root / method_name / f"[{method_name}]_{source_file.stem}_{safe_time}__{method_name}.tif"
 
 
 def build_ground_truth_output_path(
@@ -238,7 +238,7 @@ def build_ground_truth_output_path(
     target_time: str,
 ) -> Path:
     safe_time = target_time.replace(":", "-")
-    return output_root / f"{source_name}_{_location_output_token(lon, lat)}_{safe_time}__grand_truth.tif"
+    return output_root / "grand_truth" / f"{source_name}_{_location_output_token(lon, lat)}_{safe_time}__grand_truth.tif"
 
 
 def build_scene_stack_output_path(
@@ -251,7 +251,7 @@ def build_scene_stack_output_path(
     suffix: str,
 ) -> Path:
     safe_time = target_time.replace(":", "-")
-    return output_root / method_name / f"{source_name}_{_location_output_token(lon, lat)}_{safe_time}__{method_name}_{suffix}.tif"
+    return output_root / method_name / f"[{method_name}]_{source_name}_{_location_output_token(lon, lat)}_{safe_time}__{method_name}_{suffix}.tif"
 
 
 def collapse_duplicate_timestamps(cube: np.ndarray, timestamps: Sequence[str]) -> Tuple[np.ndarray, np.ndarray]:
@@ -303,6 +303,24 @@ def write_run_summary(output_root: Path, payload: Dict[str, Any]) -> Path:
     summary_path = summary_dir / f"reconstruction_summary_{source_token}_lon{lon_token}_lat{lat_token}_{safe_time}.json"
     summary_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return summary_path
+
+
+def _summary_path_for_location(output_root: Path, source_name: str, lon: float, lat: float) -> Path:
+    safe_source = source_name.replace("/", "-")
+    lon_token = f"{lon:.6f}"
+    lat_token = f"{lat:.6f}"
+    return output_root / "run_summaries" / f"reconstruction_summary_{safe_source}_lon{lon_token}_lat{lat_token}.json"
+
+
+def _find_existing_summary(output_root: Path, source_name: str, lon: float, lat: float) -> Optional[Path]:
+    pattern = _summary_path_for_location(output_root, source_name, lon, lat)
+    pattern_parent = pattern.parent
+    if not pattern_parent.exists():
+        return None
+    stem_prefix = pattern.stem
+    for candidate in sorted(pattern_parent.glob(f"{stem_prefix}_*.json")):
+        return candidate
+    return None
 
 
 def _parse_target_datetime(target_time: str) -> pd.Timestamp:
@@ -470,6 +488,11 @@ def reconstruct_full_scene_for_location(
     output_root = Path(output_root)
     data_root = Path(data_root)
     cache_dir = Path(cache_dir)
+
+    existing_summary = _find_existing_summary(output_root, source_name, lon, lat)
+    if existing_summary is not None:
+        return {"skipped": True, "summary_path": str(existing_summary)}
+
     data_dir = _resolve_data_dir(source_name, data_root)
     band_stacks = discover_location_band_stacks(data_dir, source_name=source_name, lon=lon, lat=lat, cache_dir=cache_dir)
     if not band_stacks:

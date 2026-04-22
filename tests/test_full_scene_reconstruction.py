@@ -122,7 +122,7 @@ def test_build_output_path_includes_timestamp_and_method(tmp_path: Path) -> None
     )
 
     assert output_path.parent == tmp_path / "nufrost"
-    assert output_path.name == "COPERNICUS_S2_HARMONIZED_B2_lon94.2605_lat29.7733_2026-01-27T04-19-39__nufrost.tif"
+    assert output_path.name == "[nufrost]_COPERNICUS_S2_HARMONIZED_B2_lon94.2605_lat29.7733_2026-01-27T04-19-39__nufrost.tif"
 
 
 def test_build_ground_truth_output_path(tmp_path: Path) -> None:
@@ -133,6 +133,7 @@ def test_build_ground_truth_output_path(tmp_path: Path) -> None:
         lat=29.7733,
         target_time="2026-01-27T04:19:39",
     )
+    assert gt_path.parent == tmp_path / "grand_truth"
     assert gt_path.name == "sentinel-2_lon94.260500_lat29.773300_2026-01-27T04-19-39__grand_truth.tif"
 
 
@@ -188,7 +189,34 @@ def test_build_scene_stack_output_path_distinguishes_qa_stack_name(tmp_path: Pat
         suffix="QA_stack",
     )
 
-    assert output_path.name == "sentinel-2_lon94.260500_lat29.773300_2026-01-27T04-19-39__nufrost_QA_stack.tif"
+    assert output_path.name == "[nufrost]_sentinel-2_lon94.260500_lat29.773300_2026-01-27T04-19-39__nufrost_QA_stack.tif"
+
+
+def test_reconstruct_full_scene_skips_when_summary_exists(tmp_path: Path) -> None:
+    from src.full_scene_reconstruction import reconstruct_full_scene_for_location
+
+    source_name = "sentinel-2"
+    lon = 94.2605
+    lat = 29.7733
+    safe_source = source_name.replace("/", "-")
+    summary_dir = tmp_path / "run_summaries"
+    summary_dir.mkdir(parents=True)
+    summary_path = summary_dir / f"reconstruction_summary_{safe_source}_lon{lon:.6f}_lat{lat:.6f}_2026-02-06T04-18-39.json"
+    summary_path.write_text(
+        '{"source":"sentinel-2","lon":94.2605,"lat":29.7733,"target_time":"2026-02-06T04:18:39"}',
+        encoding="utf-8",
+    )
+
+    result = reconstruct_full_scene_for_location(
+        source_name=source_name,
+        lon=lon,
+        lat=lat,
+        output_root=tmp_path,
+        data_root=tmp_path / "does-not-matter",
+    )
+
+    assert result["skipped"] is True
+    assert result["summary_path"] == str(summary_path)
 
 
 def test_validate_band_metadata_consistency_rejects_mismatched_shapes() -> None:
