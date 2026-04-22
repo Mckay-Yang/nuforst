@@ -119,10 +119,13 @@ def test_build_output_path_includes_timestamp_and_method(tmp_path: Path) -> None
         method_name="nufrost",
         source_file=Path("COPERNICUS_S2_HARMONIZED_B2_lon94.2605_lat29.7733.tif"),
         target_time="2026-01-27T04:19:39",
+        source_name="sentinel-2",
+        lon=94.2605,
+        lat=29.7733,
     )
 
-    assert output_path.parent == tmp_path / "nufrost"
-    assert output_path.name == "[nufrost]_COPERNICUS_S2_HARMONIZED_B2_lon94.2605_lat29.7733_2026-01-27T04-19-39__nufrost.tif"
+    assert output_path.parent == tmp_path / "sentinel-2_recon" / "94.2605_29.7733"
+    assert output_path.name == "[nufrost]_sentinel-2_lon94.260500_lat29.773300_2026-01-27T04-19-39__nufrost.tif"
 
 
 def test_build_ground_truth_output_path(tmp_path: Path) -> None:
@@ -133,8 +136,8 @@ def test_build_ground_truth_output_path(tmp_path: Path) -> None:
         lat=29.7733,
         target_time="2026-01-27T04:19:39",
     )
-    assert gt_path.parent == tmp_path / "grand_truth"
-    assert gt_path.name == "sentinel-2_lon94.260500_lat29.773300_2026-01-27T04-19-39__grand_truth.tif"
+    assert gt_path.parent == tmp_path / "sentinel-2_recon" / "94.2605_29.7733"
+    assert gt_path.name == "[grand_truth]_sentinel-2_lon94.260500_lat29.773300_2026-01-27T04-19-39.tif"
 
 
 def test_extract_prediction_2d_handles_nufrost_and_zhu2015() -> None:
@@ -189,6 +192,7 @@ def test_build_scene_stack_output_path_distinguishes_qa_stack_name(tmp_path: Pat
         suffix="QA_stack",
     )
 
+    assert output_path.parent == tmp_path / "sentinel-2_recon" / "94.2605_29.7733"
     assert output_path.name == "[nufrost]_sentinel-2_lon94.260500_lat29.773300_2026-01-27T04-19-39__nufrost_QA_stack.tif"
 
 

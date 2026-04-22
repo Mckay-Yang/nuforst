@@ -225,8 +225,10 @@ def choose_shared_target_timestamp(
     raise ValueError("No shared timestamp passed the completeness threshold.")
 
 
-def build_output_path(output_root: Path, method_name: str, source_file: Path, target_time: str) -> Path:
+def build_output_path(output_root: Path, method_name: str, source_file: Path, target_time: str, *, source_name: str = "", lon: float = 0.0, lat: float = 0.0) -> Path:
     safe_time = target_time.replace(":", "-")
+    if source_name and lon and lat:
+        return output_root / f"{source_name}_recon" / f"{lon:.4f}_{lat:.4f}" / f"[{method_name}]_{source_name}_{_location_output_token(lon, lat)}_{safe_time}__{method_name}.tif"
     return output_root / method_name / f"[{method_name}]_{source_file.stem}_{safe_time}__{method_name}.tif"
 
 
@@ -238,7 +240,7 @@ def build_ground_truth_output_path(
     target_time: str,
 ) -> Path:
     safe_time = target_time.replace(":", "-")
-    return output_root / "grand_truth" / f"{source_name}_{_location_output_token(lon, lat)}_{safe_time}__grand_truth.tif"
+    return output_root / f"{source_name}_recon" / f"{lon:.4f}_{lat:.4f}" / f"[grand_truth]_{source_name}_{_location_output_token(lon, lat)}_{safe_time}.tif"
 
 
 def build_scene_stack_output_path(
@@ -251,7 +253,7 @@ def build_scene_stack_output_path(
     suffix: str,
 ) -> Path:
     safe_time = target_time.replace(":", "-")
-    return output_root / method_name / f"[{method_name}]_{source_name}_{_location_output_token(lon, lat)}_{safe_time}__{method_name}_{suffix}.tif"
+    return output_root / f"{source_name}_recon" / f"{lon:.4f}_{lat:.4f}" / f"[{method_name}]_{source_name}_{_location_output_token(lon, lat)}_{safe_time}__{method_name}_{suffix}.tif"
 
 
 def collapse_duplicate_timestamps(cube: np.ndarray, timestamps: Sequence[str]) -> Tuple[np.ndarray, np.ndarray]:
@@ -537,7 +539,7 @@ def reconstruct_full_scene_for_location(
         band_meta[band_name] = data
 
         for method_name in methods:
-            output_path = build_output_path(output_root=output_root, method_name=method_name, source_file=stack_paths[0], target_time=target_time)
+            output_path = build_output_path(output_root=output_root, method_name=method_name, source_file=stack_paths[0], target_time=target_time, source_name=source_name, lon=lon, lat=lat)
             if method_name == "nufrost":
                 args = build_args(
                     {
