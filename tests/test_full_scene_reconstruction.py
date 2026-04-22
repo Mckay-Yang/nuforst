@@ -87,7 +87,7 @@ def test_discover_location_band_stacks_for_sentinel2_uses_vrt_for_multi_tile_ban
     def fake_build_multi_file_vrt(stack_paths, *, cache_dir, band_name, lon, lat):
         return [tmp_path / f"sentinel_{band_name}_lon{lon:.4f}_lat{lat:.4f}.vrt"]
 
-    monkeypatch.setattr("src.full_scene_reconstruction._build_multi_file_vrt", fake_build_multi_file_vrt)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline._build_multi_file_vrt", fake_build_multi_file_vrt)
 
     stacks = discover_location_band_stacks(data_dir, source_name="sentinel-2", lon=94.2605, lat=29.7733, cache_dir=cache_dir)
 
@@ -105,7 +105,7 @@ def test_discover_location_band_stacks_for_hls_groups_by_band(tmp_path: Path, mo
     def fake_find_image_chunks(data_dir_str: str, lon: float, lat: float, band: str, cache_dir=None):
         return [f"{data_dir_str}/{band}_lon{lon:.4f}_lat{lat:.4f}.vrt"]
 
-    monkeypatch.setattr("src.full_scene_reconstruction.find_image_chunks", fake_find_image_chunks)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.find_image_chunks", fake_find_image_chunks)
 
     stacks = discover_location_band_stacks(data_dir, source_name="hls", lon=94.2605, lat=29.7733)
 
