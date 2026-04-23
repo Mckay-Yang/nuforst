@@ -88,3 +88,44 @@ cache/
 *.nc
 test.*
 .env
+
+# LaTeX intermediate/build files
+*.aux
+*.bbl
+*.bcf
+*.blg
+*.fdb_latexmk
+*.fls
+*.idx
+*.ilg
+*.ind
+*.lof
+*.log
+*.lot
+*.out
+*.run.xml
+*.synctex.gz
+*.toc
+*.xdv
+
+# Latexmk / compiler temp artifacts
+_minted-*/
+*.nav
+*.snm
+*.vrb
+missfont.log
+
+# Editor temp files
+*.swp
+*.swo
+
+# 不追踪编译后的PDF
+*.pdf
+
+example/
+
+# OpenCode
+.plans/
+.specs/
+.worktrees/
+.temp/

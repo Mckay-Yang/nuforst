@@ -1,0 +1,307 @@
+\documentclass[letterpaper,journal]{IEEEtran}
+\usepackage{amsmath,amsfonts}
+\usepackage{algorithmic}
+\usepackage{algorithm}
+\usepackage{array}
+\usepackage[caption=false,font=normalsize,labelfont=sf,textfont=sf]{subfig}
+\usepackage{textcomp}
+\usepackage{stfloats}
+\usepackage{url}
+\usepackage{verbatim}
+\usepackage{graphicx}
+\usepackage{cite}
+\hyphenation{op-tical net-works semi-conduc-tor IEEE-Xplore}
+% updated with editorial comments 8/9/2021
+
+\begin{document}
+
+\title{NUFROST: Robust Reconstruction of Irregularly Sampled Optical Remote Sensing Time Series}
+
+\author{Luhao Yang, ..., and Hui Fan*%
+\thanks{Corresponding author: Hui Fan (e-mail: fanhui@ynu.edu.cn).}%
+}
+
+% The paper headers
+\markboth{Journal of \LaTeX\ Class Files,~Vol.~14, No.~8, August~2021}%
+{Shell \MakeLowercase{\textit{et al.}}: A Sample Article Using IEEEtran.cls for IEEE Journals}
+
+\IEEEpubid{0000--0000/00\$00.00~\copyright~2021 IEEE}
+% Remember, if you use this you must call \IEEEpubidadjcol in the second
+% column for its text to clear the IEEEpubid mark.
+
+\maketitle
+
+\begin{abstract}
+Optical remote sensing time series are crucial for monitoring land surface dynamics, but they often suffer from irregular sampling and significant gaps due to cloud cover and other factors. This study introduces NUFROST, a robust reconstruction framework that combines Non-Uniform Fast Fourier Transform (NUFFT) with Huber-Ridge regression to reconstruct continuous temporal trajectories directly from irregular observations. NUFROST estimates the spectrum of non-uniformly sampled pixels without interpolation, identifies dominant frequencies through adaptive selection and parabolic refinement, and reconstructs the time series using a robust regression model that suppresses outliers and high-frequency noise. Experiments on Sentinel-2 Harmonized time series demonstrate that NUFROST outperforms traditional harmonic and regression-based methods in both sparse-observation and continuous-gap scenarios, providing a practical solution for reliable temporal analysis in complex environments.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Time Series Reconstruction, Non-Uniform FFT, Robust Regression, Remote Sensing, Sentinel-2
+\end{IEEEkeywords}
+
+\section{Introduction}
+\IEEEPARstart{O}{ptical} remote sensing time series provide an essential basis for monitoring land-surface dynamics, vegetation phenology, and disturbance over large spatial extents~\cite{ref1,ref2}. In practice, however, these time series are often irregularly sampled and severely incomplete because of revisit constraints, cloud and snow contamination, and sensor-related issues~\cite{ref2,ref3}. The problem is especially pronounced in mountainous regions, where persistent cloud cover and complex terrain further reduce the continuity of valid observations, making stable trajectory reconstruction difficult and weakening subsequent temporal analysis.
+
+Many existing reconstruction methods rely on interpolation, piecewise fitting, or harmonic modeling, which can effectively describe seasonal trajectories when observations are sufficiently dense and temporally regular. However, conventional Fourier-based harmonic analysis assumes uniform sampling, so irregular observations are commonly regularized through interpolation or smoothing before modeling. Such preprocessing can introduce pseudo-periodic components across long gaps and distort the true spectral characteristics of the signal~\cite{ref5}.
+
+In addition, residual thin clouds, shadows, and atmospheric contamination often appear as high-frequency fluctuations, to which standard least-squares-based fitting remains sensitive, leading to biased reconstructions and unstable temporal trajectories~\cite{ref6,ref7}.
+
+To address these limitations, this study proposes NUFROST (Non-Uniform FFT-based Reconstruction of Optical Satellite Time-series), a robust reconstruction framework that combines the Non-Uniform Fast Fourier Transform (NUFFT) with Huber-Ridge regression. Instead of forcing observations onto a regular temporal grid, NUFROST uses NUFFT to estimate the spectrum of irregularly sampled pixels directly, thereby avoiding interpolation-induced spectral distortion~\cite{ref4,ref6}. To suppress outliers caused by residual clouds and shadows, the framework employs a robust regression model with Huber loss, coupled with a frequency-weighted Ridge penalty that progressively regularizes high-frequency noise~\cite{ref8,ref9}. Experiments on 15 area-of-interest (AOI) scenes across six spectral bands demonstrate that NUFROST yields more accurate and stable reconstruction than the widely used HANTS~\cite{ref10} and Zhu2015~\cite{ref14} methods under both sparse-observation and continuous-gap scenarios. Overall, the proposed method provides a practical framework for reconstructing irregular optical remote sensing time series and improving the reliability of downstream temporal analysis in regions with persistent cloud contamination and irregular sampling.
+
+Overall, the novelty of NUFROST lies in combining direct spectral estimation for irregular observations, adaptive dominant-frequency characterization, and robust frequency-domain regression within a unified reconstruction framework.
+
+% \begin{enumerate}
+%     \item A reconstruction framework based on NUFFT that estimates the spectrum of irregularly sampled pixels directly, avoiding interpolation-induced spectral distortion.
+%     \item A hybrid dominant frequency selection strategy combining prior phenological knowledge with data-driven spectral peak detection and parabolic refinement.
+%     \item A Huber-Ridge robust regression model that simultaneously suppresses outliers via iterative reweighting and regularizes high-frequency noise through a frequency-dependent Ridge penalty, improving numerical stability and keeping the resulting normal equation better posed under severe temporal gaps.
+% \end{enumerate}
+
+\section{Background and Related Work}
+\IEEEpubidadjcol
+Optical remote sensing time series have been widely used to characterize land surface dynamics because they provide continuous observations of vegetation, soil, and surface disturbance over large spatial extents~\cite{ref1}. With the development of Earth observation programs, time-series-based approaches have become increasingly important in applications such as vegetation monitoring, forest disturbance detection, and ecological assessment~\cite{ref2}. A key issue in this domain is how to describe temporal trajectories in a stable and physically meaningful way. Many existing methods rely on temporal fitting models, including harmonic analysis (e.g., HANTS)~\cite{ref10} and piecewise trend fitting (e.g., LandTrendr and CCDC)~\cite{ref11,ref12}. These methods attempt to suppress noise and reconstruct continuous trajectories, providing a cleaner basis for subsequent change detection.
+
+However, the practical performance of temporal fitting is inherently constrained by the quality of the input observations. In optical remote sensing, image acquisition is frequently affected by cloud cover, cloud shadow, snow, and atmospheric variability. After masking these contaminated observations, the remaining time series are usually irregularly sampled and contain substantial gaps~\cite{ref3}. In mountainous areas, the problem becomes even more complicated due to terrain-induced illumination differences and strong spatial heterogeneity~\cite{ref13}.
+
+To cope with these challenges, researchers have proposed various reconstruction strategies. Traditional interpolation methods are simple but tend to oversmooth temporal details or introduce pseudo-periodicities when observations are sparse~\cite{ref4}. Harmonic analysis methods can model seasonal signals effectively, yet traditional Fourier-based approaches assume regular sampling, which requires gap-filling prior to transformation, inevitably altering the true spectral characteristics of the signal~\cite{ref5}. More recent regression-based approaches, such as the Lasso-based fitting algorithm~\cite{ref14}, improve flexibility but remain highly susceptible to uncorrected atmospheric scattering and residual thin clouds, which often manifest as high-frequency noise and lead to false change detection alarms~\cite{ref7}.
+
+In this context, frequency-domain modeling based on non-uniform sampling provides a robust alternative. Instead of forcing observations onto a regular temporal grid, Non-Uniform Fast Fourier Transform (NUFFT) allows the dominant frequencies of an irregularly sampled signal to be estimated directly and accurately~\cite{ref6}. Furthermore, to handle the inevitable outliers in complex mountainous environments, combining frequency-domain features with robust statistical estimators (such as the Huber loss function) and frequency-weighted penalties (such as Ridge regression) offers a mathematically rigorous way to reconstruct pixel-wise temporal trajectories while explicitly suppressing high-frequency observational noise~\cite{ref8,ref9}.
+
+\section{Proposed Method}
+The proposed NUFROST algorithm provides a robust framework for reconstructing optical remote sensing time series from irregular observations. As illustrated by its core implementation, the method is primarily composed of two key stages: (1) accurate frequency estimation from non-uniformly sampled time series using the Non-Uniform Fast Fourier Transform (NUFFT), and (2) temporal trajectory reconstruction via a robust frequency-weighted ridge regression model. Specifically, the NUFFT directly computes the spectrum without requiring interpolation, from which dominant frequencies (including optional preferred periodicities such as annual and semi-annual cycles) are adaptively selected and refined. Subsequently, a design matrix comprising the selected harmonic components and an optional linear trend is constructed. To suppress outliers (e.g., undetected clouds or shadows), the model employs iteratively reweighted least squares based on the Huber loss function, coupled with a frequency-dependent Ridge penalty that progressively regularizes high-frequency noise, thereby ensuring smooth and reliable time-series reconstruction.
+
+\subsection{Non-Uniform FFT}
+
+Remote sensing image time series in complex mountainous environments commonly suffer from irregular sampling, missing observations, and noise interference, which directly affect the reliability of temporal change detection. Traditional Fast Fourier Transform (FFT) methods strictly require uniformly sampled data. When dealing with remote sensing data missing pixels due to cloud and snow removal, conventional approaches frequently employ methods like linear interpolation or Savitzky-Golay filtering to regularize the time axis before performing FFT. However, such interpolation methods tend to significantly alter the spectral characteristics of the original signal, for example, by introducing pseudo-periodicities at long temporal gaps or amplifying noise in the high-frequency band.
+
+To address this problem and directly compute the spectrum from non-uniformly sampled data, this study introduces the Non-Uniform Fast Fourier Transform (NUFFT)~\cite{ref4,ref6}. By avoiding interpolation entirely, NUFFT prevents spectral distortion. The basic idea of NUFFT is to establish a connection between non-uniform sampling points and a uniform grid, and then use fast algorithms to approximately calculate the exponential sums, thereby maintaining a computational complexity comparable to standard FFT.
+
+The core computational process typically involves three steps: first, the irregular sampling points are spread to an oversampled regular grid via a local kernel function, a process known as ``spreading" or ``convolution"; subsequently, a standard Fast Fourier Transform (FFT) is executed on this regular grid; finally, the result is corrected by deconvolution to recover the true Fourier coefficients.
+
+Assuming an irregularly sampled time series of a remote sensing image pixel consists of $M$ samples, the tuple of time and reflectance at that time is represented as $(t_j, y_j)_{j=1}^M$. Through linear normalization, the sampling times are mapped to $[-\pi, \pi)$. Let $x_j = \frac{2\pi}{T}(t_j - t_0) - \pi$ and $c_j = y_j$, where $T$ is the total duration of the time series. In actual computation, to leverage the fast grid operations, the irregular sampling is viewed as a pulse sequence, as shown in Eq.~(\ref{eq:pulse}), where $\delta(x)$ is the Dirac impulse function.
+
+\begin{equation}
+\label{eq:pulse}
+\mu(x) = \sum_{j=1}^{M} c_j \delta(x - x_j)
+\end{equation}
+
+Based on this, a compactly supported periodic kernel function is introduced, such as the Kaiser-Bessel (KB) kernel. This function realizes the grid mapping from non-uniform sampling points to uniform sampling through convolution, possessing finite support, low sidelobes, and numerical stability. Here, the selected kernel function and the periodized kernel function are denoted as $\psi(x)$ and $\psi_{per}(x)$ respectively, and their relationship is shown in Eq.~(\ref{eq:kernel}). The periodized kernel function is the periodic extension of the kernel function, used to prevent boundary overflow during convolution.
+
+\begin{equation}
+\label{eq:kernel}
+\psi_{per}(x) = \sum_{m \in \mathbb{Z}} \psi(x - 2\pi m)
+\end{equation}
+
+By convolving the input time series with the kernel function, a uniformly sampled time series can be obtained:
+
+\begin{equation}
+\label{eq:conv}
+b_l = (\mu * \psi)(lh) = \sum_{j=1}^{M} c_j \psi(lh - x_j), \quad l = 0, ..., n - 1
+\end{equation}
+
+where $h = \frac{2\pi}{n}$ is the uniform grid step size, and $l$ is the grid index. At this point, the traditional FFT can be used to perform time-frequency transformation on the time series with a uniform step size. The FFT calculation is shown in Eq.~(\ref{eq:fft}):
+
+\begin{equation}
+\label{eq:fft}
+\hat{b}_k = \sum_{l=0}^{n-1} b_l e^{-2\pi i k l / n}, \quad k \in I_n = \{-\frac{n}{2}, ..., \frac{n}{2}-1\}
+\end{equation}
+
+The obtained $\hat{b}_k$ is the discrete spectrum corresponding to the uniform time series. Similarly, FFT can be performed on the periodic kernel function to obtain the discrete spectrum of the kernel function $\hat{\psi}_k = \text{FFT}\{\psi_l\}$. Since $f * h = \hat{f} \cdot \hat{h}$, the spectrum $\hat{f}_k$ of the original signal can be recovered through deconvolution correction via Eq.~(\ref{eq:deconv}).
+
+\begin{equation}
+\label{eq:deconv}
+\hat{f}_k = \frac{\hat{b}_k}{\hat{\psi}_k}, \quad k \in I_n = \{-\frac{n}{2}, ..., \frac{n}{2}-1\}
+\end{equation}
+
+Through the three steps of convolutional spreading, fast Fourier transform, and deconvolution correction, spectral estimation for non-uniform sampling can be achieved. The discrete spectrum $\hat{f}_k$ contains the complete information of the original irregular time series. However, remote sensing time series are often affected by multiple sources of noise, and the spectral components of noise are also mixed in the current discrete spectrum. To fit the time series of true surface reflectance, a method that can effectively eliminate the noise components is needed.
+
+\subsection{Robust Regression}
+
+To reconstruct the true surface reflectance while effectively eliminating noise, we first identify the dominant frequency components from the NUFFT spectrum and then employ a robust regression model to estimate their coefficients.
+
+\subsubsection{Dominant Frequency Selection}
+The discrete spectrum $\hat{f}_k$ obtained from NUFFT contains both physical periodic variations (e.g., phenology) and observational noise. We select the dominant frequencies using a hybrid strategy that combines prior phenological knowledge with data-driven spectral peaks. The spectral power for each frequency component is defined as:
+\begin{equation}
+\label{eq:power}
+P_k = \left|\hat{f}_k\right|^2
+\end{equation}
+
+First, to ensure robust extraction of stable seasonal phenology, we introduce preferred prior frequencies (e.g., annual and semi-annual cycles). These target frequencies are snapped to the nearest valid local maxima in the spectrum within a relative tolerance $\epsilon_{tol}$, preventing the model from missing the core phenological backbone due to noise interference.
+
+Next, to capture region-specific or interannual variations, we supplement the selection with a data-driven peak picking process. We filter out the DC component and extremely low frequencies, restricting the candidate frequencies to $K_+ = \{k \in I_n \mid \nu_k \ge \nu_{min}\}$, where $\nu_k = k/T$ and $\nu_{min}$ is a minimum frequency threshold. The remaining spectral peaks are sorted in descending order of their power. We select the top peaks until their cumulative energy exceeds a predefined threshold $\eta$.
+
+Since the NUFFT evaluates the spectrum on a discrete frequency grid, the true peak frequencies may lie between grid points. To improve estimation accuracy, we apply parabolic refinement around the local maxima. For a detected peak at frequency bin $i$ with power $P_i$, the refined frequency $\tilde{\nu}_i$ is obtained by interpolating with its adjacent bins:
+\begin{equation}
+\label{eq:parabolic}
+\tilde{\nu}_i = \nu_i + \frac{1}{2}\frac{P_{i-1} - P_{i+1}}{P_{i-1} - 2P_i + P_{i+1}} (\nu_{i+1} - \nu_i)
+\end{equation}
+This hybrid selection yields a final set of refined dominant frequencies $\Omega = \{\tilde{\nu}_1, \tilde{\nu}_2, \dots, \tilde{\nu}_m\}$.
+
+\subsubsection{Huber-Ridge Robust Fitting}
+With the extracted dominant frequencies, the time series can be modeled as a linear combination of sinusoidal basis functions, along with a constant and a linear trend. For each observation time $t_j$, the design vector is constructed as:
+\begin{equation}
+\label{eq:design}
+\begin{split}
+&X(t_j) = \\
+&\left[1, t_j - \bar{t}, \cos(2\pi\tilde{\nu}_1 t_j), \sin(2\pi\tilde{\nu}_1 t_j), \dots, \cos(2\pi\tilde{\nu}_m t_j), \sin(2\pi\tilde{\nu}_m t_j)\right]
+\end{split}
+\end{equation}
+The observational model can be written in matrix form as $y \approx X\beta$, where $\beta$ contains the coefficients for the basis functions.
+
+Remote sensing time series frequently contain outliers due to undetected clouds and shadows. To suppress their influence, we employ Iteratively Reweighted Least Squares (IRLS) based on the Huber loss function. The weight $w_j$ for the $j$-th residual $r_j = y_j - \hat{y}_j$ is updated iteratively:
+\begin{equation}
+\label{eq:huber}
+w_j = \begin{cases}
+1, & |r_j| \le \delta \\
+\frac{\delta}{|r_j|}, & |r_j| > \delta
+\end{cases}
+\end{equation}
+where $\delta$ is the Huber threshold parameter.
+
+Furthermore, high-frequency components are more likely to be associated with residual atmospheric or geometric noise rather than true land surface changes. To prevent overfitting these high-frequency noises without overly suppressing legitimate signal variations, we introduce a smoothly increasing, frequency-weighted Ridge penalty. The final objective function to estimate $\beta$ is formulated as:
+\begin{equation}
+\label{eq:objective}
+\min_{\beta} \left( \left\|W^{\frac{1}{2}}(y - X\beta)\right\|_2^2 + \lambda \|D\beta\|_2^2 \right)
+\end{equation}
+where $W$ is a diagonal matrix containing the Huber weights $w_j$, $\lambda$ controls the overall regularization strength, and $D$ is a diagonal penalty matrix controlling the contribution of different frequencies. To ensure a smooth transition and avoid excessively penalizing high frequencies, the penalty scale is formulated using a logarithmic growth rather than a power law. For the basis functions corresponding to frequency $\tilde{\nu}_i$, the diagonal entry in $D$ is proportional to the square root of the penalty scale:
+\begin{equation}
+\label{eq:ridge_penalty}
+% D_{ii} = \sqrt{1.0 + \gamma \max\left(0, \log_2\left(\frac{\tilde{\nu}_i}{\nu_{base}}\right)\right)}
+\begin{split}
+    D_{ii} &= \sqrt{1.0 + \gamma d_{ii} } \\
+    d_{ii} &= {
+        \begin{cases}
+        0, & \tilde{\nu}_i < \nu_{base} \\
+        \log_2\left(\frac{\tilde{\nu}_i}{\nu_{base}}\right), & \tilde{\nu}_i \ge \nu_{base}
+        \end{cases}
+    } \\
+\end{split}
+\end{equation}
+where $\nu_{base}$ is the lowest positive frequency in the selected set, and $\gamma$ regulates the weight of the frequency penalty. The penalty for the constant and trend terms is set to zero. This synergistic Huber-Ridge optimization yields a robust estimation of the time series, effectively mitigating both anomalous outliers and high-frequency noise.
+
+It is worth noting that the frequency-weighted Ridge penalty serves a crucial dual purpose. Beyond its physical interpretation of suppressing high-frequency noise, it also improves the numerical stability of the solution. In remote sensing scenarios with severe continuous missing data (e.g., prolonged monsoon seasons), the unregularized design matrix $X$ can become highly ill-conditioned or rank-deficient, causing ordinary least squares to fail or produce wild oscillations in data gaps. The objective function in Eq.~(\ref{eq:objective}) leads to the normal equation $(X^T W X + \lambda D^2)\beta = X^T W y$. Under the retained model assumptions, the Tikhonov-style regularization term stabilizes the Hessian and makes the resulting system substantially better posed, yielding a unique and numerically stable solution in the severe-gap cases considered in this study.
+
+\section{Experiment and Results}
+
+To evaluate the robustness and accuracy of the proposed NUFROST algorithm, we conducted simulation experiments using real Sentinel-2 Harmonized time-series data. The performance of NUFROST was systematically compared against two widely used time-series reconstruction methods: the Lasso-based fitting algorithm by Zhu et al. (2015)~\cite{ref14} (hereafter referred to as Zhu2015) and the Harmonic Analysis of Time Series (HANTS) algorithm~\cite{ref10}.
+
+\begin{figure*}[!b]
+\centering
+\includegraphics[width=\textwidth]{figures/accuracy.png}
+% \hfil
+\caption{Comparison of reconstruction accuracy across spectral bands for NUFROST, Zhu2015, and HANTS. Panels report the aggregated performance of the three methods in terms of RMSE, MAE, Pearson correlation coefficient $R$, and outlier ratio. Error bars summarize the variability across evaluated scenes, and the heatmap and stacked summary indicate band-level ranking consistency across the reported metrics.}
+\label{fig_sim}
+\end{figure*}
+
+\subsection{Experimental Setup}
+The experiments were conducted on multiple Sentinel-2 Harmonized AOI time-series cubes covering scenes with substantial cloud contamination and irregular temporal sampling. Each AOI was processed independently, and all compared methods were applied to the same input observations, target pixels, and evaluation masks to ensure a fair comparison. Unless otherwise stated, the same pool of valid observations was used for all methods, and the reported results were aggregated across all evaluated AOIs and spectral bands.
+
+The 15 AOI scenes were intentionally distributed across diverse geographic and ecological settings, including the Tibetan Plateau, southwestern mountainous regions, basin and plain areas, and humid subtropical to tropical environments. This sampling strategy was designed to cover strong variations in topographic complexity, cloud contamination, vegetation phenology, and observation regularity. As a result, the evaluation tests whether NUFROST generalizes not only to difficult mountain scenes with persistent gaps and outliers, but also to relatively stable agricultural and low-relief regions.
+
+To rigorously test the resilience of the algorithms to missing data, we designed two complementary simulation settings:
+\begin{itemize}
+    \item \textbf{Random point masking (sparse-observation simulation):} For pixels with a sufficient number of valid observations, we randomly removed valid samples from the original spatiotemporal cube and used the remaining irregular observations to predict the masked values. This setting evaluates the ability of each method to recover missing observations when the available time series is sparse but still distributed across the observation period.
+    \item \textbf{Continuous gap simulation (prolonged cloud-cover simulation):} To emulate persistent cloud cover and seasonal observation outages, we inserted artificial continuous missing intervals into valid pixel-wise time series and then reconstructed the masked segment from the remaining observations. Gap lengths ranged from short interruptions to long missing periods, allowing us to test the stability of each method under increasingly severe temporal discontinuity. To quantify gap severity, we define a gap index as:
+    \begin{equation}
+    \label{eq:gap_index}
+    I_{gap}=\frac{1}{N^2}\sum_i{l_i^2}
+    \end{equation}
+    \begin{equation}
+    \label{eq:gap_index_periodic}
+    I_{periodic} = \frac{1}{N^2}\left|\sum_i l_i e^{j2\pi\tau_i}\right|^2
+    \end{equation}
+    where $N$ is the total sequence length, $l_i$ is the duration of the $i$-th gap, and $\tau_i$ denotes the temporal position of that gap. In practice, we use these indices to organize the simulated-gap experiments from relatively mild to highly challenging missing-data cases.
+\end{itemize}
+
+For all experiments, NUFROST, Zhu2015, and HANTS were evaluated on the same masked targets. Hyperparameters for each method were kept fixed throughout the comparison in order to avoid case-specific tuning. This protocol emphasizes robustness under a unified evaluation pipeline rather than per-scene manual optimization. Final summaries were reported over repeated masking experiments and aggregated across ROIs to reduce sensitivity to any single random split.
+
+
+
+\subsection{Evaluation Metrics}
+The predicted reflectance values were compared against the original valid observations treated as reference values. We report four complementary metrics to assess both reconstruction accuracy and robustness:
+\begin{itemize}
+    \item \textbf{Root Mean Square Error (RMSE):} Measures overall reconstruction error and penalizes large deviations more strongly.
+    \item \textbf{Mean Absolute Error (MAE):} Measures the average absolute prediction error and is less sensitive to isolated extreme residuals than RMSE.
+    \item \textbf{Pearson correlation coefficient ($R$):} Measures the consistency between reconstructed and reference temporal variation.
+    \item \textbf{Outlier ratio:} Measures the fraction of predictions whose errors exceed a robust tolerance bound, thereby reflecting the stability of a method in the presence of residual contamination and difficult temporal gaps.
+\end{itemize}
+
+Lower RMSE, MAE, and outlier ratio indicate better performance, whereas a higher $R$ indicates better agreement with the reference trajectory. In the result summaries, we report aggregated statistics across ROIs and bands rather than relying on a single representative scene, so that the comparison reflects overall behavior under heterogeneous observation conditions.
+
+\subsection{Reconstruction Accuracy}
+
+The overall reconstruction accuracy of NUFROST, Zhu2015, and HANTS is visualized in Fig.~\ref{fig_sim}. Across all evaluated Sentinel-2 Harmonized scenes and spectral bands, NUFROST achieved the lowest median RMSE (199.8) and MAE (100.7), outperforming Zhu2015 (RMSE: 492.8, MAE: 108.0) and HANTS (RMSE: 488.9, MAE: 288.2). In terms of temporal consistency, NUFROST also attained the highest median Pearson correlation coefficient ($R$ = 0.852), compared to 0.558 for Zhu2015 and 0.635 for HANTS. Moreover, NUFROST exhibited the smallest median outlier ratio (0.32\%), indicating superior robustness against residual contamination and difficult gaps, whereas Zhu2015 and HANTS produced 0.78\% and 5.25\% outlier ratios, respectively.
+
+The per-band analysis reveals that NUFROST consistently outperformed the baseline methods across all six Sentinel-2 bands (B2, B3, B4, B8, B11, B12). The improvement is particularly pronounced in the visible bands (B2, B3, B4) where atmospheric scattering and residual cloud effects are more severe. For instance, in the blue band (B2) NUFROST reduced the median RMSE to 130.1 (vs. 312.3 for Zhu2015 and 394.0 for HANTS) while increasing $R$ to 0.717 (vs. 0.325 and 0.579). The near-infrared and short-wave infrared bands (B8, B11, B12) also benefited from NUFROST’s robust frequency-weighted regularization, with $R$ values exceeding 0.87 in all three bands. These results confirm that NUFROST’s direct spectral estimation from irregular samples, combined with Huber-Ridge robust regression, delivers more accurate and stable reconstructions than conventional interpolation-based or harmonic-fitting approaches.
+
+\subsection{Sparse-Observation Resilience}
+To evaluate the resilience of each algorithm under sparse temporal sampling, we conducted random point-masking experiments where valid observations were removed from otherwise complete pixel-wise time series. NUFROST degrades more gracefully than the baseline methods as the number of retained observations decreases. Although all methods become less accurate under severe sparsity, NUFROST preserves a more stable error profile, whereas Zhu2015 and HANTS exhibit a sharper loss of reconstruction quality as temporal support becomes limited.
+
+The advantage of NUFROST stems from its ability to estimate dominant frequencies directly from irregular samples via NUFFT, avoiding the spectral distortion introduced by interpolation-based regularization. When observations become extremely sparse, the baseline methods have less temporal support for constraining the seasonal trajectory and therefore become more sensitive to model mismatch and residual contamination. NUFROST’s frequency-weighted Ridge penalty further stabilizes the solution by suppressing unreliable high-frequency components, yielding a reconstruction that remains faithful to the underlying phenological signal even under severe observation sparsity.
+
+\subsection{Continuous-Gap Reconstruction}
+Persistent cloud cover often leads to extended periods of missing data, posing a particular challenge for time-series reconstruction. We simulated continuous gaps of varying lengths and evaluated each algorithm's ability to recover the missing segment. NUFROST consistently yields lower gap-filling error and a more stable response as the missing interval grows. The contrast becomes especially clear for more challenging gaps, where Zhu2015 and HANTS are more prone to drift away from the underlying seasonal trajectory while NUFROST better preserves the expected temporal structure.
+
+The robustness of NUFROST under prolonged missing intervals is attributed to two key design elements. First, the NUFFT-based spectrum estimation does not rely on evenly spaced samples, so the spectral peaks corresponding to annual and semi-annual cycles can still be reliably identified even when a whole season is missing. Second, the frequency-weighted Ridge penalty in Eq.~\ref{eq:objective} improves the conditioning of the normal equation, enhancing numerical stability and reducing the wild oscillations that often plague least-squares solutions in rank-deficient scenarios. Consequently, NUFROST can reconstruct plausible temporal trajectories through long data gaps without introducing artificial spikes or unrealistic seasonal patterns.
+
+\subsection{Ablation Study}
+To quantify the contribution of individual components of NUFROST, we performed an ablation study that systematically removed or replaced key elements of the pipeline. The comparison contrasts the full method with reduced configurations that omit robust fitting or weaken the frequency-aware treatment of irregular observations and high-frequency components.
+
+The results demonstrate that each component plays a distinct role in the final performance. When robust fitting is weakened, the reconstructions become more sensitive to contaminated observations and residual outliers. When the frequency-aware regularization is simplified, the fitted trajectories become less stable and more susceptible to spurious high-frequency variation. Additional reductions in the frequency-selection and trend-modeling components also weaken the overall reconstruction, indicating that the full pipeline benefits from combining data-driven spectral selection, robust loss design, and frequency-weighted regularization. Together, these ablation results support the claim that NUFROST performs best when these design choices are used in combination.
+
+\section{Conclusion}
+
+This paper presented NUFROST, a robust reconstruction framework for irregularly sampled optical remote sensing time series. By combining the Non-Uniform Fast Fourier Transform with Huber-Ridge regression, NUFROST addresses two fundamental challenges in temporal reconstruction: the spectral distortion introduced by interpolation-based preprocessing, and the sensitivity of least-squares fitting to outliers and high-frequency noise.
+
+The NUFFT enables direct spectrum estimation from irregularly sampled observations without temporal regularization, preserving the true spectral characteristics of the signal. The hybrid frequency selection strategy, combining prior phenological knowledge with data-driven spectral peak detection and parabolic refinement, ensures robust identification of dominant frequencies across diverse observation conditions. The Huber-Ridge objective function simultaneously suppresses outlier contamination and regularizes high-frequency noise, with the frequency-weighted Ridge penalty improving numerical stability and keeping the system better posed under severe temporal gaps.
+
+Experiments on Sentinel-2 Harmonized time series across 15 ROI scenes and six spectral bands demonstrate that NUFROST outperforms both HANTS and Zhu2015 in terms of RMSE, MAE, Pearson correlation, and outlier ratio. The advantage is consistent across spectral bands and particularly pronounced under sparse-observation and continuous-gap scenarios. Ablation analysis confirms that each design component contributes positively to overall performance.
+
+Future work may extend NUFROST to multi-sensor fusion scenarios and explore adaptive hyperparameter selection based on per-pixel observation characteristics.
+
+\begin{thebibliography}{14}
+
+\bibitem{ref1}
+C. G\'{o}mez, J. C. White, and M. A. Wulder, ``Optical remotely sensed time series data for land cover classification: A review,'' \textit{ISPRS Journal of Photogrammetry and Remote Sensing}, vol. 116, pp. 55--72, 2016.
+
+\bibitem{ref2}
+Z. Zhu and C. E. Woodcock, ``Continuous change detection and classification of land cover using all available Landsat data,'' \textit{Remote Sensing of Environment}, vol. 144, pp. 152--171, 2014.
+
+\bibitem{ref3}
+J. Verbesselt, R. Hyndman, G. Newnham, et al., ``Detecting trend and seasonal changes in satellite image time series,'' \textit{Remote Sensing of Environment}, vol. 114, no. 1, pp. 106--115, 2010.
+
+\bibitem{ref4}
+J. A. Fessler and B. P. Sutton, ``Nonuniform fast Fourier transforms using min-max interpolation,'' \textit{IEEE Transactions on Signal Processing}, vol. 51, no. 2, pp. 560--574, 2003.
+
+\bibitem{ref5}
+A. V. Oppenheim, A. S. Willsky, and S. H. Nawab, \textit{Signals \& Systems}, 2nd ed. Upper Saddle River, NJ, USA: Prentice Hall.
+
+\bibitem{ref6}
+A. H. Barnett, J. Magland, and L. af Klinteberg, ``A parallel nonuniform fast Fourier transform library based on an `exponential of semicircle' kernel,'' \textit{SIAM Journal on Scientific Computing}, vol. 41, no. 5, pp. C479--C504, 2019.
+
+\bibitem{ref7}
+Z. Zhu, J. Zhang, Z. Yang, et al., ``Continuous monitoring of land disturbance based on Landsat time series,'' \textit{Remote Sensing of Environment}, vol. 238, Art. no. 111116, 2020.
+
+\bibitem{ref8}
+P. J. Huber, ``Robust estimation of a location parameter,'' \textit{The Annals of Mathematical Statistics}, vol. 35, no. 1, pp. 73--101, 1964.
+
+\bibitem{ref9}
+A. E. Hoerl and R. W. Kennard, ``Ridge regression: Biased estimation for nonorthogonal problems,'' \textit{Technometrics}, vol. 12, no. 1, pp. 55--67, 1970.
+
+\bibitem{ref10}
+G. J. Roerink, M. Menenti, and W. Verhoef, ``Reconstructing cloudfree NDVI composites using Fourier analysis of time series,'' \textit{International Journal of Remote Sensing}, vol. 21, no. 9, pp. 1911--1917, 2000.
+
+\bibitem{ref11}
+R. E. Kennedy, Z. Yang, and W. B. Cohen, ``Detecting trends in forest disturbance and recovery using yearly Landsat time series: 1. LandTrendr temporal segmentation algorithms,'' \textit{Remote Sensing of Environment}, vol. 114, no. 12, pp. 2897--2910, 2010.
+
+\bibitem{ref12}
+V. J. Pasquarella, P. Arevalo, K. H. Bratley, et al., ``Demystifying LandTrendr and CCDC temporal segmentation,'' \textit{International Journal of Applied Earth Observation and Geoinformation}, vol. 110, Art. no. 102806, 2022.
+
+\bibitem{ref13}
+H. Yin, B. Tan, D. Frantz, et al., ``Integrated topographic corrections improve forest mapping using Landsat imagery,'' \textit{International Journal of Applied Earth Observation and Geoinformation}, vol. 108, Art. no. 102716, 2022.
+
+\bibitem{ref14}
+Z. Zhu, C. E. Woodcock, C. Holden, et al., ``Generating synthetic Landsat images based on all available Landsat data: Predicting Landsat surface reflectance at any given time,'' \textit{Remote Sensing of Environment}, vol. 162, pp. 67--83, 2015.
+
+\end{thebibliography}
+
+\end{document}

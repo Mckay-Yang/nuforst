@@ -1,6 +1,6 @@
 import os
 import math
-from typing import Optional, Tuple, Sequence, Union, cast
+from typing import Any, Dict, Optional, Tuple, Sequence, Union, cast
 from datetime import datetime
 import numpy as np
 from pathlib import Path
@@ -342,40 +342,57 @@ def robust_fit_freq_ridge(X: np.ndarray, y: np.ndarray, freqs: np.ndarray, lam: 
                                           include_dc, include_trend, freq_weight, w=w)
     return beta, y_hat
 
-def predict_single_pixel(t_sec: np.ndarray, y: np.ndarray, target_t: float,
-                         nufft_modes: int, eps: float,
-                         num_peaks: int, power_cum: float, ignore_dc_hz: float,
-                         frequency_selection: str = "hybrid", preferred_periods_days: Union[str, Sequence[float], np.ndarray] = "365.25,182.625,91.3125,30.4375", preferred_top_k: int = 4, spectral_top_k: int = 4, spectral_merge_tol: float = 0.15,
-                         refine_peaks: bool = True, include_trend: bool = True,
-                         ridge_lam: float = 1e-2, freq_weight: float = 2.0, huber_iters: int = 3, huber_delta: float = 1.5,
-                         min_obs: int = 12) -> Tuple[float, int]:
+
+def fit_nufrost_pixel_params(t_sec: np.ndarray, y: np.ndarray, target_t: Optional[float] = None,  # reserved for future prediction at specific time
+                             nufft_modes: int = 4096, eps: float = 1e-12,
+                             num_peaks: int = 10, power_cum: float = 0.7, ignore_dc_hz: float = 1e-10,
+                              frequency_selection: str = "hybrid", preferred_periods_days: Union[str, Sequence[float], np.ndarray] = "365.25,182.625,91.3125,30.4375", preferred_top_k: int = 4, spectral_top_k: int = 4, spectral_merge_tol: float = 0.15,
+                              refine_peaks: bool = True, include_trend: bool = True,
+                              ridge_lam: float = 0.005, freq_weight: float = 2.0, huber_iters: int = 3, huber_delta: float = 1.5,
+                              min_obs: int = 12, max_freqs: Optional[int] = None) -> Dict[str, Any]:
+    if max_freqs is None:
+        max_freqs = max(num_peaks, preferred_top_k + spectral_top_k, 10)
+    max_freqs = max(0, max_freqs)
+    beta_size = 1 + (1 if include_trend else 0) + 2 * max_freqs
+    params: Dict[str, Any] = {
+        "valid": False,
+        "include_trend": bool(include_trend),
+        "n_freqs_used": 0,
+        "t_min": np.nan,
+        "t_rel_mean": np.nan,
+        "fill_value": np.nan,
+        "freqs": np.full(max_freqs, np.nan, dtype=np.float64),
+        "beta": np.full(beta_size, np.nan, dtype=np.float64),
+    }
+
     m = np.isfinite(y) & np.isfinite(t_sec)
     if m.sum() < max(3, min_obs):
-        return np.nan, 0
+        return params
     t = np.asarray(t_sec[m], dtype=np.float64)
     yy = np.asarray(y[m], dtype=np.float64)
+    params["fill_value"] = float(np.nanmean(yy))
 
     t_rel = _to_seconds_since_start(t)
     t_rel_mean = float(t_rel.mean())
     Tspan = float(t_rel.max() - t_rel.min())
     if not np.isfinite(Tspan) or Tspan <= 0:
-        return np.nan, 0
+        return params
 
-    x = 2*np.pi*(t_rel - t_rel.min())/Tspan - np.pi
+    x = 2 * np.pi * (t_rel - t_rel.min()) / Tspan - np.pi
     x = np.ascontiguousarray(x, dtype=np.float64)
     c = np.ascontiguousarray(yy.astype(np.complex128))
     ms = next_even(nufft_modes)
     Fk = finufft.nufft1d1(x, c, ms, eps=eps, isign=-1)
-    k = np.arange(-ms//2, ms//2, dtype=np.int64)
-    freqs = k.astype(np.float64)/Tspan
+    k = np.arange(-ms // 2, ms // 2, dtype=np.int64)
+    freqs = k.astype(np.float64) / Tspan
 
     pos = freqs >= 0
     f_pos = freqs[pos]
-    P_pos = (np.abs(Fk[pos])**2)
+    P_pos = np.abs(Fk[pos]) ** 2
 
     dt = np.diff(np.sort(t_rel))
     dt_pos = dt[dt > 0]
-    dt_med = float(np.median(dt_pos)) if dt_pos.size else Tspan/len(t_rel)
+    dt_med = float(np.median(dt_pos)) if dt_pos.size else Tspan / len(t_rel)
     fmax = 0.5 / max(dt_med, 1e-12)
 
     preferred_freqs = _preferred_periods_to_freqs(preferred_periods_days, time_unit="seconds")
@@ -393,100 +410,112 @@ def predict_single_pixel(t_sec: np.ndarray, y: np.ndarray, target_t: float,
         ignore_dc_hz=ignore_dc_hz,
         refine_peaks=refine_peaks,
     )
-
+    freqs_sel = np.asarray(freqs_sel[:max_freqs], dtype=np.float64)
     X = design_matrix(t_rel, freqs_sel, include_trend=include_trend, include_dc=True)
-    beta, _ = robust_fit_freq_ridge(X, yy, freqs_sel,
-                                    lam=ridge_lam, iters=huber_iters, delta=huber_delta,
-                                    include_dc=True, include_trend=include_trend, freq_weight=freq_weight)
+    beta, _ = robust_fit_freq_ridge(
+        X,
+        yy,
+        freqs_sel,
+        lam=ridge_lam,
+        iters=huber_iters,
+        delta=huber_delta,
+        include_dc=True,
+        include_trend=include_trend,
+        freq_weight=freq_weight,
+    )
 
-    t_star_rel = float(target_t - t.min())
+    params["valid"] = True
+    params["n_freqs_used"] = int(len(freqs_sel))
+    params["t_min"] = float(t.min())
+    params["t_rel_mean"] = t_rel_mean
+    if len(freqs_sel) > 0:
+        params["freqs"][: len(freqs_sel)] = freqs_sel
+    params["beta"][: len(beta)] = beta
+    return params
+
+
+def predict_nufrost_from_params(params: Dict[str, Any], target_t: float) -> float:
+    if not bool(params.get("valid", False)):
+        return float(params.get("fill_value", np.nan))
+    include_trend = bool(params["include_trend"])
+    n_freqs = int(params["n_freqs_used"])
+    freqs = np.asarray(params["freqs"], dtype=np.float64)[:n_freqs]
+    beta = np.asarray(params["beta"], dtype=np.float64)
+    t_star_rel = float(target_t - float(params["t_min"]))
     cols = [1.0]
     if include_trend:
-        cols.append(t_star_rel - t_rel_mean)
-    for f in freqs_sel:
-        w = 2*np.pi*f
-        cols.append(math.cos(w*t_star_rel))
-        cols.append(math.sin(w*t_star_rel))
-    X_star = np.array(cols, dtype=np.float64).reshape(1, -1) if len(cols) else np.zeros((1,0))
+        cols.append(t_star_rel - float(params["t_rel_mean"]))
+    for f in freqs:
+        w = 2 * np.pi * f
+        cols.append(math.cos(w * t_star_rel))
+        cols.append(math.sin(w * t_star_rel))
+    return float(np.asarray(cols, dtype=np.float64) @ beta[: len(cols)])
 
-    if X.shape[1] > 0:
-        y_star = float((X_star @ beta).item())
-    else:
-        y_star = float(np.nanmean(yy))
-    return y_star, len(freqs_sel)
+
+def predict_nufrost_curve_from_params(params: Dict[str, Any], target_t_secs: np.ndarray) -> np.ndarray:
+    return np.array([predict_nufrost_from_params(params, float(target_t)) for target_t in target_t_secs], dtype=np.float64)
+
+def predict_single_pixel(t_sec: np.ndarray, y: np.ndarray, target_t: float,
+                         nufft_modes: int, eps: float,
+                         num_peaks: int, power_cum: float, ignore_dc_hz: float,
+                          frequency_selection: str = "hybrid", preferred_periods_days: Union[str, Sequence[float], np.ndarray] = "365.25,182.625,91.3125,30.4375", preferred_top_k: int = 4, spectral_top_k: int = 4, spectral_merge_tol: float = 0.15,
+                          refine_peaks: bool = True, include_trend: bool = True,
+                          ridge_lam: float = 0.005, freq_weight: float = 2.0, huber_iters: int = 3, huber_delta: float = 1.5,
+                          min_obs: int = 12) -> Tuple[float, int]:
+    params = fit_nufrost_pixel_params(
+        t_sec,
+        y,
+        nufft_modes=nufft_modes,
+        eps=eps,
+        num_peaks=num_peaks,
+        power_cum=power_cum,
+        ignore_dc_hz=ignore_dc_hz,
+        frequency_selection=frequency_selection,
+        preferred_periods_days=preferred_periods_days,
+        preferred_top_k=preferred_top_k,
+        spectral_top_k=spectral_top_k,
+        spectral_merge_tol=spectral_merge_tol,
+        refine_peaks=refine_peaks,
+        include_trend=include_trend,
+        ridge_lam=ridge_lam,
+        freq_weight=freq_weight,
+        huber_iters=huber_iters,
+        huber_delta=huber_delta,
+        min_obs=min_obs,
+        max_freqs=max(num_peaks, preferred_top_k + spectral_top_k, 1),
+    )
+    return predict_nufrost_from_params(params, target_t), int(params["n_freqs_used"])
 
 def predict_curve_pixel(t_sec: np.ndarray, y: np.ndarray, target_t_secs: np.ndarray,
                          nufft_modes: int, eps: float,
                          num_peaks: int, power_cum: float, ignore_dc_hz: float,
-                         frequency_selection: str = "hybrid", preferred_periods_days: Union[str, Sequence[float], np.ndarray] = "365.25,182.625,91.3125,30.4375", preferred_top_k: int = 4, spectral_top_k: int = 4, spectral_merge_tol: float = 0.15,
-                         refine_peaks: bool = True, include_trend: bool = True,
-                         ridge_lam: float = 1e-2, freq_weight: float = 2.0, huber_iters: int = 3, huber_delta: float = 1.5,
-                         min_obs: int = 12) -> np.ndarray:
-    m = np.isfinite(y) & np.isfinite(t_sec)
-    if m.sum() < max(3, min_obs):
-        return np.full(len(target_t_secs), np.nan)
-    t = np.asarray(t_sec[m], dtype=np.float64)
-    yy = np.asarray(y[m], dtype=np.float64)
-
-    t_rel = _to_seconds_since_start(t)
-    t_rel_mean = float(t_rel.mean())
-    Tspan = float(t_rel.max() - t_rel.min())
-    if not np.isfinite(Tspan) or Tspan <= 0:
-        return np.full(len(target_t_secs), np.nan)
-
-    x = 2*np.pi*(t_rel - t_rel.min())/Tspan - np.pi
-    x = np.ascontiguousarray(x, dtype=np.float64)
-    c = np.ascontiguousarray(yy.astype(np.complex128))
-    ms = next_even(nufft_modes)
-    Fk = finufft.nufft1d1(x, c, ms, eps=eps, isign=-1)
-    k = np.arange(-ms//2, ms//2, dtype=np.int64)
-    freqs = k.astype(np.float64)/Tspan
-
-    pos = freqs >= 0
-    f_pos = freqs[pos]
-    P_pos = (np.abs(Fk[pos])**2)
-
-    dt = np.diff(np.sort(t_rel))
-    dt_pos = dt[dt > 0]
-    dt_med = float(np.median(dt_pos)) if dt_pos.size else Tspan/len(t_rel)
-    fmax = 0.5 / max(dt_med, 1e-12)
-
-    preferred_freqs = _preferred_periods_to_freqs(preferred_periods_days, time_unit="seconds")
-    spectral_top_k_eff = spectral_top_k if spectral_top_k > 0 else num_peaks
-    freqs_sel = select_frequencies(
-        f_pos=f_pos,
-        P_pos=P_pos,
-        fmax=fmax,
-        selection_mode=frequency_selection,
-        preferred_freqs=preferred_freqs,
-        preferred_top_k=preferred_top_k,
-        spectral_top_k=spectral_top_k_eff,
-        spectral_merge_tol=spectral_merge_tol,
+                          frequency_selection: str = "hybrid", preferred_periods_days: Union[str, Sequence[float], np.ndarray] = "365.25,182.625,91.3125,30.4375", preferred_top_k: int = 4, spectral_top_k: int = 4, spectral_merge_tol: float = 0.15,
+                          refine_peaks: bool = True, include_trend: bool = True,
+                          ridge_lam: float = 0.005, freq_weight: float = 2.0, huber_iters: int = 3, huber_delta: float = 1.5,
+                          min_obs: int = 12) -> np.ndarray:
+    params = fit_nufrost_pixel_params(
+        t_sec,
+        y,
+        nufft_modes=nufft_modes,
+        eps=eps,
+        num_peaks=num_peaks,
         power_cum=power_cum,
         ignore_dc_hz=ignore_dc_hz,
+        frequency_selection=frequency_selection,
+        preferred_periods_days=preferred_periods_days,
+        preferred_top_k=preferred_top_k,
+        spectral_top_k=spectral_top_k,
+        spectral_merge_tol=spectral_merge_tol,
         refine_peaks=refine_peaks,
+        include_trend=include_trend,
+        ridge_lam=ridge_lam,
+        freq_weight=freq_weight,
+        huber_iters=huber_iters,
+        huber_delta=huber_delta,
+        min_obs=min_obs,
+        max_freqs=max(num_peaks, preferred_top_k + spectral_top_k, 1),
     )
-
-    X = design_matrix(t_rel, freqs_sel, include_trend=include_trend, include_dc=True)
-    beta, _ = robust_fit_freq_ridge(X, yy, freqs_sel,
-                                    lam=ridge_lam, iters=huber_iters, delta=huber_delta,
-                                    include_dc=True, include_trend=include_trend, freq_weight=freq_weight)
-
-    t_star_rel = target_t_secs - t.min()
-    cols = [np.ones_like(t_star_rel)]
-    if include_trend:
-        cols.append(t_star_rel - t_rel_mean)
-    for f in freqs_sel:
-        w = 2*np.pi*f
-        cols.append(np.cos(w*t_star_rel))
-        cols.append(np.sin(w*t_star_rel))
-    X_star = np.column_stack(cols) if len(cols) else np.zeros((len(t_star_rel), 0))
-
-    if X.shape[1] > 0:
-        y_star = X_star @ beta
-    else:
-        y_star = np.full(len(target_t_secs), np.nanmean(yy))
-    return y_star
+    return predict_nufrost_curve_from_params(params, target_t_secs)
 
 def reconstruct_nufrost(
     image: Union[str, Path],
@@ -513,7 +542,7 @@ def reconstruct_nufrost(
     # 2. 加载数据
     loader = RSCube(args.image, cache_dir=args.cache_dir, force_refresh=args.force_refresh)
     data = loader.load()
-    cube = data["cube"]
+    cube = np.ma.filled(data["cube"], np.nan)
     timestamps = data["timestamps"]
 
     # 3. 执行重建
