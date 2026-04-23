@@ -24,7 +24,7 @@ from ..data_loader import (
     find_image_chunks,
 )
 from ..hants import hants_pixel
-from ..nufrost import nufrost_core, timestamps_to_seconds
+from ..nufrost import parse_timestamp_str, predict_single_pixel, timestamps_to_seconds
 from ..zhu2015 import fit_predict_pixel
 
 
@@ -228,8 +228,8 @@ def choose_shared_target_timestamp(
 def build_output_path(output_root: Path, method_name: str, source_file: Path, target_time: str, *, source_name: str = "", lon: float = 0.0, lat: float = 0.0) -> Path:
     safe_time = target_time.replace(":", "-")
     if source_name and lon and lat:
-        return output_root / f"{source_name}_recon" / f"{lon:.4f}_{lat:.4f}" / f"[{method_name}]_{source_name}_{_location_output_token(lon, lat)}_{safe_time}__{method_name}.tif"
-    return output_root / method_name / f"[{method_name}]_{source_file.stem}_{safe_time}__{method_name}.tif"
+        return output_root / f"{source_name}_recon" / f"{lon:.4f}_{lat:.4f}" / f"[{method_name}]_{source_name}_{_location_output_token(lon, lat)}_{safe_time}.tif"
+    return output_root / method_name / f"[{method_name}]_{source_file.stem}_{safe_time}.tif"
 
 
 def build_ground_truth_output_path(
@@ -240,7 +240,7 @@ def build_ground_truth_output_path(
     target_time: str,
 ) -> Path:
     safe_time = target_time.replace(":", "-")
-    return output_root / f"{source_name}_recon" / f"{lon:.4f}_{lat:.4f}" / f"[grand_truth]_{source_name}_{_location_output_token(lon, lat)}_{safe_time}.tif"
+    return output_root / f"{source_name}_recon" / f"{lon:.4f}_{lat:.4f}" / f"[ground_truth]_{source_name}_{_location_output_token(lon, lat)}_{safe_time}.tif"
 
 
 def build_scene_stack_output_path(
@@ -253,7 +253,7 @@ def build_scene_stack_output_path(
     suffix: str,
 ) -> Path:
     safe_time = target_time.replace(":", "-")
-    return output_root / f"{source_name}_recon" / f"{lon:.4f}_{lat:.4f}" / f"[{method_name}]_{source_name}_{_location_output_token(lon, lat)}_{safe_time}__{method_name}_{suffix}.tif"
+    return output_root / f"{source_name}_recon" / f"{lon:.4f}_{lat:.4f}" / f"[{method_name}]_{source_name}_{_location_output_token(lon, lat)}_{safe_time}_{suffix}.tif"
 
 
 def collapse_duplicate_timestamps(cube: np.ndarray, timestamps: Sequence[str]) -> Tuple[np.ndarray, np.ndarray]:
@@ -314,14 +314,61 @@ def _summary_path_for_location(output_root: Path, source_name: str, lon: float, 
     return output_root / "run_summaries" / f"reconstruction_summary_{safe_source}_lon{lon_token}_lat{lat_token}.json"
 
 
-def _find_existing_summary(output_root: Path, source_name: str, lon: float, lat: float) -> Optional[Path]:
+def _summary_matches_run(
+    candidate: Path,
+    *,
+    methods: Sequence[str],
+    window_size: Optional[int],
+    source_files: Mapping[str, Sequence[str]],
+    min_valid_ratio: float,
+    late_fraction: float,
+) -> bool:
+    try:
+        payload = json.loads(candidate.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+
+    candidate_methods = tuple(str(method) for method in payload.get("methods", ("nufrost", "hants", "zhu2015")))
+    candidate_window_size = payload.get("window_size")
+    candidate_source_files = payload.get("source_files", {})
+    candidate_min_valid_ratio = float(payload.get("min_valid_ratio", DEFAULT_MIN_VALID_RATIO))
+    candidate_late_fraction = float(payload.get("late_fraction", DEFAULT_LATE_FRACTION))
+    return (
+        candidate_methods == tuple(methods)
+        and candidate_window_size == window_size
+        and candidate_source_files == {band: list(paths) for band, paths in source_files.items()}
+        and candidate_min_valid_ratio == float(min_valid_ratio)
+        and candidate_late_fraction == float(late_fraction)
+    )
+
+
+def _find_existing_summary(
+    output_root: Path,
+    source_name: str,
+    lon: float,
+    lat: float,
+    *,
+    methods: Sequence[str],
+    window_size: Optional[int],
+    source_files: Mapping[str, Sequence[str]],
+    min_valid_ratio: float,
+    late_fraction: float,
+) -> Optional[Path]:
     pattern = _summary_path_for_location(output_root, source_name, lon, lat)
     pattern_parent = pattern.parent
     if not pattern_parent.exists():
         return None
     stem_prefix = pattern.stem
     for candidate in sorted(pattern_parent.glob(f"{stem_prefix}_*.json")):
-        return candidate
+        if _summary_matches_run(
+            candidate,
+            methods=methods,
+            window_size=window_size,
+            source_files=source_files,
+            min_valid_ratio=min_valid_ratio,
+            late_fraction=late_fraction,
+        ):
+            return candidate
     return None
 
 
@@ -346,6 +393,103 @@ def _run_parallel_rows(height: int, worker, n_jobs: int, desc: str):
         delayed(worker)(row_idx) for row_idx in range(height)
     )
     return list(tqdm(results_gen, total=height, desc=desc))
+
+
+def _run_shared_method_rows(
+    *,
+    methods: Sequence[str],
+    cube: np.ndarray,
+    timestamps: Sequence[str],
+    target_time: str,
+    n_jobs: int,
+    build_nufrost_args: Mapping[str, object],
+) -> Dict[str, np.ndarray]:
+    method_names = list(methods)
+    if not method_names:
+        return {}
+
+    timestamps_array = np.asarray(timestamps, dtype="U32")
+    target_dt = _parse_target_datetime(target_time)
+    timestamps_sec = timestamps_to_seconds(timestamps_array)
+    t0_sec = float(np.min(timestamps_sec))
+    t_days = (timestamps_sec - t0_sec) / 86400.0
+    target_t_day = (target_dt.timestamp() - t0_sec) / 86400.0
+
+    nufrost_args = build_args(dict(build_nufrost_args))
+    nufrost_t_sec = timestamps_to_seconds(timestamps_array, unit=nufrost_args.time_unit)
+    nufrost_target_dt = parse_timestamp_str(target_time)
+    if nufrost_target_dt is None:
+        raise ValueError(f"Unrecognized target_time: {target_time}")
+    nufrost_target_t = nufrost_target_dt.timestamp()
+    if nufrost_args.time_unit == "days":
+        nufrost_target_t = nufrost_target_t / 86400.0
+
+    _, height, width = cube.shape
+    task_count = max(1, height * len(method_names))
+    resolved_jobs = _resolve_n_jobs(n_jobs, task_count)
+    outputs = {method_name: np.full((height, width), np.nan, dtype=np.float32) for method_name in method_names}
+
+    def _predict_task(method_name: str, row_idx: int):
+        row = np.full(width, np.nan, dtype=np.float32)
+        if method_name == "nufrost":
+            for col_idx in range(width):
+                pred, _ = predict_single_pixel(
+                    nufrost_t_sec,
+                    cube[:, row_idx, col_idx],
+                    nufrost_target_t,
+                    nufft_modes=nufrost_args.modes,
+                    eps=nufrost_args.eps,
+                    num_peaks=nufrost_args.num_peaks,
+                    power_cum=nufrost_args.power_cum,
+                    ignore_dc_hz=nufrost_args.ignore_dc_hz,
+                    frequency_selection=nufrost_args.frequency_selection,
+                    preferred_periods_days=nufrost_args.preferred_periods_days,
+                    preferred_top_k=nufrost_args.preferred_top_k,
+                    spectral_top_k=nufrost_args.spectral_top_k,
+                    spectral_merge_tol=nufrost_args.spectral_merge_tol,
+                    refine_peaks=nufrost_args.refine_peaks,
+                    include_trend=nufrost_args.include_trend,
+                    ridge_lam=nufrost_args.ridge,
+                    freq_weight=nufrost_args.freq_weight,
+                    huber_iters=nufrost_args.huber_iters,
+                    huber_delta=nufrost_args.huber_delta,
+                    min_obs=nufrost_args.min_obs,
+                )
+                row[col_idx] = pred
+        elif method_name == "hants":
+            for col_idx in range(width):
+                row[col_idx] = hants_pixel(t_days, cube[:, row_idx, col_idx], target_t_day, nof=3, sf="low", fet=0.05, dod=5)
+        elif method_name == "zhu2015":
+            for col_idx in range(width):
+                pred, _ = fit_predict_pixel(t_days, cube[:, row_idx, col_idx], target_t_day, lasso_alpha=0.0001)
+                row[col_idx] = pred
+        else:
+            raise ValueError(f"Unsupported method: {method_name}")
+        return method_name, row_idx, row
+
+    tasks = (delayed(_predict_task)(method_name, row_idx) for method_name in method_names for row_idx in range(height))
+    if resolved_jobs == 1:
+        results = (_predict_task(method_name, row_idx) for method_name in method_names for row_idx in range(height))
+    else:
+        results = Parallel(n_jobs=resolved_jobs, prefer="processes", return_as="generator")(tasks)
+
+    for method_name, row_idx, row in tqdm(results, total=task_count, desc="Method Rows"):
+        outputs[method_name][row_idx, :] = row
+    return outputs
+
+
+def _crop_loaded_cube(data: Mapping[str, object], window_size: Optional[int]) -> Dict[str, object]:
+    if window_size is None:
+        return dict(data)
+    if window_size <= 0:
+        raise ValueError("window_size must be positive")
+
+    cropped = dict(data)
+    cube = data.get("cube")
+    if cube is None:
+        raise ValueError("Loaded cube data must include 'cube'")
+    cropped["cube"] = cube[:, :window_size, :window_size]
+    return cropped
 
 
 def reconstruct_hants_from_cube(
@@ -486,19 +630,31 @@ def reconstruct_full_scene_for_location(
     force_refresh: bool = False,
     min_valid_ratio: float = DEFAULT_MIN_VALID_RATIO,
     late_fraction: float = DEFAULT_LATE_FRACTION,
+    window_size: Optional[int] = None,
 ) -> Dict[str, Any]:
     output_root = Path(output_root)
     data_root = Path(data_root)
     cache_dir = Path(cache_dir)
 
-    existing_summary = _find_existing_summary(output_root, source_name, lon, lat)
-    if existing_summary is not None:
-        return {"skipped": True, "summary_path": str(existing_summary)}
-
     data_dir = _resolve_data_dir(source_name, data_root)
     band_stacks = discover_location_band_stacks(data_dir, source_name=source_name, lon=lon, lat=lat, cache_dir=cache_dir)
     if not band_stacks:
         raise FileNotFoundError(f"No stacks found for {source_name} lon={lon:.4f} lat={lat:.4f}")
+
+    source_map = {band: [str(path) for path in stack_paths] for band, stack_paths in band_stacks.items()}
+    existing_summary = _find_existing_summary(
+        output_root,
+        source_name,
+        lon,
+        lat,
+        methods=methods,
+        window_size=window_size,
+        source_files=source_map,
+        min_valid_ratio=min_valid_ratio,
+        late_fraction=late_fraction,
+    )
+    if existing_summary is not None:
+        return {"skipped": True, "summary_path": str(existing_summary)}
 
     band_to_timestamps: Dict[str, List[str]] = {}
     for band_name, stack_paths in band_stacks.items():
@@ -515,7 +671,6 @@ def reconstruct_full_scene_for_location(
 
     output_map: Dict[str, Dict[str, str]] = {method: {} for method in methods}
     merged_prediction_map: Dict[str, str] = {}
-    source_map = {band: [str(path) for path in stack_paths] for band, stack_paths in band_stacks.items()}
     mask_indices: Dict[str, int] = {}
     counts_before: Dict[str, int] = {}
     counts_after: Dict[str, int] = {}
@@ -525,7 +680,7 @@ def reconstruct_full_scene_for_location(
 
     for band_name, stack_paths in band_stacks.items():
         loader = RSCube([str(path) for path in stack_paths], cache_dir=cache_dir, force_refresh=force_refresh)
-        data = loader.load()
+        data = _crop_loaded_cube(loader.load(), window_size)
         cube = np.ma.filled(data["cube"], np.nan).astype(np.float32)
         timestamps = [str(ts) for ts in data["timestamps"]]
         cube, deduped_timestamps = collapse_duplicate_timestamps(cube, timestamps)
@@ -538,26 +693,23 @@ def reconstruct_full_scene_for_location(
         counts_after[band_name] = int(len(masked_timestamps))
         band_meta[band_name] = data
 
+        build_nufrost_args = {
+            "cache_dir": cache_dir,
+            "n_jobs": n_jobs,
+            "force_refresh": force_refresh,
+            "target_time": target_time,
+        }
+        method_predictions = _run_shared_method_rows(
+            methods=methods,
+            cube=masked_cube,
+            timestamps=masked_timestamps,
+            target_time=target_time,
+            n_jobs=n_jobs,
+            build_nufrost_args=build_nufrost_args,
+        )
         for method_name in methods:
+            prediction_2d = np.asarray(method_predictions[method_name], dtype=np.float32)
             output_path = build_output_path(output_root=output_root, method_name=method_name, source_file=stack_paths[0], target_time=target_time, source_name=source_name, lon=lon, lat=lat)
-            if method_name == "nufrost":
-                args = build_args(
-                    {
-                        "cache_dir": cache_dir,
-                        "n_jobs": n_jobs,
-                        "force_refresh": force_refresh,
-                        "target_time": target_time,
-                    }
-                )
-                prediction = nufrost_core(masked_cube, masked_timestamps, target_time, args=args)
-            elif method_name == "hants":
-                prediction = reconstruct_hants_from_cube(masked_cube, masked_timestamps, target_time, n_jobs=n_jobs)
-            elif method_name == "zhu2015":
-                prediction = reconstruct_zhu2015_from_cube(masked_cube, masked_timestamps, target_time, n_jobs=n_jobs)
-            else:
-                raise ValueError(f"Unsupported method: {method_name}")
-
-            prediction_2d = extract_prediction_2d(method_name, prediction)
             _write_prediction(output_path, prediction_2d, data)
             output_map[method_name][band_name] = str(output_path)
             prediction_arrays[method_name][band_name] = prediction_2d
@@ -597,14 +749,18 @@ def reconstruct_full_scene_for_location(
         "lon": lon,
         "lat": lat,
         "target_time": target_time,
+        "methods": list(methods),
         "bands": list(band_stacks.keys()),
         "source_files": source_map,
         "mask_indices": mask_indices,
         "counts_before": counts_before,
         "counts_after": counts_after,
         "completeness": completeness,
+        "min_valid_ratio": min_valid_ratio,
+        "late_fraction": late_fraction,
         "merged_prediction_outputs": merged_prediction_map,
         "ground_truth_output": str(gt_path),
+        "window_size": window_size,
     }
     summary_path = write_run_summary(output_root, payload)
     payload["summary_path"] = str(summary_path)

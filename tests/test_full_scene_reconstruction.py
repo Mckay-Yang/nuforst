@@ -1,3 +1,4 @@
+import importlib.util
 from pathlib import Path
 
 import numpy as np
@@ -125,7 +126,7 @@ def test_build_output_path_includes_timestamp_and_method(tmp_path: Path) -> None
     )
 
     assert output_path.parent == tmp_path / "sentinel-2_recon" / "94.2605_29.7733"
-    assert output_path.name == "[nufrost]_sentinel-2_lon94.260500_lat29.773300_2026-01-27T04-19-39__nufrost.tif"
+    assert output_path.name == "[nufrost]_sentinel-2_lon94.260500_lat29.773300_2026-01-27T04-19-39.tif"
 
 
 def test_build_ground_truth_output_path(tmp_path: Path) -> None:
@@ -137,7 +138,7 @@ def test_build_ground_truth_output_path(tmp_path: Path) -> None:
         target_time="2026-01-27T04:19:39",
     )
     assert gt_path.parent == tmp_path / "sentinel-2_recon" / "94.2605_29.7733"
-    assert gt_path.name == "[grand_truth]_sentinel-2_lon94.260500_lat29.773300_2026-01-27T04-19-39.tif"
+    assert gt_path.name == "[ground_truth]_sentinel-2_lon94.260500_lat29.773300_2026-01-27T04-19-39.tif"
 
 
 def test_extract_prediction_2d_handles_nufrost_and_zhu2015() -> None:
@@ -193,10 +194,128 @@ def test_build_scene_stack_output_path_distinguishes_qa_stack_name(tmp_path: Pat
     )
 
     assert output_path.parent == tmp_path / "sentinel-2_recon" / "94.2605_29.7733"
-    assert output_path.name == "[nufrost]_sentinel-2_lon94.260500_lat29.773300_2026-01-27T04-19-39__nufrost_QA_stack.tif"
+    assert output_path.name == "[nufrost]_sentinel-2_lon94.260500_lat29.773300_2026-01-27T04-19-39_QA_stack.tif"
 
 
-def test_reconstruct_full_scene_skips_when_summary_exists(tmp_path: Path) -> None:
+def test_reconstruct_full_scene_dispatches_methods_with_shared_job_budget(tmp_path: Path, monkeypatch) -> None:
+    from src.full_scene_reconstruction import reconstruct_full_scene_for_location
+
+    calls = []
+
+    def fake_discover_location_band_stacks(*args, **kwargs):
+        return {"B2": [tmp_path / "B2.vrt"]}
+
+    def fake_read_stack_metadata(*args, **kwargs):
+        return {"timestamps": ["2024-01-01T00:00:00", "2024-02-01T00:00:00"]}
+
+    def fake_choose_shared_target_timestamp(*args, **kwargs):
+        return "2024-02-01T00:00:00", {"B2": {"2024-02-01T00:00:00": 1.0}}
+
+    class FakeRSCube:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def load(self):
+            return {
+                "cube": np.ma.array(
+                    [
+                        [[1.0, 2.0], [3.0, 4.0]],
+                        [[5.0, 6.0], [7.0, 8.0]],
+                    ],
+                    dtype=np.float32,
+                ),
+                "timestamps": np.asarray(["2024-01-01T00:00:00", "2024-02-01T00:00:00"], dtype="U32"),
+                "transform": (1.0, 0.0, 10.0, 0.0, -1.0, 20.0, 0.0, 0.0, 1.0),
+                "crs_wkt": None,
+            }
+
+    def fake_run_shared_method_rows(*, methods, cube, timestamps, target_time, n_jobs, build_nufrost_args):
+        calls.append((tuple(methods), cube.shape, tuple(timestamps), target_time, n_jobs, build_nufrost_args["n_jobs"]))
+        return {
+            "nufrost": np.full(cube.shape[1:], 10.0, dtype=np.float32),
+            "hants": np.full(cube.shape[1:], 20.0, dtype=np.float32),
+            "zhu2015": np.full(cube.shape[1:], 30.0, dtype=np.float32),
+        }
+
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.discover_location_band_stacks", fake_discover_location_band_stacks)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.read_stack_metadata", fake_read_stack_metadata)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.choose_shared_target_timestamp", fake_choose_shared_target_timestamp)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.RSCube", FakeRSCube)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline._run_shared_method_rows", fake_run_shared_method_rows)
+
+    result = reconstruct_full_scene_for_location(
+        source_name="sentinel-2",
+        lon=94.2605,
+        lat=29.7733,
+        output_root=tmp_path,
+        data_root=tmp_path,
+        n_jobs=9,
+    )
+
+    assert calls == [(("nufrost", "hants", "zhu2015"), (1, 2, 2), ("2024-01-01T00:00:00",), "2024-02-01T00:00:00", 9, 9)]
+    assert result["ground_truth_output"].endswith("[ground_truth]_sentinel-2_lon94.260500_lat29.773300_2024-02-01T00-00-00.tif")
+    assert result["merged_prediction_outputs"]["nufrost"].endswith("[nufrost]_sentinel-2_lon94.260500_lat29.773300_2024-02-01T00-00-00_prediction.tif")
+
+
+def test_reconstruct_full_scene_passes_limited_budget_into_shared_scheduler(tmp_path: Path, monkeypatch) -> None:
+    from src.full_scene_reconstruction import reconstruct_full_scene_for_location
+
+    calls = []
+
+    def fake_discover_location_band_stacks(*args, **kwargs):
+        return {"B2": [tmp_path / "B2.vrt"]}
+
+    def fake_read_stack_metadata(*args, **kwargs):
+        return {"timestamps": ["2024-01-01T00:00:00", "2024-02-01T00:00:00"]}
+
+    def fake_choose_shared_target_timestamp(*args, **kwargs):
+        return "2024-02-01T00:00:00", {"B2": {"2024-02-01T00:00:00": 1.0}}
+
+    class FakeRSCube:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def load(self):
+            return {
+                "cube": np.ma.array(
+                    [
+                        [[1.0, 2.0], [3.0, 4.0]],
+                        [[5.0, 6.0], [7.0, 8.0]],
+                    ],
+                    dtype=np.float32,
+                ),
+                "timestamps": np.asarray(["2024-01-01T00:00:00", "2024-02-01T00:00:00"], dtype="U32"),
+                "transform": (1.0, 0.0, 10.0, 0.0, -1.0, 20.0, 0.0, 0.0, 1.0),
+                "crs_wkt": None,
+            }
+
+    def fake_run_shared_method_rows(*, methods, cube, timestamps, target_time, n_jobs, build_nufrost_args):
+        calls.append((tuple(methods), cube.shape, tuple(timestamps), target_time, n_jobs, build_nufrost_args["n_jobs"]))
+        return {
+            "nufrost": np.full(cube.shape[1:], 10.0, dtype=np.float32),
+            "hants": np.full(cube.shape[1:], 20.0, dtype=np.float32),
+            "zhu2015": np.full(cube.shape[1:], 30.0, dtype=np.float32),
+        }
+
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.discover_location_band_stacks", fake_discover_location_band_stacks)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.read_stack_metadata", fake_read_stack_metadata)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.choose_shared_target_timestamp", fake_choose_shared_target_timestamp)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.RSCube", FakeRSCube)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline._run_shared_method_rows", fake_run_shared_method_rows)
+
+    reconstruct_full_scene_for_location(
+        source_name="sentinel-2",
+        lon=94.2605,
+        lat=29.7733,
+        output_root=tmp_path,
+        data_root=tmp_path,
+        n_jobs=2,
+    )
+
+    assert calls == [(("nufrost", "hants", "zhu2015"), (1, 2, 2), ("2024-01-01T00:00:00",), "2024-02-01T00:00:00", 2, 2)]
+
+
+def test_reconstruct_full_scene_skips_when_summary_exists(tmp_path: Path, monkeypatch) -> None:
     from src.full_scene_reconstruction import reconstruct_full_scene_for_location
 
     source_name = "sentinel-2"
@@ -207,9 +326,16 @@ def test_reconstruct_full_scene_skips_when_summary_exists(tmp_path: Path) -> Non
     summary_dir.mkdir(parents=True)
     summary_path = summary_dir / f"reconstruction_summary_{safe_source}_lon{lon:.6f}_lat{lat:.6f}_2026-02-06T04-18-39.json"
     summary_path.write_text(
-        '{"source":"sentinel-2","lon":94.2605,"lat":29.7733,"target_time":"2026-02-06T04:18:39"}',
+        '{"source":"sentinel-2","lon":94.2605,"lat":29.7733,"target_time":"2026-02-06T04:18:39","methods":["nufrost","hants","zhu2015"],"window_size":null,"source_files":{"B2":["'
+        + str(tmp_path / "B2.vrt")
+        + '"]},"min_valid_ratio":0.9,"late_fraction":0.25}',
         encoding="utf-8",
     )
+
+    def fake_discover_location_band_stacks(*args, **kwargs):
+        return {"B2": [tmp_path / "B2.vrt"]}
+
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.discover_location_band_stacks", fake_discover_location_band_stacks)
 
     result = reconstruct_full_scene_for_location(
         source_name=source_name,
@@ -221,6 +347,128 @@ def test_reconstruct_full_scene_skips_when_summary_exists(tmp_path: Path) -> Non
 
     assert result["skipped"] is True
     assert result["summary_path"] == str(summary_path)
+
+
+def test_reconstruct_full_scene_does_not_skip_when_window_size_differs(tmp_path: Path, monkeypatch) -> None:
+    from src.full_scene_reconstruction import reconstruct_full_scene_for_location
+
+    summary_dir = tmp_path / "run_summaries"
+    summary_dir.mkdir(parents=True)
+    summary_path = summary_dir / "reconstruction_summary_sentinel-2_lon94.260500_lat29.773300_2025-01-01T00-00-00.json"
+    summary_path.write_text(
+        '{"source":"sentinel-2","lon":94.2605,"lat":29.7733,"target_time":"2025-01-01T00:00:00","window_size":8,"methods":["hants"]}',
+        encoding="utf-8",
+    )
+
+    def fake_discover_location_band_stacks(*args, **kwargs):
+        return {"B2": [tmp_path / "B2.vrt"]}
+
+    def fake_read_stack_metadata(*args, **kwargs):
+        return {"timestamps": ["2024-01-01T00:00:00", "2025-01-01T00:00:00"]}
+
+    def fake_choose_shared_target_timestamp(*args, **kwargs):
+        return "2025-01-01T00:00:00", {"B2": {"2025-01-01T00:00:00": 1.0}}
+
+    class FakeRSCube:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def load(self):
+            return {
+                "cube": np.ma.array(
+                    [
+                        np.full((16, 16), 1.0, dtype=np.float32),
+                        np.full((16, 16), 2.0, dtype=np.float32),
+                    ]
+                ),
+                "timestamps": np.asarray(["2024-01-01T00:00:00", "2025-01-01T00:00:00"], dtype="U32"),
+                "transform": (30.0, 0.0, 10.0, 0.0, -30.0, 20.0, 0.0, 0.0, 1.0),
+                "crs_wkt": None,
+            }
+
+    def fake_run_shared_method_rows(*, methods, cube, timestamps, target_time, n_jobs, build_nufrost_args):
+        return {"hants": np.full(cube.shape[1:], 7.0, dtype=np.float32)}
+
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.discover_location_band_stacks", fake_discover_location_band_stacks)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.read_stack_metadata", fake_read_stack_metadata)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.choose_shared_target_timestamp", fake_choose_shared_target_timestamp)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.RSCube", FakeRSCube)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline._run_shared_method_rows", fake_run_shared_method_rows)
+
+    result = reconstruct_full_scene_for_location(
+        source_name="sentinel-2",
+        lon=94.2605,
+        lat=29.7733,
+        output_root=tmp_path,
+        data_root=tmp_path,
+        methods=("hants",),
+        window_size=4,
+        n_jobs=1,
+    )
+
+    assert result.get("skipped") is not True
+    assert result["window_size"] == 4
+
+
+def test_reconstruct_full_scene_does_not_skip_when_source_files_differ(tmp_path: Path, monkeypatch) -> None:
+    from src.full_scene_reconstruction import reconstruct_full_scene_for_location
+
+    summary_dir = tmp_path / "run_summaries"
+    summary_dir.mkdir(parents=True)
+    summary_path = summary_dir / "reconstruction_summary_sentinel-2_lon94.260500_lat29.773300_2025-01-01T00-00-00.json"
+    summary_path.write_text(
+        '{"source":"sentinel-2","lon":94.2605,"lat":29.7733,"target_time":"2025-01-01T00:00:00","window_size":4,"methods":["hants"],"source_files":{"B2":["/old/B2.vrt"]}}',
+        encoding="utf-8",
+    )
+
+    def fake_discover_location_band_stacks(*args, **kwargs):
+        return {"B2": [tmp_path / "B2-new.vrt"]}
+
+    def fake_read_stack_metadata(*args, **kwargs):
+        return {"timestamps": ["2024-01-01T00:00:00", "2025-01-01T00:00:00"]}
+
+    def fake_choose_shared_target_timestamp(*args, **kwargs):
+        return "2025-01-01T00:00:00", {"B2": {"2025-01-01T00:00:00": 1.0}}
+
+    class FakeRSCube:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def load(self):
+            return {
+                "cube": np.ma.array(
+                    [
+                        np.full((8, 8), 1.0, dtype=np.float32),
+                        np.full((8, 8), 2.0, dtype=np.float32),
+                    ]
+                ),
+                "timestamps": np.asarray(["2024-01-01T00:00:00", "2025-01-01T00:00:00"], dtype="U32"),
+                "transform": (30.0, 0.0, 10.0, 0.0, -30.0, 20.0, 0.0, 0.0, 1.0),
+                "crs_wkt": None,
+            }
+
+    def fake_run_shared_method_rows(*, methods, cube, timestamps, target_time, n_jobs, build_nufrost_args):
+        return {"hants": np.full(cube.shape[1:], 5.0, dtype=np.float32)}
+
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.discover_location_band_stacks", fake_discover_location_band_stacks)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.read_stack_metadata", fake_read_stack_metadata)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.choose_shared_target_timestamp", fake_choose_shared_target_timestamp)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.RSCube", FakeRSCube)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline._run_shared_method_rows", fake_run_shared_method_rows)
+
+    result = reconstruct_full_scene_for_location(
+        source_name="sentinel-2",
+        lon=94.2605,
+        lat=29.7733,
+        output_root=tmp_path,
+        data_root=tmp_path,
+        methods=("hants",),
+        window_size=4,
+        n_jobs=1,
+    )
+
+    assert result.get("skipped") is not True
+    assert result["source_files"]["B2"] == [str(tmp_path / "B2-new.vrt")]
 
 
 def test_validate_band_metadata_consistency_rejects_mismatched_shapes() -> None:
@@ -282,3 +530,135 @@ def test_write_run_summary_persists_selected_timestamp(tmp_path: Path) -> None:
     assert summary_path.exists()
     assert "sentinel-2_lon94.260500_lat29.773300" in summary_path.name
     assert "2026-01-27T04:19:39" in summary_path.read_text()
+
+
+def test_small_window_full_scene_run_writes_8x8_outputs(tmp_path: Path, monkeypatch) -> None:
+    script_path = Path(__file__).resolve().parent.parent / "scripts" / "run_small_window_full_scene.py"
+    spec = importlib.util.spec_from_file_location("run_small_window_full_scene", script_path)
+    if spec is None or spec.loader is None:
+        raise AssertionError(f"Unable to load script module from {script_path}")
+    script_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script_module)
+
+    timestamps = np.asarray(
+        [
+            "2024-01-01T00:00:00",
+            "2024-02-01T00:00:00",
+            "2024-03-01T00:00:00",
+            "2024-04-01T00:00:00",
+            "2024-05-01T00:00:00",
+            "2024-06-01T00:00:00",
+            "2024-07-01T00:00:00",
+            "2024-08-01T00:00:00",
+            "2024-09-01T00:00:00",
+            "2024-10-01T00:00:00",
+            "2024-11-01T00:00:00",
+            "2024-12-01T00:00:00",
+            "2025-01-01T00:00:00",
+        ],
+        dtype="U32",
+    )
+    cube = np.stack(
+        [np.full((16, 16), float(idx + 1), dtype=np.float32) for idx in range(len(timestamps))],
+        axis=0,
+    )
+
+    def fake_discover_location_band_stacks(*args, **kwargs):
+        return {"B2": [tmp_path / "B2.vrt"]}
+
+    def fake_read_stack_metadata(*args, **kwargs):
+        return {"timestamps": timestamps}
+
+    def fake_choose_shared_target_timestamp(*args, **kwargs):
+        return str(timestamps[-1]), {"B2": {str(timestamps[-1]): 1.0}}
+
+    class FakeRSCube:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def load(self):
+            return {
+                "cube": np.ma.array(cube, dtype=np.float32),
+                "timestamps": timestamps,
+                "transform": (30.0, 0.0, 10.0, 0.0, -30.0, 20.0, 0.0, 0.0, 1.0),
+                "crs_wkt": None,
+            }
+
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.discover_location_band_stacks", fake_discover_location_band_stacks)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.read_stack_metadata", fake_read_stack_metadata)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.choose_shared_target_timestamp", fake_choose_shared_target_timestamp)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.RSCube", FakeRSCube)
+
+    exit_code = script_module.main(
+        [
+            "--source-name",
+            "sentinel-2",
+            "--lon",
+            "94.2605",
+            "--lat",
+            "29.7733",
+            "--output-root",
+            str(tmp_path / "output"),
+            "--data-root",
+            str(tmp_path),
+            "--window-size",
+            "8",
+            "--methods",
+            "hants",
+            "--n-jobs",
+            "1",
+        ]
+    )
+
+    assert exit_code == 0
+
+    summary_dir = tmp_path / "output" / "run_summaries"
+    summary_paths = list(summary_dir.glob("*.json"))
+    assert len(summary_paths) == 1
+
+    with rasterio.open(tmp_path / "output" / "sentinel-2_recon" / "94.2605_29.7733" / "[ground_truth]_sentinel-2_lon94.260500_lat29.773300_2025-01-01T00-00-00.tif") as ds:
+        assert ds.height == 8
+        assert ds.width == 8
+
+    with rasterio.open(tmp_path / "output" / "sentinel-2_recon" / "94.2605_29.7733" / "[hants]_sentinel-2_lon94.260500_lat29.773300_2025-01-01T00-00-00_prediction.tif") as ds:
+        assert ds.height == 8
+        assert ds.width == 8
+
+
+def test_run_shared_method_rows_executes_hants_on_small_cube() -> None:
+    from src.full_scene_reconstruction.pipeline import _run_shared_method_rows
+
+    timestamps = np.asarray(
+        [
+            "2024-01-01T00:00:00",
+            "2024-02-01T00:00:00",
+            "2024-03-01T00:00:00",
+            "2024-04-01T00:00:00",
+            "2024-05-01T00:00:00",
+            "2024-06-01T00:00:00",
+            "2024-07-01T00:00:00",
+            "2024-08-01T00:00:00",
+            "2024-09-01T00:00:00",
+            "2024-10-01T00:00:00",
+            "2024-11-01T00:00:00",
+            "2024-12-01T00:00:00",
+        ],
+        dtype="U32",
+    )
+    cube = np.stack(
+        [np.full((2, 2), 0.2 + 0.01 * idx, dtype=np.float32) for idx in range(len(timestamps))],
+        axis=0,
+    )
+
+    outputs = _run_shared_method_rows(
+        methods=("hants",),
+        cube=cube,
+        timestamps=timestamps,
+        target_time="2024-12-01T00:00:00",
+        n_jobs=1,
+        build_nufrost_args={},
+    )
+
+    assert set(outputs) == {"hants"}
+    assert outputs["hants"].shape == (2, 2)
+    assert np.isfinite(outputs["hants"]).all()
