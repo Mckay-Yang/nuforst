@@ -84,6 +84,23 @@ def _build_multi_file_vrt(
     return [vrt_path]
 
 
+def discover_available_locations(data_dir: Path, source_name: str) -> List[Tuple[float, float]]:
+    if source_name == SENTINEL_SOURCE:
+        pattern = re.compile(r"COPERNICUS_S2_HARMONIZED_[A-Z0-9]+_lon(?P<lon>-?\d+\.\d+)_lat(?P<lat>-?\d+\.\d+)")
+    elif source_name == HLS_SOURCE:
+        pattern = re.compile(r"NASA_HLS_v\d+_[A-Z0-9]+_lon(?P<lon>-?\d+\.\d+)_lat(?P<lat>-?\d+\.\d+)")
+    else:
+        raise ValueError(f"Unsupported source: {source_name}")
+
+    locations = {
+        (float(match.group("lon")), float(match.group("lat")))
+        for path in data_dir.glob("*.tif")
+        for match in [pattern.search(path.name)]
+        if match is not None
+    }
+    return sorted(locations)
+
+
 def discover_location_band_stacks(
     data_dir: Path,
     source_name: str,
@@ -766,3 +783,41 @@ def reconstruct_full_scene_for_location(
     payload["summary_path"] = str(summary_path)
     summary_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return payload
+
+
+def reconstruct_full_scene_for_all_locations(
+    source_name: str,
+    *,
+    output_root: Path | str = DEFAULT_OUTPUT_ROOT,
+    data_root: Path | str = Path("data"),
+    cache_dir: Path | str = DEFAULT_CACHE_ROOT,
+    methods: Sequence[str] = ("nufrost", "hants", "zhu2015"),
+    n_jobs: int = -1,
+    force_refresh: bool = False,
+    min_valid_ratio: float = DEFAULT_MIN_VALID_RATIO,
+    late_fraction: float = DEFAULT_LATE_FRACTION,
+) -> List[Dict[str, Any]]:
+    data_root = Path(data_root)
+    data_dir = _resolve_data_dir(source_name, data_root)
+    locations = discover_available_locations(data_dir, source_name=source_name)
+    if not locations:
+        raise FileNotFoundError(f"No locations found for {source_name} in {data_dir}")
+
+    results: List[Dict[str, Any]] = []
+    for lon, lat in locations:
+        results.append(
+            reconstruct_full_scene_for_location(
+                source_name=source_name,
+                lon=lon,
+                lat=lat,
+                output_root=output_root,
+                data_root=data_root,
+                cache_dir=cache_dir,
+                methods=methods,
+                n_jobs=n_jobs,
+                force_refresh=force_refresh,
+                min_valid_ratio=min_valid_ratio,
+                late_fraction=late_fraction,
+            )
+        )
+    return results

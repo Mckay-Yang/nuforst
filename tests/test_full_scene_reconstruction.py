@@ -9,10 +9,12 @@ from src.full_scene_reconstruction import (
     build_output_path,
     build_scene_stack_output_path,
     collapse_duplicate_timestamps,
+    discover_available_locations,
     discover_location_band_stacks,
     extract_prediction_2d,
     intersect_band_timestamps,
     make_masked_time_series,
+    reconstruct_full_scene_for_all_locations,
     select_shared_target_timestamp,
     write_band_stack,
     write_run_summary,
@@ -112,6 +114,30 @@ def test_discover_location_band_stacks_for_hls_groups_by_band(tmp_path: Path, mo
 
     assert sorted(stacks) == ["BLUE", "RED"]
     assert stacks["BLUE"][0].name == "BLUE_lon94.2605_lat29.7733.vrt"
+
+
+def test_discover_available_locations_for_sentinel2_returns_sorted_unique_pairs(tmp_path: Path) -> None:
+    data_dir = tmp_path / "sentinel-2"
+    data_dir.mkdir()
+    (data_dir / "COPERNICUS_S2_HARMONIZED_B2_lon94.2605_lat29.7733.tif").touch()
+    (data_dir / "COPERNICUS_S2_HARMONIZED_B3_lon94.2605_lat29.7733.tif").touch()
+    (data_dir / "COPERNICUS_S2_HARMONIZED_B2_lon91.2734_lat29.7904.tif").touch()
+
+    locations = discover_available_locations(data_dir, source_name="sentinel-2")
+
+    assert locations == [(91.2734, 29.7904), (94.2605, 29.7733)]
+
+
+def test_discover_available_locations_for_hls_returns_sorted_unique_pairs(tmp_path: Path) -> None:
+    data_dir = tmp_path / "hls"
+    data_dir.mkdir()
+    (data_dir / "NASA_HLS_v002_BLUE_lon94.2605_lat29.7733_part1-0000000000-0000000000.tif").touch()
+    (data_dir / "NASA_HLS_v002_RED_lon94.2605_lat29.7733_part1-0000000000-0000000000.tif").touch()
+    (data_dir / "NASA_HLS_v002_BLUE_lon91.2734_lat29.7904_part1-0000000000-0000000000.tif").touch()
+
+    locations = discover_available_locations(data_dir, source_name="hls")
+
+    assert locations == [(91.2734, 29.7904), (94.2605, 29.7733)]
 
 
 def test_build_output_path_includes_timestamp_and_method(tmp_path: Path) -> None:
@@ -662,3 +688,38 @@ def test_run_shared_method_rows_executes_hants_on_small_cube() -> None:
     assert set(outputs) == {"hants"}
     assert outputs["hants"].shape == (2, 2)
     assert np.isfinite(outputs["hants"]).all()
+
+
+def test_reconstruct_full_scene_for_all_locations_dispatches_every_coordinate(tmp_path: Path, monkeypatch) -> None:
+    calls = []
+    (tmp_path / "sentinel-2").mkdir()
+
+    def fake_discover_available_locations(data_dir, source_name):
+        assert data_dir == tmp_path / "sentinel-2"
+        assert source_name == "sentinel-2"
+        return [(91.2734, 29.7904), (94.2605, 29.7733)]
+
+    def fake_reconstruct_full_scene_for_location(source_name, lon, lat, **kwargs):
+        calls.append((source_name, lon, lat, kwargs["n_jobs"], kwargs["methods"]))
+        return {"source": source_name, "lon": lon, "lat": lat}
+
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.discover_available_locations", fake_discover_available_locations)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.reconstruct_full_scene_for_location", fake_reconstruct_full_scene_for_location)
+
+    results = reconstruct_full_scene_for_all_locations(
+        source_name="sentinel-2",
+        output_root=tmp_path / "output",
+        data_root=tmp_path,
+        cache_dir=tmp_path / "cache",
+        methods=("nufrost", "hants"),
+        n_jobs=-1,
+    )
+
+    assert calls == [
+        ("sentinel-2", 91.2734, 29.7904, -1, ("nufrost", "hants")),
+        ("sentinel-2", 94.2605, 29.7733, -1, ("nufrost", "hants")),
+    ]
+    assert results == [
+        {"source": "sentinel-2", "lon": 91.2734, "lat": 29.7904},
+        {"source": "sentinel-2", "lon": 94.2605, "lat": 29.7733},
+    ]

@@ -129,3 +129,4 @@ example/
 .specs/
 .worktrees/
 .temp/
+.todo/
