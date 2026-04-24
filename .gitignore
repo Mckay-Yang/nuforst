@@ -64,6 +64,8 @@ htmlcov/
 _minted-*/
 missfont.log
 *.pdf
+# LaTeX log files, not conflicting with directory named log/
+*.log
 
 # ===== Data & Cache =====
 data/
