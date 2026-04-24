@@ -74,10 +74,11 @@ def _gdal_dtype_name(dtype: str) -> str:
 
 
 def _log_cache_event(kind: str, status: str, path: Union[str, Path], detail: Optional[str] = None) -> None:
-    msg = f"[DataLoader] {kind} cache {status}: {Path(path)}"
+    from .logger import log as _log
+    msg = f"{kind} cache {status}: {Path(path)}"
     if detail:
         msg += f" ({detail})"
-    print(msg, flush=True)
+    _log("_log_cache_event", msg)
 
 
 def _is_stale(target: Path, sources: List[Path]) -> bool:

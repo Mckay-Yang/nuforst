@@ -23,6 +23,7 @@ from ..data_loader import (
     find_image_chunks,
 )
 from ..hants import hants_pixel
+from ..logger import log as _log
 from ..nufrost import nufrost_core, timestamps_to_seconds
 from ..zhu2015 import fit_predict_pixel
 
@@ -155,6 +156,7 @@ def _batch_score_candidates(
     candidates: Sequence[str],
     cache_dir: Path | str = DEFAULT_CACHE_ROOT,
 ) -> Dict[str, Dict[str, float]]:
+    _log("_batch_score_candidates", f"Scoring {len(candidates)} candidates across {len(band_to_stack_paths)} bands")
     scores: Dict[str, Dict[str, float]] = {band: {} for band in band_to_stack_paths}
     for band, stack_paths in band_to_stack_paths.items():
         resolved = [str(p) for p in stack_paths]
@@ -553,6 +555,7 @@ def reconstruct_full_scene_for_location(
     late_fraction: float = DEFAULT_LATE_FRACTION,
     window_size: Optional[int] = None,
 ) -> Dict[str, Any]:
+    _log("reconstruct_full_scene_for_location", f"Start source={source_name} lon={lon:.4f} lat={lat:.4f} methods={list(methods)} window_size={window_size}")
     output_root = Path(output_root)
     data_root = Path(data_root)
     cache_dir = Path(cache_dir)
@@ -575,10 +578,12 @@ def reconstruct_full_scene_for_location(
         late_fraction=late_fraction,
     )
     if existing_summary is not None:
+        _log("reconstruct_full_scene_for_location", f"Skipping (existing summary): {existing_summary}")
         return {"skipped": True, "summary_path": str(existing_summary)}
 
     band_to_timestamps: Dict[str, List[str]] = {}
     band_to_data: Dict[str, Dict[str, object]] = {}
+    _log("reconstruct_full_scene_for_location", f"Loading {len(band_stacks)} bands from cache")
     for band_name, stack_paths in band_stacks.items():
         loader = RSCube([str(p) for p in stack_paths], cache_dir=cache_dir, force_refresh=force_refresh)
         data = loader.load()
@@ -592,6 +597,7 @@ def reconstruct_full_scene_for_location(
         min_valid_ratio=min_valid_ratio,
         late_fraction=late_fraction,
     )
+    _log("reconstruct_full_scene_for_location", f"Selected target_time={target_time}")
 
     output_map: Dict[str, Dict[str, str]] = {method: {} for method in methods}
     merged_prediction_map: Dict[str, str] = {}
@@ -603,6 +609,7 @@ def reconstruct_full_scene_for_location(
     band_meta: Dict[str, Mapping[str, object]] = {}
 
     for band_name, stack_paths in band_stacks.items():
+        _log("reconstruct_full_scene_for_location", f"Band {band_name}: cube shape={band_to_data[band_name]['cube'].shape}, timestamps={counts_before.get(band_name, '?')}")
         data = _crop_loaded_cube(band_to_data[band_name], window_size)
         cube = np.ma.filled(data["cube"], np.nan).astype(np.float32)
         timestamps = [str(ts) for ts in data["timestamps"]]
@@ -623,6 +630,7 @@ def reconstruct_full_scene_for_location(
             "target_time": target_time,
         }
         for method_name in methods:
+            _log("reconstruct_full_scene_for_location", f"Band {band_name}: running {method_name}")
             output_path = build_output_path(output_root=output_root, method_name=method_name, source_file=stack_paths[0], target_time=target_time, source_name=source_name, lon=lon, lat=lat)
             if method_name == "nufrost":
                 args = build_args(dict(build_nufrost_args))
@@ -690,6 +698,7 @@ def reconstruct_full_scene_for_location(
     summary_path = write_run_summary(output_root, payload)
     payload["summary_path"] = str(summary_path)
     summary_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    _log("reconstruct_full_scene_for_location", f"Complete source={source_name} lon={lon:.4f} lat={lat:.4f} target={target_time}")
     return payload
 
 
@@ -711,8 +720,10 @@ def reconstruct_full_scene_for_all_locations(
     if not locations:
         raise FileNotFoundError(f"No locations found for {source_name} in {data_dir}")
 
+    _log("reconstruct_full_scene_for_all_locations", f"Batch start source={source_name} locations={len(locations)}")
     results: List[Dict[str, Any]] = []
-    for lon, lat in locations:
+    for idx, (lon, lat) in enumerate(locations):
+        _log("reconstruct_full_scene_for_all_locations", f"Location {idx+1}/{len(locations)}: lon={lon:.4f} lat={lat:.4f}")
         results.append(
             reconstruct_full_scene_for_location(
                 source_name=source_name,

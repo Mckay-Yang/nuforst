@@ -9,6 +9,7 @@ from datetime import datetime
 from .data_loader import RSCube
 from .nufrost import timestamps_to_seconds
 from config import Args, build_args
+from .logger import log as _log
 import rasterio
 from pathlib import Path
 from tqdm import tqdm
@@ -439,7 +440,7 @@ def reconstruct_zhu2015(
     if n_jobs <= 0:
         n_jobs = cpu_count()
 
-    print(f"[Zhu2015] Reconstructing {image} at {target_time} using LASSO (alpha={lasso_alpha})...")
+    _log("reconstruct_zhu2015", f"Reconstructing {image} at {target_time} using LASSO (alpha={lasso_alpha})")
 
     def _process_row(i):
         row_pred = np.full((2, W), np.nan, dtype=np.float32)
@@ -478,6 +479,6 @@ def reconstruct_zhu2015(
         ) as dst:
             dst.write(out[0], 1)
             dst.write(out[1], 2)
-        print(f"[Success] Saved to: {out_p}")
+        _log("reconstruct_zhu2015", f"Saved to: {out_p}")
 
     return out

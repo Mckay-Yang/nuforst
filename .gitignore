@@ -65,6 +65,7 @@ compile_commands.json
 build/
 
 # Logs & temp files
+log/*
 *.log
 *.tmp
 *.swp
@@ -130,4 +131,5 @@ example/
 .worktrees/
 .temp/
 .todo/
+log/
 .memo/

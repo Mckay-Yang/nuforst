@@ -4,6 +4,7 @@ from typing import Any, Dict, Tuple, Optional, Union, List
 from .data_loader import RSCube
 from .nufrost import timestamps_to_seconds
 from config import Args, build_args
+from .logger import log as _log
 import rasterio
 from pathlib import Path
 from tqdm import tqdm
@@ -237,7 +238,7 @@ def reconstruct_hants(
     if n_jobs <= 0:
         n_jobs = cpu_count()
 
-    print(f"[HANTS] Reconstructing {image} at {target_time} (NOF={nof}, SF={sf}, FET={fet})...")
+    _log("reconstruct_hants", f"Reconstructing {image} at {target_time} (NOF={nof}, SF={sf}, FET={fet})")
 
     def _process_row(i):
         row_pred = np.full(W, np.nan, dtype=np.float32)
@@ -277,6 +278,6 @@ def reconstruct_hants(
             transform=transform,
         ) as dst:
             dst.write(out, 1)
-        print(f"[Success] Saved to: {out_p}")
+        _log("reconstruct_hants", f"Saved to: {out_p}")
 
     return out

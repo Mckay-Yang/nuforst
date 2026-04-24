@@ -104,7 +104,8 @@ def append_rows(csv_path: Path, df: pd.DataFrame) -> None:
 
 
 def log_step(message: str) -> None:
-    print(f"[{time.strftime('%H:%M:%S')}] {message}", flush=True)
+    from .logger import log as _log
+    _log("log_step", message)
 
 
 def load_done_keys(csv_path: Path, key_columns: Sequence[str]) -> set[tuple]:

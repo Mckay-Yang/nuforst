@@ -35,6 +35,7 @@ except ModuleNotFoundError:
 import rasterio
 
 from config import Args, build_args
+from .logger import log as _log
 from .data_loader import RSCube
 
 
@@ -568,7 +569,7 @@ def reconstruct_nufrost(
             transform=transform,
         ) as dst:
             dst.write(recon, 1)
-        print(f"[Success] Saved to: {out_p}")
+        _log("reconstruct_nufrost", f"Saved to: {out_p}")
 
     return recon
 
@@ -617,7 +618,7 @@ def nufrost_core(cube: np.ndarray, timestamps: np.ndarray, target_time: str, arg
         n_jobs = max(1, int(os.cpu_count() or 1)) if cpu_count is None else max(1, int(cpu_count()))
     n_jobs = min(n_jobs, H)
 
-    print(f"[System] Starting NuFrost reconstruction with {n_jobs} jobs...")
+    _log("nufrost_core", f"Starting NUFROST reconstruction shape={cube.shape} n_jobs={n_jobs}")
 
     # 串行执行
     if not JOBLIB_AVAILABLE or n_jobs == 1:
@@ -652,7 +653,7 @@ def nufrost_core(cube: np.ndarray, timestamps: np.ndarray, target_time: str, arg
         for i, row in results:
             out[i, :] = row
     except Exception as e:
-        print(f"[Error] Parallel execution failed: {e}. Falling back to serial.")
+        _log("nufrost_core", f"Parallel execution failed: {e}. Falling back to serial.")
         for i in range(H):
             _, row = _predict_row(i)
             out[i, :] = row
