@@ -1,4 +1,4 @@
-# MacOS
+# ===== OS =====
 .DS_Store
 .AppleDouble
 .LSOverride
@@ -6,91 +6,42 @@ Icon
 ._*
 .Spotlight-V100/
 .Trashes/
-
-# Windows
 Thumbs.db
 ehthumbs.db
 Desktop.ini
 $RECYCLE.BIN/
 
-# IDE/Editor
+# ===== IDE / Editor =====
 .idea/
 .vscode/
+*.swp
+*.swo
+*~
 
-# Python: bytecode & caches
-*/__pycache__/
+# ===== Python =====
+__pycache__/
 *.pyc
 *.pyo
 *.pyd
 *.egg-info/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-
-# Python: coverage
-.coverage
-coverage.xml
-htmlcov/
-
-# Python: virtual environments
 .venv/
 venv/
 env/
 conda_env/
 .conda/
-*.conda
 
-# Rust
-target/
-Cargo.lock
-**/*.rs.bk
+# ===== Python: tooling =====
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
 
-# C/C++: build outputs
-*.o
-*.a
-*.so
-*.dylib
-*.dll
-*.obj
-*.exe
-*.out
-*.ilk
-*.pdb
-
-# C/C++: build directories
-CMakeFiles/
-CMakeCache.txt
-cmake_install.cmake
-compile_commands.json
-build/
-
-# Logs & temp files
-log/*
-*.log
-*.tmp
-*.swp
-*.swo
-*.bak
-*~
-*.cache
-
-# Data Outputs
-data/*
-database/*
-bak/
-
-# Jupyter
+# ===== Jupyter =====
 .ipynb_checkpoints
 
-# Project Specific
-cache/
-*.tif
-*.npz
-*.nc
-test.*
-.env
-
-# LaTeX intermediate/build files
+# ===== LaTeX =====
 *.aux
 *.bbl
 *.bcf
@@ -101,35 +52,36 @@ test.*
 *.ilg
 *.ind
 *.lof
-*.log
 *.lot
 *.out
 *.run.xml
 *.synctex.gz
 *.toc
 *.xdv
-
-# Latexmk / compiler temp artifacts
-_minted-*/
 *.nav
 *.snm
 *.vrb
+_minted-*/
 missfont.log
-
-# Editor temp files
-*.swp
-*.swo
-
-# 不追踪编译后的PDF
 *.pdf
 
-example/
+# ===== Data & Cache =====
+data/
+cache/
+bak/
+database/
 
-# OpenCode
+# ===== Logs =====
+log/
+
+# ===== Project tooling =====
 .plans/
 .specs/
 .worktrees/
 .temp/
 .todo/
-log/
 .memo/
+example/
+
+# ===== Secrets =====
+.env
