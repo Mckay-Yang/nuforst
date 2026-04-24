@@ -16,7 +16,6 @@ from config import build_args
 
 from ..data_loader import (
     RSCube,
-    TimeSeriesRasterSource,
     _cache_subdir,
     _is_stale,
     _resolve_cache_root,
@@ -24,7 +23,7 @@ from ..data_loader import (
     find_image_chunks,
 )
 from ..hants import hants_pixel
-from ..nufrost import parse_timestamp_str, predict_single_pixel, timestamps_to_seconds
+from ..nufrost import nufrost_core, timestamps_to_seconds
 from ..zhu2015 import fit_predict_pixel
 
 
@@ -139,12 +138,6 @@ def discover_location_band_stacks(
     raise ValueError(f"Unsupported source: {source_name}")
 
 
-def read_stack_metadata(stack_paths: Sequence[Path], cache_dir: Path | str = DEFAULT_CACHE_ROOT) -> Dict[str, object]:
-    resolved = [str(path) for path in stack_paths]
-    with TimeSeriesRasterSource(resolved, cache_dir=cache_dir) as source:
-        return source.metadata()
-
-
 def intersect_band_timestamps(band_to_timestamps: Mapping[str, Sequence[str]]) -> List[str]:
     shared: Optional[set[str]] = None
     for timestamps in band_to_timestamps.values():
@@ -153,28 +146,39 @@ def intersect_band_timestamps(band_to_timestamps: Mapping[str, Sequence[str]]) -
     return sorted(shared or [])
 
 
-def _compute_valid_ratio(stack_paths: Sequence[Path], timestamp_idx: int, cache_dir: Path | str = DEFAULT_CACHE_ROOT) -> float:
-    resolved = [str(path) for path in stack_paths]
-    with TimeSeriesRasterSource(resolved, cache_dir=cache_dir) as source:
-        band = source.src.read(timestamp_idx + 1, masked=True)
-    if np.ma.isMaskedArray(band):
-        return float(np.mean(~band.mask))
-    finite = np.isfinite(np.asarray(band))
-    return float(np.mean(finite))
+_VALID_RATIO_SUBSAMPLE_STEP = 8
 
 
-def _score_candidate_pool(
-    candidates: Sequence[str],
+def _batch_score_candidates(
     band_to_stack_paths: Mapping[str, Sequence[Path]],
     band_to_timestamps: Mapping[str, Sequence[str]],
+    candidates: Sequence[str],
     cache_dir: Path | str = DEFAULT_CACHE_ROOT,
 ) -> Dict[str, Dict[str, float]]:
     scores: Dict[str, Dict[str, float]] = {band: {} for band in band_to_stack_paths}
     for band, stack_paths in band_to_stack_paths.items():
-        timestamps = [str(ts) for ts in band_to_timestamps[band]]
-        index_map = {timestamp: idx for idx, timestamp in enumerate(timestamps)}
+        resolved = [str(p) for p in stack_paths]
+        loader = RSCube(resolved, cache_dir=cache_dir)
+        data = loader.load()
+        cube = np.asarray(data["cube"], dtype=np.float32)
+        timestamps = [str(ts) for ts in data["timestamps"]]
+        index_map = {ts: idx for idx, ts in enumerate(timestamps)}
+        step = _VALID_RATIO_SUBSAMPLE_STEP
+        sampled = cube[:, ::step, ::step]
         for candidate in candidates:
-            scores[band][candidate] = _compute_valid_ratio(stack_paths, index_map[candidate], cache_dir=cache_dir)
+            idx = index_map.get(str(candidate))
+            if idx is None:
+                continue
+            layer = sampled[idx]
+            finite = np.isfinite(layer)
+            total = finite.size
+            if total == 0:
+                scores[band][candidate] = 0.0
+                continue
+            if np.any(~finite):
+                scores[band][candidate] = float(np.mean(finite))
+            else:
+                scores[band][candidate] = 1.0
     return scores
 
 
@@ -220,26 +224,9 @@ def choose_shared_target_timestamp(
     if not shared:
         raise ValueError("No shared timestamps exist across selected bands.")
 
-    ordered = sorted(shared)
-    tail_len = max(1, int(np.ceil(len(ordered) * late_fraction)))
-    preferred = ordered[-tail_len:]
-    fallback = ordered[:-tail_len]
-
-    completeness = _score_candidate_pool(preferred, band_to_stack_paths, band_to_timestamps, cache_dir=cache_dir)
-    try:
-        chosen = select_shared_target_timestamp(preferred, completeness, min_valid_ratio=min_valid_ratio, late_fraction=1.0)
-        return chosen, completeness
-    except ValueError:
-        pass
-
-    if fallback:
-        fallback_scores = _score_candidate_pool(fallback, band_to_stack_paths, band_to_timestamps, cache_dir=cache_dir)
-        for band, score_map in fallback_scores.items():
-            completeness[band].update(score_map)
-        chosen = select_shared_target_timestamp(ordered, completeness, min_valid_ratio=min_valid_ratio, late_fraction=late_fraction)
-        return chosen, completeness
-
-    raise ValueError("No shared timestamp passed the completeness threshold.")
+    completeness = _batch_score_candidates(band_to_stack_paths, band_to_timestamps, shared, cache_dir=cache_dir)
+    chosen = select_shared_target_timestamp(shared, completeness, min_valid_ratio=min_valid_ratio, late_fraction=late_fraction)
+    return chosen, completeness
 
 
 def build_output_path(output_root: Path, method_name: str, source_file: Path, target_time: str, *, source_name: str = "", lon: float = 0.0, lat: float = 0.0) -> Path:
@@ -410,89 +397,6 @@ def _run_parallel_rows(height: int, worker, n_jobs: int, desc: str):
         delayed(worker)(row_idx) for row_idx in range(height)
     )
     return list(tqdm(results_gen, total=height, desc=desc))
-
-
-def _run_shared_method_rows(
-    *,
-    methods: Sequence[str],
-    cube: np.ndarray,
-    timestamps: Sequence[str],
-    target_time: str,
-    n_jobs: int,
-    build_nufrost_args: Mapping[str, object],
-) -> Dict[str, np.ndarray]:
-    method_names = list(methods)
-    if not method_names:
-        return {}
-
-    timestamps_array = np.asarray(timestamps, dtype="U32")
-    target_dt = _parse_target_datetime(target_time)
-    timestamps_sec = timestamps_to_seconds(timestamps_array)
-    t0_sec = float(np.min(timestamps_sec))
-    t_days = (timestamps_sec - t0_sec) / 86400.0
-    target_t_day = (target_dt.timestamp() - t0_sec) / 86400.0
-
-    nufrost_args = build_args(dict(build_nufrost_args))
-    nufrost_t_sec = timestamps_to_seconds(timestamps_array, unit=nufrost_args.time_unit)
-    nufrost_target_dt = parse_timestamp_str(target_time)
-    if nufrost_target_dt is None:
-        raise ValueError(f"Unrecognized target_time: {target_time}")
-    nufrost_target_t = nufrost_target_dt.timestamp()
-    if nufrost_args.time_unit == "days":
-        nufrost_target_t = nufrost_target_t / 86400.0
-
-    _, height, width = cube.shape
-    task_count = max(1, height * len(method_names))
-    resolved_jobs = _resolve_n_jobs(n_jobs, task_count)
-    outputs = {method_name: np.full((height, width), np.nan, dtype=np.float32) for method_name in method_names}
-
-    def _predict_task(method_name: str, row_idx: int):
-        row = np.full(width, np.nan, dtype=np.float32)
-        if method_name == "nufrost":
-            for col_idx in range(width):
-                pred, _ = predict_single_pixel(
-                    nufrost_t_sec,
-                    cube[:, row_idx, col_idx],
-                    nufrost_target_t,
-                    nufft_modes=nufrost_args.modes,
-                    eps=nufrost_args.eps,
-                    num_peaks=nufrost_args.num_peaks,
-                    power_cum=nufrost_args.power_cum,
-                    ignore_dc_hz=nufrost_args.ignore_dc_hz,
-                    frequency_selection=nufrost_args.frequency_selection,
-                    preferred_periods_days=nufrost_args.preferred_periods_days,
-                    preferred_top_k=nufrost_args.preferred_top_k,
-                    spectral_top_k=nufrost_args.spectral_top_k,
-                    spectral_merge_tol=nufrost_args.spectral_merge_tol,
-                    refine_peaks=nufrost_args.refine_peaks,
-                    include_trend=nufrost_args.include_trend,
-                    ridge_lam=nufrost_args.ridge,
-                    freq_weight=nufrost_args.freq_weight,
-                    huber_iters=nufrost_args.huber_iters,
-                    huber_delta=nufrost_args.huber_delta,
-                    min_obs=nufrost_args.min_obs,
-                )
-                row[col_idx] = pred
-        elif method_name == "hants":
-            for col_idx in range(width):
-                row[col_idx] = hants_pixel(t_days, cube[:, row_idx, col_idx], target_t_day, nof=3, sf="low", fet=0.05, dod=5)
-        elif method_name == "zhu2015":
-            for col_idx in range(width):
-                pred, _ = fit_predict_pixel(t_days, cube[:, row_idx, col_idx], target_t_day, lasso_alpha=0.0001)
-                row[col_idx] = pred
-        else:
-            raise ValueError(f"Unsupported method: {method_name}")
-        return method_name, row_idx, row
-
-    tasks = (delayed(_predict_task)(method_name, row_idx) for method_name in method_names for row_idx in range(height))
-    if resolved_jobs == 1:
-        results = (_predict_task(method_name, row_idx) for method_name in method_names for row_idx in range(height))
-    else:
-        results = Parallel(n_jobs=resolved_jobs, prefer="processes", return_as="generator")(tasks)
-
-    for method_name, row_idx, row in tqdm(results, total=task_count, desc="Method Rows"):
-        outputs[method_name][row_idx, :] = row
-    return outputs
 
 
 def _crop_loaded_cube(data: Mapping[str, object], window_size: Optional[int]) -> Dict[str, object]:
@@ -674,9 +578,12 @@ def reconstruct_full_scene_for_location(
         return {"skipped": True, "summary_path": str(existing_summary)}
 
     band_to_timestamps: Dict[str, List[str]] = {}
+    band_to_data: Dict[str, Dict[str, object]] = {}
     for band_name, stack_paths in band_stacks.items():
-        metadata = read_stack_metadata(stack_paths, cache_dir=cache_dir)
-        band_to_timestamps[band_name] = [str(ts) for ts in metadata["timestamps"]]
+        loader = RSCube([str(p) for p in stack_paths], cache_dir=cache_dir, force_refresh=force_refresh)
+        data = loader.load()
+        band_to_timestamps[band_name] = [str(ts) for ts in data["timestamps"]]
+        band_to_data[band_name] = data
 
     target_time, completeness = choose_shared_target_timestamp(
         band_stacks,
@@ -696,8 +603,7 @@ def reconstruct_full_scene_for_location(
     band_meta: Dict[str, Mapping[str, object]] = {}
 
     for band_name, stack_paths in band_stacks.items():
-        loader = RSCube([str(path) for path in stack_paths], cache_dir=cache_dir, force_refresh=force_refresh)
-        data = _crop_loaded_cube(loader.load(), window_size)
+        data = _crop_loaded_cube(band_to_data[band_name], window_size)
         cube = np.ma.filled(data["cube"], np.nan).astype(np.float32)
         timestamps = [str(ts) for ts in data["timestamps"]]
         cube, deduped_timestamps = collapse_duplicate_timestamps(cube, timestamps)
@@ -716,17 +622,19 @@ def reconstruct_full_scene_for_location(
             "force_refresh": force_refresh,
             "target_time": target_time,
         }
-        method_predictions = _run_shared_method_rows(
-            methods=methods,
-            cube=masked_cube,
-            timestamps=masked_timestamps,
-            target_time=target_time,
-            n_jobs=n_jobs,
-            build_nufrost_args=build_nufrost_args,
-        )
         for method_name in methods:
-            prediction_2d = np.asarray(method_predictions[method_name], dtype=np.float32)
             output_path = build_output_path(output_root=output_root, method_name=method_name, source_file=stack_paths[0], target_time=target_time, source_name=source_name, lon=lon, lat=lat)
+            if method_name == "nufrost":
+                args = build_args(dict(build_nufrost_args))
+                prediction = nufrost_core(masked_cube, masked_timestamps, target_time, args=args)
+            elif method_name == "hants":
+                prediction = reconstruct_hants_from_cube(masked_cube, masked_timestamps, target_time, n_jobs=n_jobs)
+            elif method_name == "zhu2015":
+                prediction = reconstruct_zhu2015_from_cube(masked_cube, masked_timestamps, target_time, n_jobs=n_jobs)
+            else:
+                raise ValueError(f"Unsupported method: {method_name}")
+
+            prediction_2d = extract_prediction_2d(method_name, prediction)
             _write_prediction(output_path, prediction_2d, data)
             output_map[method_name][band_name] = str(output_path)
             prediction_arrays[method_name][band_name] = prediction_2d

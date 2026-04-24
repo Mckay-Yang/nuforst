@@ -60,9 +60,6 @@ def test_full_scene_script_runs_without_window_crop(tmp_path: Path, monkeypatch)
     def fake_discover_location_band_stacks(*args, **kwargs):
         return {"B2": [tmp_path / "B2.vrt"]}
 
-    def fake_read_stack_metadata(*args, **kwargs):
-        return {"timestamps": timestamps}
-
     def fake_choose_shared_target_timestamp(*args, **kwargs):
         return str(timestamps[-1]), {"B2": {str(timestamps[-1]): 1.0}}
 
@@ -79,7 +76,6 @@ def test_full_scene_script_runs_without_window_crop(tmp_path: Path, monkeypatch)
             }
 
     monkeypatch.setattr("src.full_scene_reconstruction.pipeline.discover_location_band_stacks", fake_discover_location_band_stacks)
-    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.read_stack_metadata", fake_read_stack_metadata)
     monkeypatch.setattr("src.full_scene_reconstruction.pipeline.choose_shared_target_timestamp", fake_choose_shared_target_timestamp)
     monkeypatch.setattr("src.full_scene_reconstruction.pipeline.RSCube", FakeRSCube)
 

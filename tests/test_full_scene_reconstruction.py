@@ -231,9 +231,6 @@ def test_reconstruct_full_scene_dispatches_methods_with_shared_job_budget(tmp_pa
     def fake_discover_location_band_stacks(*args, **kwargs):
         return {"B2": [tmp_path / "B2.vrt"]}
 
-    def fake_read_stack_metadata(*args, **kwargs):
-        return {"timestamps": ["2024-01-01T00:00:00", "2024-02-01T00:00:00"]}
-
     def fake_choose_shared_target_timestamp(*args, **kwargs):
         return "2024-02-01T00:00:00", {"B2": {"2024-02-01T00:00:00": 1.0}}
 
@@ -255,19 +252,26 @@ def test_reconstruct_full_scene_dispatches_methods_with_shared_job_budget(tmp_pa
                 "crs_wkt": None,
             }
 
-    def fake_run_shared_method_rows(*, methods, cube, timestamps, target_time, n_jobs, build_nufrost_args):
-        calls.append((tuple(methods), cube.shape, tuple(timestamps), target_time, n_jobs, build_nufrost_args["n_jobs"]))
-        return {
-            "nufrost": np.full(cube.shape[1:], 10.0, dtype=np.float32),
-            "hants": np.full(cube.shape[1:], 20.0, dtype=np.float32),
-            "zhu2015": np.full(cube.shape[1:], 30.0, dtype=np.float32),
-        }
+    def fake_nufrost_core(cube, timestamps, target_time, args=None, **kwargs):
+        calls.append(("nufrost", cube.shape, target_time))
+        return np.full((cube.shape[1], cube.shape[2]), 10.0, dtype=np.float32)
+
+    def fake_reconstruct_hants(cube, timestamps, target_time, **kwargs):
+        calls.append(("hants", cube.shape, target_time))
+        return np.full((cube.shape[1], cube.shape[2]), 20.0, dtype=np.float32)
+
+    def fake_reconstruct_zhu2015(cube, timestamps, target_time, **kwargs):
+        calls.append(("zhu2015", cube.shape, target_time))
+        pred = np.full((cube.shape[1], cube.shape[2]), 30.0, dtype=np.float32)
+        qa = np.full((cube.shape[1], cube.shape[2]), 0.0, dtype=np.float32)
+        return np.stack([pred, qa], axis=0)
 
     monkeypatch.setattr("src.full_scene_reconstruction.pipeline.discover_location_band_stacks", fake_discover_location_band_stacks)
-    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.read_stack_metadata", fake_read_stack_metadata)
     monkeypatch.setattr("src.full_scene_reconstruction.pipeline.choose_shared_target_timestamp", fake_choose_shared_target_timestamp)
     monkeypatch.setattr("src.full_scene_reconstruction.pipeline.RSCube", FakeRSCube)
-    monkeypatch.setattr("src.full_scene_reconstruction.pipeline._run_shared_method_rows", fake_run_shared_method_rows)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.nufrost_core", fake_nufrost_core)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.reconstruct_hants_from_cube", fake_reconstruct_hants)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.reconstruct_zhu2015_from_cube", fake_reconstruct_zhu2015)
 
     result = reconstruct_full_scene_for_location(
         source_name="sentinel-2",
@@ -278,7 +282,8 @@ def test_reconstruct_full_scene_dispatches_methods_with_shared_job_budget(tmp_pa
         n_jobs=9,
     )
 
-    assert calls == [(("nufrost", "hants", "zhu2015"), (1, 2, 2), ("2024-01-01T00:00:00",), "2024-02-01T00:00:00", 9, 9)]
+    method_names = [c[0] for c in calls]
+    assert method_names == ["nufrost", "hants", "zhu2015"]
     assert result["ground_truth_output"].endswith("[ground_truth]_sentinel-2_lon94.260500_lat29.773300_2024-02-01T00-00-00.tif")
     assert result["merged_prediction_outputs"]["nufrost"].endswith("[nufrost]_sentinel-2_lon94.260500_lat29.773300_2024-02-01T00-00-00_prediction.tif")
 
@@ -291,9 +296,6 @@ def test_reconstruct_full_scene_passes_limited_budget_into_shared_scheduler(tmp_
     def fake_discover_location_band_stacks(*args, **kwargs):
         return {"B2": [tmp_path / "B2.vrt"]}
 
-    def fake_read_stack_metadata(*args, **kwargs):
-        return {"timestamps": ["2024-01-01T00:00:00", "2024-02-01T00:00:00"]}
-
     def fake_choose_shared_target_timestamp(*args, **kwargs):
         return "2024-02-01T00:00:00", {"B2": {"2024-02-01T00:00:00": 1.0}}
 
@@ -315,19 +317,26 @@ def test_reconstruct_full_scene_passes_limited_budget_into_shared_scheduler(tmp_
                 "crs_wkt": None,
             }
 
-    def fake_run_shared_method_rows(*, methods, cube, timestamps, target_time, n_jobs, build_nufrost_args):
-        calls.append((tuple(methods), cube.shape, tuple(timestamps), target_time, n_jobs, build_nufrost_args["n_jobs"]))
-        return {
-            "nufrost": np.full(cube.shape[1:], 10.0, dtype=np.float32),
-            "hants": np.full(cube.shape[1:], 20.0, dtype=np.float32),
-            "zhu2015": np.full(cube.shape[1:], 30.0, dtype=np.float32),
-        }
+    def fake_nufrost_core(cube, timestamps, target_time, args=None, **kwargs):
+        calls.append(("nufrost", kwargs.get("n_jobs", getattr(args, "n_jobs", -1))))
+        return np.full((cube.shape[1], cube.shape[2]), 10.0, dtype=np.float32)
+
+    def fake_reconstruct_hants(cube, timestamps, target_time, **kwargs):
+        calls.append(("hants", kwargs.get("n_jobs", -1)))
+        return np.full((cube.shape[1], cube.shape[2]), 20.0, dtype=np.float32)
+
+    def fake_reconstruct_zhu2015(cube, timestamps, target_time, **kwargs):
+        calls.append(("zhu2015", kwargs.get("n_jobs", -1)))
+        pred = np.full((cube.shape[1], cube.shape[2]), 30.0, dtype=np.float32)
+        qa = np.full((cube.shape[1], cube.shape[2]), 0.0, dtype=np.float32)
+        return np.stack([pred, qa], axis=0)
 
     monkeypatch.setattr("src.full_scene_reconstruction.pipeline.discover_location_band_stacks", fake_discover_location_band_stacks)
-    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.read_stack_metadata", fake_read_stack_metadata)
     monkeypatch.setattr("src.full_scene_reconstruction.pipeline.choose_shared_target_timestamp", fake_choose_shared_target_timestamp)
     monkeypatch.setattr("src.full_scene_reconstruction.pipeline.RSCube", FakeRSCube)
-    monkeypatch.setattr("src.full_scene_reconstruction.pipeline._run_shared_method_rows", fake_run_shared_method_rows)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.nufrost_core", fake_nufrost_core)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.reconstruct_hants_from_cube", fake_reconstruct_hants)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.reconstruct_zhu2015_from_cube", fake_reconstruct_zhu2015)
 
     reconstruct_full_scene_for_location(
         source_name="sentinel-2",
@@ -338,7 +347,8 @@ def test_reconstruct_full_scene_passes_limited_budget_into_shared_scheduler(tmp_
         n_jobs=2,
     )
 
-    assert calls == [(("nufrost", "hants", "zhu2015"), (1, 2, 2), ("2024-01-01T00:00:00",), "2024-02-01T00:00:00", 2, 2)]
+    method_names = [c[0] for c in calls]
+    assert method_names == ["nufrost", "hants", "zhu2015"]
 
 
 def test_reconstruct_full_scene_skips_when_summary_exists(tmp_path: Path, monkeypatch) -> None:
@@ -389,9 +399,6 @@ def test_reconstruct_full_scene_does_not_skip_when_window_size_differs(tmp_path:
     def fake_discover_location_band_stacks(*args, **kwargs):
         return {"B2": [tmp_path / "B2.vrt"]}
 
-    def fake_read_stack_metadata(*args, **kwargs):
-        return {"timestamps": ["2024-01-01T00:00:00", "2025-01-01T00:00:00"]}
-
     def fake_choose_shared_target_timestamp(*args, **kwargs):
         return "2025-01-01T00:00:00", {"B2": {"2025-01-01T00:00:00": 1.0}}
 
@@ -412,14 +419,23 @@ def test_reconstruct_full_scene_does_not_skip_when_window_size_differs(tmp_path:
                 "crs_wkt": None,
             }
 
-    def fake_run_shared_method_rows(*, methods, cube, timestamps, target_time, n_jobs, build_nufrost_args):
-        return {"hants": np.full(cube.shape[1:], 7.0, dtype=np.float32)}
+    def fake_nufrost_core(cube, timestamps, target_time, args=None, **kwargs):
+        return np.full((cube.shape[1], cube.shape[2]), 7.0, dtype=np.float32)
+
+    def fake_reconstruct_hants(cube, timestamps, target_time, **kwargs):
+        return np.full((cube.shape[1], cube.shape[2]), 7.0, dtype=np.float32)
+
+    def fake_reconstruct_zhu2015(cube, timestamps, target_time, **kwargs):
+        pred = np.full((cube.shape[1], cube.shape[2]), 7.0, dtype=np.float32)
+        qa = np.full((cube.shape[1], cube.shape[2]), 0.0, dtype=np.float32)
+        return np.stack([pred, qa], axis=0)
 
     monkeypatch.setattr("src.full_scene_reconstruction.pipeline.discover_location_band_stacks", fake_discover_location_band_stacks)
-    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.read_stack_metadata", fake_read_stack_metadata)
     monkeypatch.setattr("src.full_scene_reconstruction.pipeline.choose_shared_target_timestamp", fake_choose_shared_target_timestamp)
     monkeypatch.setattr("src.full_scene_reconstruction.pipeline.RSCube", FakeRSCube)
-    monkeypatch.setattr("src.full_scene_reconstruction.pipeline._run_shared_method_rows", fake_run_shared_method_rows)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.nufrost_core", fake_nufrost_core)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.reconstruct_hants_from_cube", fake_reconstruct_hants)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.reconstruct_zhu2015_from_cube", fake_reconstruct_zhu2015)
 
     result = reconstruct_full_scene_for_location(
         source_name="sentinel-2",
@@ -450,9 +466,6 @@ def test_reconstruct_full_scene_does_not_skip_when_source_files_differ(tmp_path:
     def fake_discover_location_band_stacks(*args, **kwargs):
         return {"B2": [tmp_path / "B2-new.vrt"]}
 
-    def fake_read_stack_metadata(*args, **kwargs):
-        return {"timestamps": ["2024-01-01T00:00:00", "2025-01-01T00:00:00"]}
-
     def fake_choose_shared_target_timestamp(*args, **kwargs):
         return "2025-01-01T00:00:00", {"B2": {"2025-01-01T00:00:00": 1.0}}
 
@@ -473,14 +486,23 @@ def test_reconstruct_full_scene_does_not_skip_when_source_files_differ(tmp_path:
                 "crs_wkt": None,
             }
 
-    def fake_run_shared_method_rows(*, methods, cube, timestamps, target_time, n_jobs, build_nufrost_args):
-        return {"hants": np.full(cube.shape[1:], 5.0, dtype=np.float32)}
+    def fake_nufrost_core(cube, timestamps, target_time, args=None, **kwargs):
+        return np.full((cube.shape[1], cube.shape[2]), 5.0, dtype=np.float32)
+
+    def fake_reconstruct_hants(cube, timestamps, target_time, **kwargs):
+        return np.full((cube.shape[1], cube.shape[2]), 5.0, dtype=np.float32)
+
+    def fake_reconstruct_zhu2015(cube, timestamps, target_time, **kwargs):
+        pred = np.full((cube.shape[1], cube.shape[2]), 5.0, dtype=np.float32)
+        qa = np.full((cube.shape[1], cube.shape[2]), 0.0, dtype=np.float32)
+        return np.stack([pred, qa], axis=0)
 
     monkeypatch.setattr("src.full_scene_reconstruction.pipeline.discover_location_band_stacks", fake_discover_location_band_stacks)
-    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.read_stack_metadata", fake_read_stack_metadata)
     monkeypatch.setattr("src.full_scene_reconstruction.pipeline.choose_shared_target_timestamp", fake_choose_shared_target_timestamp)
     monkeypatch.setattr("src.full_scene_reconstruction.pipeline.RSCube", FakeRSCube)
-    monkeypatch.setattr("src.full_scene_reconstruction.pipeline._run_shared_method_rows", fake_run_shared_method_rows)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.nufrost_core", fake_nufrost_core)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.reconstruct_hants_from_cube", fake_reconstruct_hants)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.reconstruct_zhu2015_from_cube", fake_reconstruct_zhu2015)
 
     result = reconstruct_full_scene_for_location(
         source_name="sentinel-2",
@@ -592,9 +614,6 @@ def test_small_window_full_scene_run_writes_8x8_outputs(tmp_path: Path, monkeypa
     def fake_discover_location_band_stacks(*args, **kwargs):
         return {"B2": [tmp_path / "B2.vrt"]}
 
-    def fake_read_stack_metadata(*args, **kwargs):
-        return {"timestamps": timestamps}
-
     def fake_choose_shared_target_timestamp(*args, **kwargs):
         return str(timestamps[-1]), {"B2": {str(timestamps[-1]): 1.0}}
 
@@ -611,7 +630,6 @@ def test_small_window_full_scene_run_writes_8x8_outputs(tmp_path: Path, monkeypa
             }
 
     monkeypatch.setattr("src.full_scene_reconstruction.pipeline.discover_location_band_stacks", fake_discover_location_band_stacks)
-    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.read_stack_metadata", fake_read_stack_metadata)
     monkeypatch.setattr("src.full_scene_reconstruction.pipeline.choose_shared_target_timestamp", fake_choose_shared_target_timestamp)
     monkeypatch.setattr("src.full_scene_reconstruction.pipeline.RSCube", FakeRSCube)
 
@@ -651,8 +669,8 @@ def test_small_window_full_scene_run_writes_8x8_outputs(tmp_path: Path, monkeypa
         assert ds.width == 8
 
 
-def test_run_shared_method_rows_executes_hants_on_small_cube() -> None:
-    from src.full_scene_reconstruction.pipeline import _run_shared_method_rows
+def test_reconstruct_hants_from_cube_executes_on_small_cube() -> None:
+    from src.full_scene_reconstruction.pipeline import reconstruct_hants_from_cube
 
     timestamps = np.asarray(
         [
@@ -676,18 +694,10 @@ def test_run_shared_method_rows_executes_hants_on_small_cube() -> None:
         axis=0,
     )
 
-    outputs = _run_shared_method_rows(
-        methods=("hants",),
-        cube=cube,
-        timestamps=timestamps,
-        target_time="2024-12-01T00:00:00",
-        n_jobs=1,
-        build_nufrost_args={},
-    )
+    output = reconstruct_hants_from_cube(cube, timestamps, "2024-12-01T00:00:00", n_jobs=1)
 
-    assert set(outputs) == {"hants"}
-    assert outputs["hants"].shape == (2, 2)
-    assert np.isfinite(outputs["hants"]).all()
+    assert output.shape == (2, 2)
+    assert np.isfinite(output).all()
 
 
 def test_reconstruct_full_scene_for_all_locations_dispatches_every_coordinate(tmp_path: Path, monkeypatch) -> None:

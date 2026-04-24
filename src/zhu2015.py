@@ -1,5 +1,8 @@
+import warnings
+
 import numpy as np
 import pandas as pd
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.linear_model import Lasso
 from typing import Tuple, Optional, Union, List, Dict, Any
 from datetime import datetime
@@ -74,7 +77,9 @@ def fit_model(t_days: np.ndarray, y: np.ndarray, lasso_alpha: float) -> Tuple[Op
 
     X = make_design_matrix(t_days, order)
     clf = Lasso(alpha=lasso_alpha, fit_intercept=True, max_iter=2000)
-    clf.fit(X, y)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ConvergenceWarning)
+        clf.fit(X, y)
 
     y_pred = clf.predict(X)
     res = y - y_pred
