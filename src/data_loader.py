@@ -74,10 +74,11 @@ def _gdal_dtype_name(dtype: str) -> str:
 
 
 def _log_cache_event(kind: str, status: str, path: Union[str, Path], detail: Optional[str] = None) -> None:
-    msg = f"[DataLoader] {kind} cache {status}: {Path(path)}"
+    from .logger import log as _log
+    msg = f"{kind} cache {status}: {Path(path)}"
     if detail:
         msg += f" ({detail})"
-    print(msg, flush=True)
+    _log("_log_cache_event", msg)
 
 
 def _is_stale(target: Path, sources: List[Path]) -> bool:
@@ -396,6 +397,11 @@ class RSCube:
         return sorted_arr, sorted_timestamps, sorted_band_names
 
     def _save_npz(self, cache_path: Path, cube: np.ndarray, timestamps: np.ndarray, band_names: np.ndarray) -> None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        stem_prefix = cache_path.name.rsplit("_", 1)[0]
+        for sibling in cache_path.parent.glob(f"{stem_prefix}_*.npz"):
+            if sibling != cache_path:
+                sibling.unlink(missing_ok=True)
         meta = {**self.meta, "cache_path": str(cache_path)}
         np.savez_compressed(cache_path, cube=cube, timestamps=timestamps, band_names=band_names, meta=json.dumps(meta))
 

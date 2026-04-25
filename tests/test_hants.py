@@ -1,6 +1,13 @@
 import numpy as np
 
-from src.hants import _apply_hants_valid_mask, hants_curve_pixel, hants_pixel, make_harmonic_matrix
+from src.hants import (
+    _apply_hants_valid_mask,
+    fit_hants_pixel_params,
+    hants_curve_pixel,
+    hants_pixel,
+    make_harmonic_matrix,
+    predict_hants_from_params,
+)
 
 
 def test_apply_hants_valid_mask_respects_idrt_direction() -> None:
@@ -27,3 +34,69 @@ def test_hants_pixel_and_curve_return_finite_values(
     assert np.isfinite(pred)
     assert curve.shape == (3,)
     assert np.isfinite(curve).all()
+
+
+def test_fit_hants_pixel_params_requires_paper_minimum_observations_after_rejection() -> None:
+    t = np.array([0.0, 1.0], dtype=np.float64)
+    y = np.array([0.0, 10.0], dtype=np.float64)
+
+    params = fit_hants_pixel_params(t, y, nof=1, sf="high", fet=0.1, dod=1, period=365.25)
+
+    assert params["valid"] is False
+
+
+def test_hants_suppression_flag_is_one_sided() -> None:
+    t = np.array([0.0, 1.0, 2.0, 3.0], dtype=np.float64)
+    y = np.array([1.0, 1.0, 1.0, 10.0], dtype=np.float64)
+
+    low_pred = hants_pixel(t, y, target_t=1.5, nof=1, sf="low", fet=0.1, dod=0, period=365.25)
+    high_pred = hants_pixel(t, y, target_t=1.5, nof=1, sf="high", fet=0.1, dod=0, period=365.25)
+
+    assert low_pred > 2.0
+    assert abs(high_pred - 1.0) < 1e-6
+
+
+def test_idrt_filters_invalid_side_before_hants_fit() -> None:
+    t = np.array([0.0, 1.0, 2.0, 3.0], dtype=np.float64)
+    y = np.array([0.2, 0.4, 0.8, 0.9], dtype=np.float64)
+
+    params = fit_hants_pixel_params(t, y, nof=1, sf="low", idrt=0.7, fet=0.1, dod=0, period=365.25)
+    pred = predict_hants_from_params(params, target_t=1.5)
+
+    assert params["valid"] is True
+    assert abs(pred - 0.3) < 1e-6
+
+
+def test_hants_iterative_rejection_removes_outliers() -> None:
+    t = np.arange(10, dtype=np.float64)
+    y = np.ones(10, dtype=np.float64) * 0.5
+    y[5] = -5.0
+
+    params = fit_hants_pixel_params(t, y, nof=1, sf="low", fet=0.1, dod=0, period=365.25)
+
+    assert params["valid"] is True
+    pred = predict_hants_from_params(params, target_t=5.0)
+    assert abs(pred - 0.5) < 0.5
+
+
+def test_hants_nof_3_uses_5_parameters() -> None:
+    params = fit_hants_pixel_params(
+        np.arange(20, dtype=np.float64),
+        np.ones(20, dtype=np.float64),
+        nof=3,
+        sf="low",
+        fet=0.1,
+        dod=5,
+        period=365.25,
+    )
+    assert params["valid"] is True
+    assert len(params["coeffs"]) == 5
+
+
+def test_hants_stops_when_all_residuals_within_fet() -> None:
+    t = np.arange(8, dtype=np.float64)
+    y = np.sin(2 * np.pi * t / 365.25) * 0.1 + 0.5
+
+    params = fit_hants_pixel_params(t, y, nof=1, sf="low", fet=1.0, dod=0, period=365.25)
+
+    assert params["valid"] is True

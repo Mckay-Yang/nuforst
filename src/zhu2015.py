@@ -1,11 +1,15 @@
+import warnings
+
 import numpy as np
 import pandas as pd
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.linear_model import Lasso
 from typing import Tuple, Optional, Union, List, Dict, Any
 from datetime import datetime
 from .data_loader import RSCube
 from .nufrost import timestamps_to_seconds
 from config import Args, build_args
+from .logger import log as _log
 import rasterio
 from pathlib import Path
 from tqdm import tqdm
@@ -74,7 +78,9 @@ def fit_model(t_days: np.ndarray, y: np.ndarray, lasso_alpha: float) -> Tuple[Op
 
     X = make_design_matrix(t_days, order)
     clf = Lasso(alpha=lasso_alpha, fit_intercept=True, max_iter=2000)
-    clf.fit(X, y)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ConvergenceWarning)
+        clf.fit(X, y)
 
     y_pred = clf.predict(X)
     res = y - y_pred
@@ -82,13 +88,24 @@ def fit_model(t_days: np.ndarray, y: np.ndarray, lasso_alpha: float) -> Tuple[Op
 
     return clf, unit_qa, order, rmse
 
+
+def _predict_raw(coef: np.ndarray, intercept: float, X: np.ndarray) -> np.ndarray:
+    return intercept + X @ coef
+
+
+def _predict_single(coef: np.ndarray, intercept: float, x_day: float, order: int) -> float:
+    w = 2 * np.pi / DAYS_PER_YEAR
+    row = np.empty(2 * order + 1, dtype=np.float64)
+    for k in range(1, order + 1):
+        row[2 * (k - 1)] = np.cos(k * w * x_day)
+        row[2 * k - 1] = np.sin(k * w * x_day)
+    row[-1] = x_day
+    return intercept + row @ coef
+
 def extract_segments(t_days: np.ndarray, y: np.ndarray, lasso_alpha: float = 0.001) -> List[Dict[str, Any]]:
     n_obs = len(y)
     segments = []
 
-    # Zhu et al. (2015) state that models estimated from fewer than 12 clear
-    # observations are backup algorithms and should not be used for break
-    # detection. Therefore, for these short series we create a single segment.
     if n_obs < 12:
         clf, unit_qa, order, _ = fit_model(t_days, y, lasso_alpha)
         if clf is None:
@@ -113,7 +130,6 @@ def extract_segments(t_days: np.ndarray, y: np.ndarray, lasso_alpha: float = 0.0
     while start_idx < n_obs:
         remaining = n_obs - start_idx
         if remaining < 6:
-            # End of time series, not enough for a model
             segments.append({
                 'start_idx': start_idx,
                 'end_idx': n_obs - 1,
@@ -124,7 +140,6 @@ def extract_segments(t_days: np.ndarray, y: np.ndarray, lasso_alpha: float = 0.0
             })
             break
 
-        # Initialize
         init_end = min(start_idx + 24, n_obs)
         if init_end - start_idx < 12:
             init_end = min(start_idx + 12, n_obs)
@@ -134,7 +149,6 @@ def extract_segments(t_days: np.ndarray, y: np.ndarray, lasso_alpha: float = 0.0
 
         clf, unit_qa, order, base_rmse = fit_model(t_init, y_init, lasso_alpha)
         if clf is None:
-            # Fallback
             segments.append({
                 'start_idx': start_idx,
                 'end_idx': n_obs - 1,
@@ -145,14 +159,25 @@ def extract_segments(t_days: np.ndarray, y: np.ndarray, lasso_alpha: float = 0.0
             })
             break
 
+        if unit_qa != 0:
+            segments.append({
+                'start_idx': start_idx,
+                'end_idx': n_obs - 1,
+                'clf': clf,
+                'order': order,
+                'unit_qa': unit_qa,
+                'median_val': 0.0 if clf is not None else float(np.median(y_init))
+            })
+            break
+
+        coef = np.asarray(clf.coef_, dtype=np.float64)
+        intercept = float(clf.intercept_)
         break_idx = -1
         consecutive_anomalies = 0
 
         for i in range(init_end, n_obs):
-            X_i = make_design_matrix(np.array([t_days[i]]), order)
-            pred = clf.predict(X_i)[0]
+            pred = _predict_single(coef, intercept, t_days[i], order)
 
-            # Temporally adjusted RMSE
             if i - start_idx >= 24:
                 t_seg = t_days[start_idx:i]
                 y_seg = y[start_idx:i]
@@ -161,14 +186,15 @@ def extract_segments(t_days: np.ndarray, y: np.ndarray, lasso_alpha: float = 0.0
                 diff = np.abs(doy_seg - target_doy)
                 diff = np.minimum(diff, DAYS_PER_YEAR - diff)
                 nearest_idx = np.argsort(diff)[:24]
-                y_pred_seg = clf.predict(make_design_matrix(t_seg, order))
+                X_seg = make_design_matrix(t_seg, order)
+                y_pred_seg = _predict_raw(coef, intercept, X_seg)
                 res = y_seg - y_pred_seg
                 current_rmse = np.sqrt(np.mean(res[nearest_idx]**2))
             else:
                 current_rmse = base_rmse
 
             threshold = 2 * current_rmse
-            threshold = max(threshold, 0.01) # Avoid threshold being too small
+            threshold = max(threshold, 0.01)
 
             if abs(y[i] - pred) > threshold:
                 consecutive_anomalies += 1
@@ -310,22 +336,21 @@ def predict_zhu2015_from_params(params: Dict[str, Any], target_t_day: float) -> 
         return np.nan, 255
 
     n_segments = int(params["n_segments"])
-    starts = np.asarray(params["segment_start_days"], dtype=np.float64)[:n_segments]
-    ends = np.asarray(params["segment_end_days"], dtype=np.float64)[:n_segments]
-    orders = np.asarray(params["segment_orders"], dtype=np.int16)[:n_segments]
-    unit_qas = np.asarray(params["segment_unit_qas"], dtype=np.int16)[:n_segments]
-    has_model = np.asarray(params["segment_has_model"], dtype=np.int8)[:n_segments]
-    median_vals = np.asarray(params["segment_median_values"], dtype=np.float64)[:n_segments]
-    intercepts = np.asarray(params["segment_intercepts"], dtype=np.float64)[:n_segments]
-    coeffs = np.asarray(params["segment_coefficients"], dtype=np.float64)[:n_segments]
+    starts = params["segment_start_days"][:n_segments]
+    ends = params["segment_end_days"][:n_segments]
+    unit_qas = params["segment_unit_qas"][:n_segments]
+    has_model = params["segment_has_model"][:n_segments]
+    median_vals = params["segment_median_values"][:n_segments]
+    intercepts = params["segment_intercepts"][:n_segments]
+    coeffs = params["segment_coefficients"][:n_segments]
 
-    seg_idx = None
+    seg_idx = -1
     qa_prefix = 0
-    for idx, (start_day, end_day) in enumerate(zip(starts, ends)):
-        if start_day <= target_t_day <= end_day:
+    for idx in range(n_segments):
+        if starts[idx] <= target_t_day <= ends[idx]:
             seg_idx = idx
             break
-    if seg_idx is None:
+    if seg_idx < 0:
         if target_t_day < starts[0]:
             seg_idx = 0
             qa_prefix = 1
@@ -337,8 +362,15 @@ def predict_zhu2015_from_params(params: Dict[str, Any], target_t_day: float) -> 
     if not has_model[seg_idx]:
         return float(median_vals[seg_idx]), qa
 
-    X = _make_full_design_matrix(np.array([target_t_day], dtype=np.float64), max_order=int(params["max_order"]))
-    pred = float(intercepts[seg_idx] + (X @ coeffs[seg_idx]).item())
+    max_order = int(params["max_order"])
+    w = 2 * np.pi / DAYS_PER_YEAR
+    ncols = 2 * max_order + 1
+    row = np.empty(ncols, dtype=np.float64)
+    for k in range(1, max_order + 1):
+        row[2 * (k - 1)] = np.cos(k * w * target_t_day)
+        row[2 * k - 1] = np.sin(k * w * target_t_day)
+    row[-1] = target_t_day
+    pred = float(intercepts[seg_idx] + row @ coeffs[seg_idx])
     return pred, qa
 
 def predict_target(segments: List[Dict[str, Any]], t_days: np.ndarray, target_t_day: float) -> Tuple[float, int]:
@@ -434,7 +466,7 @@ def reconstruct_zhu2015(
     if n_jobs <= 0:
         n_jobs = cpu_count()
 
-    print(f"[Zhu2015] Reconstructing {image} at {target_time} using LASSO (alpha={lasso_alpha})...")
+    _log("reconstruct_zhu2015", f"Reconstructing {image} at {target_time} using LASSO (alpha={lasso_alpha})")
 
     def _process_row(i):
         row_pred = np.full((2, W), np.nan, dtype=np.float32)
@@ -473,6 +505,6 @@ def reconstruct_zhu2015(
         ) as dst:
             dst.write(out[0], 1)
             dst.write(out[1], 2)
-        print(f"[Success] Saved to: {out_p}")
+        _log("reconstruct_zhu2015", f"Saved to: {out_p}")
 
     return out
