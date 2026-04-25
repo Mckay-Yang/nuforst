@@ -1,98 +1,213 @@
 ---
 name: nufrost-project
-description: Use when working on the NUFROST codebase — understanding algorithm architecture, evaluation pipeline, configuration, or data flow
+description: Use when working in the NUFROST repo and needing the codebase map, notebook or script entrypoints, exported Python interfaces, configuration precedence, or reconstruction and evaluation workflow guidance
 ---
 
 # NUFROST Project Reference
 
 ## Overview
 
-NUFROST is a remote sensing time-series reconstruction framework combining NUFFT + Huber-Ridge regression. The repo contains three independent algorithms (NUFROST, Zhu2015, HANTS), a streaming evaluation pipeline, and Jupyter notebook workflows.
+NUFROST is a notebook-first remote sensing time-series reconstruction repo. Treat it as four connected layers: data loading, reconstruction algorithms, evaluation workflows, and notebook/script entrypoints.
 
-## Architecture
+## When to Use
 
-```
+- Explaining the repo architecture or where a workflow lives
+- Choosing between notebooks, Python APIs, and `scripts/*.py`
+- Finding public entrypoints such as `reconstruct_nufrost`, `RSCube`, or full-scene helpers
+- Tracing how GeoTIFF inputs become VRTs, NPZ caches, GeoTIFF outputs, CSVs, and summary JSON
+- Debugging config precedence or output-shape differences between NUFROST, Zhu2015, and HANTS
+
+Do not use this skill as a replacement for reading the target implementation file when exact internal behavior matters.
+
+## Repository Map
+
+```text
 src/
-  nufrost.py      # NUFROST: NUFFT → frequency selection → Huber-Ridge IRLS
-  hants.py        # HANTS:  Harmonic analysis with iterative outlier rejection
-  zhu2015.py      # Zhu2015: Lasso-based piecewise harmonic fitting
-  evaluation.py   # Evaluation: sampling, metrics, streaming vs cube entrypoints
-  data_loader.py  # RSCube (full NPZ) + TimeSeriesRasterSource (streaming VRT)
-  model_params.py # Parameter caching (unused in current notebook flow)
+  __init__.py                   # Public Python API re-exports
+  data_loader.py                # TIFF/VRT loading, timestamp parsing, NPZ cache, streaming raster source
+  nufrost.py                    # NUFROST reconstruction entrypoint + core algorithm
+  zhu2015.py                    # Zhu2015 baseline reconstruction
+  hants.py                      # HANTS baseline reconstruction
+  evaluation.py                 # Random-point / gap evaluation helpers
+  local_eval_workflow.py        # Notebook-free local evaluation orchestration
+  full_scene_reconstruction/
+    __init__.py                 # Full-scene public exports
+    pipeline.py                 # Location discovery, band stacks, target timestamp selection, GeoTIFF writers
+  logger.py                     # Async file logger for long-running workflows
+
 config/
-  config.yaml     # Canonical defaults (overrides Args dataclass when using build_args)
-  settings.py     # Args dataclass + build_args() merge logic
+  config.yaml                   # Canonical defaults
+  settings.py                   # Args dataclass, CLI parser, build_args()
+
+scripts/
+  run_local_evals.py            # Notebook-free local evaluation entrypoint
+  run_full_scene_reconstruction.py
+  run_small_window_full_scene.py
+
 notebooks/
-  local_evals.ipynb    # Main local evaluation entrypoint
+  local_evals.ipynb             # Main local evaluation workflow
+  ...                           # Reconstruction, plotting, Earth Engine export notebooks
 ```
 
-## Three Algorithms Are Independent
+## Core Logic
 
-- **NUFROST** (nufrost.py): The proposed method. NUFFT spectrum → hybrid frequency selection (prior + data-driven) → parabolic refinement → IRLS with Huber loss + frequency-weighted Ridge.
-- **Zhu2015** (zhu2015.py): Comparison baseline. Lasso regression on fixed harmonic basis (annual, semi-annual, tri-annual) with piecewise segmentation.
-- **HANTS** (hants.py): Comparison baseline. Iterative harmonic fitting with outlier rejection (FET threshold).
+### Three algorithms are independent
 
-Do NOT treat Zhu2015 or HANTS as sub-components of NUFROST.
+- `NUFROST`: proposed method. `NUFFT -> frequency selection -> optional parabolic refinement -> Huber-Ridge IRLS`
+- `Zhu2015`: comparison baseline. Piecewise harmonic fitting with `Lasso`
+- `HANTS`: comparison baseline. Harmonic fitting with iterative outlier rejection
 
-## Data Flow
+Do not describe Zhu2015 or HANTS as sub-parts of NUFROST.
 
+### Data flow
+
+```text
+GeoTIFF tiles
+  -> find_image_chunks() / discover_location_band_stacks()
+  -> VRT cache under <cache_dir>/vrts/
+  -> one of two read paths:
+     - RSCube.load() -> full cube + NPZ cache under <cache_dir>/npz/
+     - TimeSeriesRasterSource -> streaming reads for evaluation / full-scene workflows
+  -> reconstruction or evaluation
+  -> outputs under data/output/
 ```
-GeoTIFF tiles → find_image_chunks() → VRT (cached in data/cache/local/vrts/)
-                                           ↓
-                        ┌─── RSCube.load() → NPZ (data/cache/local/npz/)  [full-cube path]
-                        └─── TimeSeriesRasterSource  [streaming path, no NPZ]
-                                           ↓
-                        open_evaluation_source() → {source, t_days, timestamps}
-                                           ↓
-                        scan_pixel_stats() → cached {valid_counts, missing_ratios, native_gap_days}
-                                           ↓
-                        sample / evaluate → CSV in data/output/
+
+### Execution modes
+
+- Notebook-first workflows: preferred for research and ad hoc experiments
+- Python API: best for calling one reconstruction method programmatically
+- `scripts/*.py`: best for repeatable local evaluation or full-scene batch runs
+
+## Public Python Interfaces
+
+### `src/__init__.py` exports
+
+| Export | Purpose | Notes |
+|---|---|---|
+| `reconstruct_nufrost(image, target_time, output_path=None, **kwargs)` | Run NUFROST on one cube | Returns `np.ndarray` with shape `(H, W)` |
+| `reconstruct_zhu2015(image, target_time, output_path=None, lasso_alpha=..., n_jobs=..., cache_dir=..., force_refresh=False)` | Run Zhu2015 on one cube | Returns shape `(2, H, W)` for prediction + QA |
+| `reconstruct_hants(image, target_time, output_path=None, nof=..., sf=..., fet=..., dod=..., n_jobs=..., cache_dir=..., force_refresh=False)` | Run HANTS on one cube | Returns shape `(H, W)` |
+| `RSCube(tif_path, cache_dir=None, force_refresh=False)` | Load TIFF/VRT inputs and cache them as NPZ | `load()` returns `cube`, `timestamps`, `band_names`, and metadata |
+| `build_args(overrides=None)` | Merge config values | Precedence: Python overrides > CLI flags > YAML defaults > dataclass fallbacks |
+| `Args` | Runtime config dataclass | Used across notebook and Python flows |
+
+### `src/full_scene_reconstruction/__init__.py` exports
+
+| Export | Purpose |
+|---|---|
+| `reconstruct_full_scene_for_location(...)` | Reconstruct all discovered bands for one `(lon, lat)` |
+| `reconstruct_full_scene_for_all_locations(...)` | Batch all discovered coordinates for a source |
+| `discover_available_locations(...)` | Find coordinates from filenames in `data/<source>/` |
+| `discover_location_band_stacks(...)` | Build per-band TIFF/VRT stacks for one location |
+| `choose_shared_target_timestamp(...)` | Pick a valid shared timestamp across selected bands |
+| `write_run_summary(...)` | Persist summary JSON for a reconstruction run |
+
+## Entry Points
+
+### Start here by task
+
+| Goal | Best entrypoint | Why |
+|---|---|---|
+| Explore or tune algorithms interactively | `notebooks/` | This repo is notebook-first |
+| Run one reconstruction from Python | `src.reconstruct_nufrost`, `src.reconstruct_zhu2015`, `src.reconstruct_hants` | Lowest ceremony |
+| Run local evaluation without a notebook | `python scripts/run_local_evals.py ...` | Wraps `run_local_evals_workflow()` |
+| Reconstruct a whole location across bands | `python scripts/run_full_scene_reconstruction.py ...` | Uses full-scene pipeline |
+| Run a cheap regression on a cropped scene | `python scripts/run_small_window_full_scene.py ... --window-size N` | Same pipeline, smaller window |
+
+### Script quick reference
+
+| Script | Main flags | Behavior |
+|---|---|---|
+| `scripts/run_local_evals.py` | `--source-name`, `--output-dir`, `--cache-dir`, `--max-images`, `--n-jobs`, `--run-ablation`, `--run-sparse`, `--run-gap`, `--run-repeatability` | Runs notebook-free evaluation sweeps and writes CSVs. `--source-name` is limited to `sentinel-2` or `hls` |
+| `scripts/run_full_scene_reconstruction.py` | `--source-name`, `--lon`, `--lat`, `--all-coordinates`, `--output-root`, `--data-root`, `--cache-dir`, `--methods`, `--n-jobs`, `--force-refresh` | Runs full-scene reconstruction for one location or all locations. Defaults: `data/`, `data/output/`, `data/cache/local/` |
+| `scripts/run_small_window_full_scene.py` | Same as full-scene script plus `--window-size` | Runs the full-scene pipeline on a cropped window |
+
+### Typical commands
+
+```bash
+python scripts/run_local_evals.py --source-name sentinel-2 --max-images 2 --n-jobs -1
+python scripts/run_full_scene_reconstruction.py --source-name sentinel-2 --lon 100.112 --lat 25.654 --methods nufrost hants zhu2015
+python scripts/run_small_window_full_scene.py --source-name sentinel-2 --lon 100.112 --lat 25.654 --window-size 512
 ```
 
-**Notebook uses streaming path only.** NPZ path exists for backward compat and `reconstruct_nufrost()` CLI.
+## Configuration Rules
 
-## Configuration Precedence
+- `build_args(overrides=...)` merges Python overrides on top of `config/config.yaml`
+- CLI parsing uses YAML values as parser defaults
+- If `target_time` is omitted, `build_args()` falls back to `start_time`
+- Important defaults live in `config/config.yaml`; `Args` is the code-level fallback
 
-Python overrides > CLI flags > YAML defaults > Args dataclass fallbacks.
+Known parameter mismatch to remember when reasoning about old code or direct function calls:
 
-**Known inconsistency:** `config.yaml` and `Args` dataclass differ on:
-- `ridge`: YAML=0.005, Args=1e-2, `fit_nufrost_pixel_params` signature=1e-2
-- `ignore_dc_hz`: YAML=1e-10, Args=1e-9
-- `num_peaks`: YAML=10, Args=8
+- `ridge`
+- `ignore_dc_hz`
+- `num_peaks`
 
-When using `build_args({})`, YAML wins. When calling `fit_nufrost_pixel_params` directly without passing `ridge_lam`, the function default (1e-2) wins.
+When using `build_args({})`, YAML wins. When calling low-level functions directly without passing overrides, the function signature or dataclass default may win instead.
 
-## Evaluation Pipeline (notebooks/local_evals.ipynb)
+## Outputs And Artifacts
 
-Four experiment stages per spatial/band chunk:
-1. **Ablation**: NUFROST variants (full, w/o preferred freqs, w/o parabolic, w/o Huber, w/o ridge, w/o trend) + baselines
-2. **Sparse sweep**: Vary number of random points (1000–20000)
-3. **Gap sweep**: Vary continuous gap length (derived from gap index targets)
-4. **Repeatability**: Repeat random + gap with different seeds
+- NUFROST and HANTS write single-band GeoTIFFs
+- Zhu2015 writes a 2-band GeoTIFF: prediction + QA
+- Full-scene scripts write outputs under `data/output/<source>_recon/<lon>_<lat>/`
+- Full-scene scripts also write run summaries under `data/output/run_summaries/`
+- Evaluation workflows append CSVs such as `sentinel-2_ablation_results.csv`, `*_sparse_sweep_results.csv`, `*_gap_sweep_results.csv`, and `*_repeatability_results.csv`
 
-**Checkpoint mechanism:** Results written incrementally to CSV. On restart, `load_done_keys()` skips completed (Image, Scenario, Variant) / (Image, NumPoints) / (Image, GapLength) tuples. No checkpoint for intermediate computation (random-point pool, gap candidates).
+### Full-scene naming rules
 
-## Key Parameters for Paper
+- Per-method scene output: `[<method>]_<source>_lon<lon6>_lat<lat6>_<target-time>.tif`
+- Ground truth output: `[ground_truth]_<source>_lon<lon6>_lat<lat6>_<target-time>.tif`
+- Run summary JSON: `data/output/run_summaries/reconstruction_summary_<source>_lon<lon6>_lat<lat6>_<target-time>.json`
 
-| Symbol | Parameter | Default | Location |
-|--------|-----------|---------|----------|
-| $\lambda$ | `ridge` / `ridge_lam` | 0.005 (YAML) | Eq.(7) |
-| $\gamma$ | `freq_weight` | 2.0 | Eq.(8) |
-| $\delta$ | `huber_delta` | 1.5 | Eq.(5) |
-| — | `huber_iters` | 3 | IRLS iterations |
-| $\eta$ | `power_cum` | 0.7 | Cumulative energy threshold |
-| $\epsilon_{tol}$ | `spectral_merge_tol` | 0.15 | Frequency snapping tolerance |
-| $\nu_{min}$ | `ignore_dc_hz` | 1e-10 (YAML) | Min frequency threshold |
-| — | `preferred_periods_days` | "365.25,182.625,91.3125,30.4375" | Annual/semi/seasonal/monthly |
-| — | `min_obs` | 12 | Min valid observations per pixel |
+## One Good Example
 
-## Output Shapes
+Use this pattern when you want one programmatic reconstruction and do not need the notebook or full-scene pipeline:
 
-- NUFROST / HANTS: single-band GeoTIFF
-- Zhu2015: 2-band GeoTIFF (prediction + QA)
+```python
+from src.data_loader import find_image_chunks
+import src
 
-## Testing
+image_paths = find_image_chunks(
+    data_dir="data/hls",
+    lon=91.2734,
+    lat=29.7904,
+    band="BLUE",
+    cache_dir="data/cache/local",
+)
 
-- Only `tests/test_data_loader.py` exists; hardcodes local absolute paths and contains `breakpoint()`
-- Do NOT assume `pytest tests/` is a clean smoke test on another machine
-- No lint, formatter, typecheck, or CI config exists
+recon = src.reconstruct_nufrost(
+    image=image_paths,
+    target_time="2023-06-15T00:00:00",
+    output_path="data/output/example_nufrost.tif",
+    cache_dir="data/cache/local",
+    n_jobs=-1,
+)
+```
+
+`find_image_chunks()` returns a `List[str]`, usually a one-element list containing the final VRT path. Do not treat it as a single string in prose or code review.
+
+## Common Mistakes
+
+- Assuming this repo is CLI-first. It is notebook-first.
+- Treating Zhu2015 or HANTS as internal stages of NUFROST.
+- Forgetting that Zhu2015 output has two bands.
+- Assuming `pytest tests/` is a reliable unattended smoke test. It is not.
+- Treating `find_image_chunks()` as a single path instead of a list.
+- Forgetting that `RSCube.load()` caches full cubes, while evaluation and full-scene paths often use streaming reads.
+- Forgetting `--lon` and `--lat` are required for `run_full_scene_reconstruction.py` unless `--all-coordinates` is set.
+
+## Environment And Testing Notes
+
+- Preferred environment file is `environment.yml` (`conda env create -f environment.yml`, env name `geo-science`)
+- `requirements.txt` is only the minimal runtime set, not the full notebook stack
+- There is no lint, formatter, typecheck, or CI config in the repo
+- The checked-in test coverage is minimal and loader-focused
+
+### Environment setup
+
+```bash
+conda env create -f environment.yml
+conda activate geo-science
+```
+
+Use `pip install -r requirements.txt` only when the notebook and Earth Engine dependencies are not needed.

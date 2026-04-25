@@ -83,10 +83,13 @@ def fit_hants_pixel_params(
     if np.sum(valid_mask) == 0:
         return params
 
-    t_curr = t[valid_mask]
-    y_curr = y[valid_mask]
+    t_curr = t[valid_mask].copy()
+    y_curr = y[valid_mask].copy()
     freqs = [i / period for i in range(1, nof)]
     num_params = 1 + 2 * (nof - 1)
+
+    if len(y_curr) < num_params + dod:
+        return params
 
     coeffs = None
     max_iter = len(y_curr)
@@ -118,6 +121,9 @@ def fit_hants_pixel_params(
         t_curr = t_curr[mask_keep]
         y_curr = y_curr[mask_keep]
 
+    if len(y_curr) < num_params + dod:
+        return params
+
     if coeffs is None:
         coeffs = _fit_hants_coeffs(t_curr, y_curr, freqs)
     if coeffs is None:
@@ -140,21 +146,31 @@ def predict_hants_from_params(params: Dict[str, Any], target_t: float) -> float:
 
 
 def predict_hants_curve_from_params(params: Dict[str, Any], target_t_array: np.ndarray) -> np.ndarray:
-    return np.array([predict_hants_from_params(params, float(target_t)) for target_t in target_t_array], dtype=np.float64)
+    if not bool(params.get("valid", False)):
+        fill = float(params.get("fill_value", np.nan))
+        return np.full(len(target_t_array), fill, dtype=np.float64)
+
+    coeffs = np.asarray(params["coeffs"], dtype=np.float64)
+    nof = int(params["nof"])
+    period = float(params["period"])
+    freqs = [i / period for i in range(1, nof)]
+    X = make_harmonic_matrix(np.asarray(target_t_array, dtype=np.float64), freqs)
+    return (X @ coeffs[: X.shape[1]]).astype(np.float64)
 
 def make_harmonic_matrix(t: np.ndarray, frequencies: List[float]) -> np.ndarray:
-    """
-    Construct design matrix for harmonic analysis.
-    """
-    cols = []
-    cols.append(np.ones_like(t))
+    n_freqs = sum(1 for f in frequencies if f != 0)
+    ncols = 1 + 2 * n_freqs
+    out = np.empty((len(t), ncols), dtype=np.float64)
+    out[:, 0] = 1.0
+    col = 1
     for f in frequencies:
         if f == 0:
             continue
         w = 2 * np.pi * f
-        cols.append(np.cos(w * t))
-        cols.append(np.sin(w * t))
-    return np.column_stack(cols)
+        np.cos(w * t, out=out[:, col])
+        np.sin(w * t, out=out[:, col + 1])
+        col += 2
+    return out
 
 def hants_pixel(
     t: np.ndarray,
