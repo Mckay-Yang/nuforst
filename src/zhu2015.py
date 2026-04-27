@@ -371,6 +371,8 @@ def predict_zhu2015_from_params(params: Dict[str, Any], target_t_day: float) -> 
         row[2 * k - 1] = np.sin(k * w * target_t_day)
     row[-1] = target_t_day
     pred = float(intercepts[seg_idx] + row @ coeffs[seg_idx])
+    if pred < 0.0:
+        pred = 0.0
     return pred, qa
 
 def predict_target(segments: List[Dict[str, Any]], t_days: np.ndarray, target_t_day: float) -> Tuple[float, int]:
@@ -384,7 +386,7 @@ def predict_target(segments: List[Dict[str, Any]], t_days: np.ndarray, target_t_
                 return seg['median_val'], qa
             else:
                 pred = seg['clf'].predict(make_design_matrix(np.array([target_t_day]), seg['order']))[0]
-                return pred, qa
+                return max(0.0, pred), qa
 
     if target_t_day < t_days[segments[0]['start_idx']]:
         seg = segments[0]
@@ -393,7 +395,7 @@ def predict_target(segments: List[Dict[str, Any]], t_days: np.ndarray, target_t_
             return seg['median_val'], qa
         else:
             pred = seg['clf'].predict(make_design_matrix(np.array([target_t_day]), seg['order']))[0]
-            return pred, qa
+            return max(0.0, pred), qa
 
     seg = segments[-1]
     qa = 2 * 10 + seg['unit_qa']
@@ -401,7 +403,7 @@ def predict_target(segments: List[Dict[str, Any]], t_days: np.ndarray, target_t_
         return seg['median_val'], qa
     else:
         pred = seg['clf'].predict(make_design_matrix(np.array([target_t_day]), seg['order']))[0]
-        return pred, qa
+        return max(0.0, pred), qa
 
 def fit_predict_pixel(
     t_days: np.ndarray,
@@ -429,7 +431,7 @@ def reconstruct_zhu2015(
     image: Union[str, Path],
     target_time: str,
     output_path: Optional[Union[str, Path]] = None,
-    lasso_alpha: float = 0.0001,
+    lasso_alpha: float = 0.001,
     n_jobs: int = -1,
     cache_dir: Union[str, Path] = "data/cache/local",
     force_refresh: bool = False

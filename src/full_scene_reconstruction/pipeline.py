@@ -451,7 +451,7 @@ def reconstruct_zhu2015_from_cube(
     timestamps: Sequence[str],
     target_time: str,
     *,
-    lasso_alpha: float = 0.0001,
+    lasso_alpha: float = 0.001,
     n_jobs: int = -1,
 ) -> np.ndarray:
     target_dt = _parse_target_datetime(target_time)

@@ -128,3 +128,19 @@ def test_break_detection_five_consecutive_no_break() -> None:
 
     segments = extract_segments(t_days, y)
     assert len(segments) == 1
+
+
+def test_prediction_is_clamped_to_nonnegative() -> None:
+    np.random.seed(42)
+    t_days = np.arange(50, dtype=np.float64) * 16
+    y_mean = 0.02
+    y = y_mean + np.random.randn(50).astype(np.float64) * 0.005
+    y += -0.0005 * t_days
+
+    params = fit_zhu2015_pixel_params(t_days, y)
+    assert params["valid"] is True
+
+    future_t = float(t_days[-1] + 5000)
+    pred, qa = predict_zhu2015_from_params(params, target_t_day=future_t)
+    assert pred >= 0.0
+    assert qa // 10 == 2

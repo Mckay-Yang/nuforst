@@ -246,16 +246,24 @@ def select_peaks_adaptive(f_pos: np.ndarray, P_pos: np.ndarray, k_max: int, powe
     return idx_sorted[:take]
 
 def design_matrix(t: np.ndarray, freqs: Union[Sequence[float], np.ndarray], include_trend: bool = True, include_dc: bool = True) -> np.ndarray:
-    cols = []
+    n = len(t)
+    ncols = int(include_dc) + int(include_trend) + 2 * len(freqs)
+    if ncols == 0:
+        return np.empty((n, 0))
+    X = np.empty((n, ncols), dtype=np.float64)
+    col = 0
     if include_dc:
-        cols.append(np.ones_like(t))
+        X[:, col] = 1.0
+        col += 1
     if include_trend:
-        cols.append(t - t.mean())
+        X[:, col] = t - t.mean()
+        col += 1
     for f in freqs:
-        w = 2*np.pi*f
-        cols.append(np.cos(w*t))
-        cols.append(np.sin(w*t))
-    return np.vstack(cols).T if cols else np.empty((len(t),0))
+        w = 2 * np.pi * f
+        np.cos(w * t, out=X[:, col])
+        np.sin(w * t, out=X[:, col + 1])
+        col += 2
+    return X
 
 def huber_weights(r: np.ndarray, delta: float) -> np.ndarray:
     a = np.abs(r)
@@ -336,11 +344,15 @@ def robust_fit_freq_ridge(X: np.ndarray, y: np.ndarray, freqs: np.ndarray, lam: 
     y_hat = np.zeros_like(y)
     for _ in range(max(0, iters)):
         r = y - y_hat
-        w = huber_weights(r, max(1e-8, delta))
+        w_new = huber_weights(r, max(1e-8, delta))
+        if np.max(np.abs(w_new - w)) < 1e-4:
+            w = w_new
+            break
+        w = w_new
         _, y_hat = ridge_with_freq_weights(X, y, freqs, lam,
-                                           include_dc, include_trend, freq_weight, w=w)
+                                            include_dc, include_trend, freq_weight, w=w)
     beta, y_hat = ridge_with_freq_weights(X, y, freqs, lam,
-                                          include_dc, include_trend, freq_weight, w=w)
+                                           include_dc, include_trend, freq_weight, w=w)
     return beta, y_hat
 
 
@@ -362,6 +374,7 @@ def fit_nufrost_pixel_params(t_sec: np.ndarray, y: np.ndarray, target_t: Optiona
         "t_min": np.nan,
         "t_rel_mean": np.nan,
         "fill_value": np.nan,
+        "y_scale": 1.0,
         "freqs": np.full(max_freqs, np.nan, dtype=np.float64),
         "beta": np.full(beta_size, np.nan, dtype=np.float64),
     }
@@ -373,6 +386,12 @@ def fit_nufrost_pixel_params(t_sec: np.ndarray, y: np.ndarray, target_t: Optiona
     yy = np.asarray(y[m], dtype=np.float64)
     params["fill_value"] = float(np.nanmean(yy))
 
+    y_scale = max(float(np.median(np.abs(yy[np.isfinite(yy)]))), 1e-6) if np.any(np.isfinite(yy)) else 1.0
+    if y_scale < 1e-6:
+        y_scale = 1.0
+    params["y_scale"] = y_scale
+    yy_scaled = yy / y_scale
+
     t_rel = _to_seconds_since_start(t)
     t_rel_mean = float(t_rel.mean())
     Tspan = float(t_rel.max() - t_rel.min())
@@ -381,7 +400,7 @@ def fit_nufrost_pixel_params(t_sec: np.ndarray, y: np.ndarray, target_t: Optiona
 
     x = 2 * np.pi * (t_rel - t_rel.min()) / Tspan - np.pi
     x = np.ascontiguousarray(x, dtype=np.float64)
-    c = np.ascontiguousarray(yy.astype(np.complex128))
+    c = np.ascontiguousarray(yy_scaled.astype(np.complex128))
     ms = next_even(nufft_modes)
     Fk = finufft.nufft1d1(x, c, ms, eps=eps, isign=-1)
     k = np.arange(-ms // 2, ms // 2, dtype=np.int64)
@@ -413,9 +432,9 @@ def fit_nufrost_pixel_params(t_sec: np.ndarray, y: np.ndarray, target_t: Optiona
     )
     freqs_sel = np.asarray(freqs_sel[:max_freqs], dtype=np.float64)
     X = design_matrix(t_rel, freqs_sel, include_trend=include_trend, include_dc=True)
-    beta, _ = robust_fit_freq_ridge(
+    beta_scaled, _ = robust_fit_freq_ridge(
         X,
-        yy,
+        yy_scaled,
         freqs_sel,
         lam=ridge_lam,
         iters=huber_iters,
@@ -431,7 +450,7 @@ def fit_nufrost_pixel_params(t_sec: np.ndarray, y: np.ndarray, target_t: Optiona
     params["t_rel_mean"] = t_rel_mean
     if len(freqs_sel) > 0:
         params["freqs"][: len(freqs_sel)] = freqs_sel
-    params["beta"][: len(beta)] = beta
+    params["beta"][: len(beta_scaled)] = beta_scaled
     return params
 
 
@@ -443,18 +462,52 @@ def predict_nufrost_from_params(params: Dict[str, Any], target_t: float) -> floa
     freqs = np.asarray(params["freqs"], dtype=np.float64)[:n_freqs]
     beta = np.asarray(params["beta"], dtype=np.float64)
     t_star_rel = float(target_t - float(params["t_min"]))
-    cols = [1.0]
+    ncols = 1 + int(include_trend) + 2 * n_freqs
+    row = np.empty(ncols, dtype=np.float64)
+    row[0] = 1.0
+    col = 1
     if include_trend:
-        cols.append(t_star_rel - float(params["t_rel_mean"]))
+        row[col] = t_star_rel - float(params["t_rel_mean"])
+        col += 1
     for f in freqs:
         w = 2 * np.pi * f
-        cols.append(math.cos(w * t_star_rel))
-        cols.append(math.sin(w * t_star_rel))
-    return float(np.asarray(cols, dtype=np.float64) @ beta[: len(cols)])
+        row[col] = math.cos(w * t_star_rel)
+        row[col + 1] = math.sin(w * t_star_rel)
+        col += 2
+    pred = float(row @ beta[:ncols])
+    pred = pred * float(params.get("y_scale", 1.0))
+    if pred < 0.0:
+        pred = 0.0
+    return pred
 
 
 def predict_nufrost_curve_from_params(params: Dict[str, Any], target_t_secs: np.ndarray) -> np.ndarray:
-    return np.array([predict_nufrost_from_params(params, float(target_t)) for target_t in target_t_secs], dtype=np.float64)
+    if not bool(params.get("valid", False)):
+        fill = float(params.get("fill_value", np.nan))
+        return np.full(len(target_t_secs), fill, dtype=np.float64)
+
+    include_trend = bool(params["include_trend"])
+    n_freqs = int(params["n_freqs_used"])
+    freqs = np.asarray(params["freqs"], dtype=np.float64)[:n_freqs]
+    beta = np.asarray(params["beta"], dtype=np.float64)
+    t_star_rel = np.asarray(target_t_secs, dtype=np.float64) - float(params["t_min"])
+    n = len(target_t_secs)
+    ncols = 1 + int(include_trend) + 2 * n_freqs
+    X = np.empty((n, ncols), dtype=np.float64)
+    X[:, 0] = 1.0
+    col = 1
+    if include_trend:
+        X[:, col] = t_star_rel - float(params["t_rel_mean"])
+        col += 1
+    for i in range(n_freqs):
+        w = 2 * np.pi * freqs[i]
+        np.cos(w * t_star_rel, out=X[:, col])
+        np.sin(w * t_star_rel, out=X[:, col + 1])
+        col += 2
+    pred = (X @ beta[:ncols]).astype(np.float64)
+    pred = pred * float(params.get("y_scale", 1.0))
+    pred = np.clip(pred, 0.0, None)
+    return pred
 
 def predict_single_pixel(t_sec: np.ndarray, y: np.ndarray, target_t: float,
                          nufft_modes: int, eps: float,
