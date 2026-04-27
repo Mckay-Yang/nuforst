@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -601,6 +602,7 @@ def reconstruct_full_scene_for_location(
 
     output_map: Dict[str, Dict[str, str]] = {method: {} for method in methods}
     merged_prediction_map: Dict[str, str] = {}
+    timing_seconds: Dict[str, Dict[str, float]] = {method: {} for method in methods}
     mask_indices: Dict[str, int] = {}
     counts_before: Dict[str, int] = {}
     counts_after: Dict[str, int] = {}
@@ -632,6 +634,7 @@ def reconstruct_full_scene_for_location(
         for method_name in methods:
             _log("reconstruct_full_scene_for_location", f"Band {band_name}: running {method_name}")
             output_path = build_output_path(output_root=output_root, method_name=method_name, source_file=stack_paths[0], target_time=target_time, source_name=source_name, lon=lon, lat=lat)
+            t0 = time.perf_counter()
             if method_name == "nufrost":
                 args = build_args(dict(build_nufrost_args))
                 prediction = nufrost_core(masked_cube, masked_timestamps, target_time, args=args)
@@ -641,6 +644,9 @@ def reconstruct_full_scene_for_location(
                 prediction = reconstruct_zhu2015_from_cube(masked_cube, masked_timestamps, target_time, n_jobs=n_jobs)
             else:
                 raise ValueError(f"Unsupported method: {method_name}")
+            elapsed = time.perf_counter() - t0
+            timing_seconds[method_name][band_name] = elapsed
+            _log("reconstruct_full_scene_for_location", f"Band {band_name} / {method_name}: {elapsed:.1f}s")
 
             prediction_2d = extract_prediction_2d(method_name, prediction)
             _write_prediction(output_path, prediction_2d, data)
@@ -693,6 +699,7 @@ def reconstruct_full_scene_for_location(
         "late_fraction": late_fraction,
         "merged_prediction_outputs": merged_prediction_map,
         "ground_truth_output": str(gt_path),
+        "timing_seconds": timing_seconds,
         "window_size": window_size,
     }
     summary_path = write_run_summary(output_root, payload)
