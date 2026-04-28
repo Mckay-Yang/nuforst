@@ -1,10 +1,9 @@
 import numpy as np
 import pandas as pd
-from typing import Any, Dict, Tuple, Optional, Union, List
+from typing import Tuple, Optional, Union, List, Any, Dict as DictType
 from .data_loader import RSCube
 from .nufrost import timestamps_to_seconds
 from config import Args, build_args
-from .logger import log as _log
 import rasterio
 from pathlib import Path
 from tqdm import tqdm
@@ -13,209 +12,158 @@ from joblib import Parallel, delayed, cpu_count
 # Constants
 DAYS_PER_YEAR = 365.25
 
-
-def _apply_hants_valid_mask(
-    y: np.ndarray,
-    sf: str,
-    idrt: Optional[float],
-) -> np.ndarray:
-    """
-    Build the validity mask used by HANTS.
-
-    Notes
-    -----
-    Roerink et al. (2000) describe IDRT as an *invalid data rejection*
-    threshold. In their NDVI example, with ``sf='low'`` they still reject very
-    high values (IDRT = 0.7). This means IDRT works in the opposite direction
-    of the suppression flag:
-
-    - ``sf='low'``  -> reject implausibly high values above IDRT
-    - ``sf='high'`` -> reject implausibly low values below IDRT
-    """
-    valid_mask = np.isfinite(y)
-    if idrt is None:
-        return valid_mask
-
-    if sf == 'low':
-        valid_mask &= (y <= idrt)
-    elif sf == 'high':
-        valid_mask &= (y >= idrt)
-    else:
-        valid_mask &= np.isfinite(y)
-
-    return valid_mask
-
-
-def _fit_hants_coeffs(
-    t_curr: np.ndarray,
-    y_curr: np.ndarray,
-    freqs: List[float],
-) -> Optional[np.ndarray]:
-    if len(y_curr) == 0:
-        return None
-    X = make_harmonic_matrix(t_curr, freqs)
-    if X.shape[0] < X.shape[1]:
-        return None
-    coeffs, _, _, _ = np.linalg.lstsq(X, y_curr, rcond=None)
-    return coeffs
-
-
-def fit_hants_pixel_params(
-    t: np.ndarray,
-    y: np.ndarray,
-    nof: int = 3,
-    sf: str = 'low',
-    idrt: float = None,
-    fet: float = 0.05,
-    dod: int = 5,
-    period: float = 365.25,
-) -> Dict[str, Any]:
-    coeff_count = 1 + 2 * max(0, nof - 1)
-    params: Dict[str, Any] = {
-        "valid": False,
-        "nof": int(nof),
-        "period": float(period),
-        "coeffs": np.full(coeff_count, np.nan, dtype=np.float64),
-        "fill_value": float(np.nanmedian(y)) if np.isfinite(y).any() else np.nan,
-    }
-
-    valid_mask = _apply_hants_valid_mask(y, sf=sf, idrt=idrt) & np.isfinite(t)
-    if np.sum(valid_mask) == 0:
-        return params
-
-    t_curr = t[valid_mask].copy()
-    y_curr = y[valid_mask].copy()
-    freqs = [i / period for i in range(1, nof)]
-    num_params = 1 + 2 * (nof - 1)
-
-    if len(y_curr) < num_params + dod:
-        return params
-
-    coeffs = None
-    max_iter = len(y_curr)
-    for _ in range(max_iter):
-        n_obs = len(y_curr)
-        if n_obs < num_params + dod:
-            break
-
-        X = make_harmonic_matrix(t_curr, freqs)
-        coeffs, _, _, _ = np.linalg.lstsq(X, y_curr, rcond=None)
-        y_pred_curr = X @ coeffs
-        residuals = y_curr - y_pred_curr
-
-        if sf == 'low':
-            worst_idx = np.argmin(residuals)
-            has_bad = residuals[worst_idx] < -fet
-        elif sf == 'high':
-            worst_idx = np.argmax(residuals)
-            has_bad = residuals[worst_idx] > fet
-        else:
-            worst_idx = np.argmax(np.abs(residuals))
-            has_bad = np.abs(residuals)[worst_idx] > fet
-
-        if not has_bad:
-            break
-
-        mask_keep = np.ones(n_obs, dtype=bool)
-        mask_keep[worst_idx] = False
-        t_curr = t_curr[mask_keep]
-        y_curr = y_curr[mask_keep]
-
-    if len(y_curr) < num_params + dod:
-        return params
-
-    if coeffs is None:
-        coeffs = _fit_hants_coeffs(t_curr, y_curr, freqs)
-    if coeffs is None:
-        return params
-
-    params["valid"] = True
-    params["coeffs"][: len(coeffs)] = coeffs
-    return params
-
-
-def predict_hants_from_params(params: Dict[str, Any], target_t: float) -> float:
-    if not bool(params.get("valid", False)):
-        return float(params.get("fill_value", np.nan))
-    coeffs = np.asarray(params["coeffs"], dtype=np.float64)
-    nof = int(params["nof"])
-    period = float(params["period"])
-    freqs = [i / period for i in range(1, nof)]
-    X_target = make_harmonic_matrix(np.array([target_t], dtype=np.float64), freqs)
-    return float((X_target @ coeffs[: X_target.shape[1]])[0])
-
-
-def predict_hants_curve_from_params(params: Dict[str, Any], target_t_array: np.ndarray) -> np.ndarray:
-    if not bool(params.get("valid", False)):
-        fill = float(params.get("fill_value", np.nan))
-        return np.full(len(target_t_array), fill, dtype=np.float64)
-
-    coeffs = np.asarray(params["coeffs"], dtype=np.float64)
-    nof = int(params["nof"])
-    period = float(params["period"])
-    freqs = [i / period for i in range(1, nof)]
-    X = make_harmonic_matrix(np.asarray(target_t_array, dtype=np.float64), freqs)
-    return (X @ coeffs[: X.shape[1]]).astype(np.float64)
-
 def make_harmonic_matrix(t: np.ndarray, frequencies: List[float]) -> np.ndarray:
-    n_freqs = sum(1 for f in frequencies if f != 0)
-    ncols = 1 + 2 * n_freqs
-    out = np.empty((len(t), ncols), dtype=np.float64)
-    out[:, 0] = 1.0
-    col = 1
+    """
+    Construct design matrix for harmonic analysis.
+    t: time points (e.g. days)
+    frequencies: list of frequencies to fit (e.g. [1, 2] for annual and semi-annual if t in years)
+                 Or if t is in days, frequencies might be [1/365.25, 2/365.25].
+
+    The paper says: "NOF... define how many frequencies are used and how large their corresponding period... is"
+    Usually NOF=3 implies: Mean (freq=0), Annual, Semi-annual.
+
+    We'll assume t is in DAYS.
+    Base frequency w = 2 * pi / T.
+    The paper uses specific periods.
+    """
+    cols = []
+    # Mean (Frequency 0) is handled by intercept or column of ones
+    cols.append(np.ones_like(t))
+
     for f in frequencies:
         if f == 0:
             continue
+        # Omega = 2 * pi * f
+        # If f is "1 cycle per year" and t is days: f = 1/365.25
         w = 2 * np.pi * f
-        np.cos(w * t, out=out[:, col])
-        np.sin(w * t, out=out[:, col + 1])
-        col += 2
-    return out
+        cols.append(np.cos(w * t))
+        cols.append(np.sin(w * t))
+
+    return np.column_stack(cols)
 
 def hants_pixel(
     t: np.ndarray,
     y: np.ndarray,
     target_t: float,
-    nof: int = 3,
-    sf: str = 'low',
-    idrt: float = None,
-    fet: float = 0.05,
-    dod: int = 5,
+    nof: int = 3, # Number of frequencies. 3 means: 0, 1/T, 2/T
+    sf: str = 'low', # 'low' means reject low values (e.g. clouds in NDVI)
+    idrt: float = None, # Invalid data rejection threshold
+    fet: float = 0.05, # Fit error tolerance
+    dod: int = 5, # Degree of overdeterminedness
     period: float = 365.25
 ) -> float:
     """
     Apply HANTS algorithm to a single pixel.
     """
-    params = fit_hants_pixel_params(t, y, nof=nof, sf=sf, idrt=idrt, fet=fet, dod=dod, period=period)
-    return predict_hants_from_params(params, target_t)
+    # 1. Initial valid data check
+    valid_mask = np.isfinite(y)
+    if idrt is not None:
+        if sf == 'low':
+            valid_mask &= (y > idrt)
+        elif sf == 'high':
+            valid_mask &= (y < idrt)
 
-def hants_curve_pixel(
-    t: np.ndarray,
-    y: np.ndarray,
-    target_t_array: np.ndarray,
-    nof: int = 3,
-    sf: str = 'low',
-    idrt: float = None,
-    fet: float = 0.05,
-    dod: int = 5,
-    period: float = 365.25
-) -> np.ndarray:
-    """
-    Apply HANTS algorithm to a single pixel and predict for an array of times.
-    """
-    params = fit_hants_pixel_params(t, y, nof=nof, sf=sf, idrt=idrt, fet=fet, dod=dod, period=period)
-    return predict_hants_curve_from_params(params, target_t_array)
+    if np.sum(valid_mask) == 0:
+        return np.nan
+
+    t_curr = t[valid_mask]
+    y_curr = y[valid_mask]
+
+    # 2. Setup frequencies
+    # NOF includes 0 freq. If NOF=3, we use freq 0, 1/period, 2/period
+    freqs = [i / period for i in range(1, nof)] # 0 is handled by intercept column
+
+    # Number of parameters: 1 (mean) + 2 * (NOF-1)
+    # Paper: 2 * NOF - 1. (NOF includes zero).
+    # e.g. NOF=3 -> Mean, Amp1, Ph1, Amp2, Ph2 -> 5 params.
+    # 1 + 2*(3-1) = 5. Correct.
+    num_params = 1 + 2 * (nof - 1)
+
+    # Iteration
+    max_iter = 20 # Safety break
+    for _ in range(max_iter):
+        n_obs = len(y_curr)
+        if n_obs < num_params + dod:
+            # Not enough points
+            break
+
+        # Build Matrix
+        X = make_harmonic_matrix(t_curr, freqs)
+
+        # Fit Least Squares
+        # lstsq returns: x, residuals, rank, s
+        coeffs, _, _, _ = np.linalg.lstsq(X, y_curr, rcond=None)
+
+        # Calculate fit values for CURRENT points to check outliers
+        y_pred_curr = X @ coeffs
+        residuals = y_curr - y_pred_curr
+
+        # Check outliers
+        # SF = 'low' means reject low values. Low values have y_curr < y_pred => residual < 0
+        # Paper: "large positive or negative deviation ... removed"
+        # Paper (Sec 2): "Hi/Lo suppression flag (SF)... indicates whether high or low values (outliers) should be rejected"
+        # Example: "SF = low; ... cloudy observations lead to low NDVI values."
+        # This implies we reject points where y_obs is significantly LOWER than y_fit.
+        # i.e. residual (y_obs - y_fit) is large NEGATIVE.
+
+        candidates_to_reject = np.zeros(n_obs, dtype=bool)
+
+        if sf == 'low':
+            # Reject if y_obs is too low -> residual is negative and magnitude > FET
+            # Paper: "absolute difference in the Hi/Lo direction ... determined"
+            # "Iteration stops when the difference of all remaining points becomes smaller than the FET"
+            diffs = residuals
+            # We care about negative residuals
+            bad_indices = (diffs < -fet)
+        elif sf == 'high':
+            # Reject if y_obs is too high -> residual is positive and > FET
+            diffs = residuals
+            bad_indices = (diffs > fet)
+        else:
+            # Reject both? Paper implies one direction usually.
+            # "HANTS cannot reject outliers in the opposite direction of the SF"
+            bad_indices = (np.abs(residuals) > fet)
+
+        if not np.any(bad_indices):
+            # Convergence: No points exceed FET in the specified direction
+            break
+
+        # Identify the WORST outlier to remove? Or all?
+        # Paper says: "Input data points that have a large ... deviation ... are removed".
+        # Usually HANTS removes *all* outliers outside tolerance in one step?
+        # Or one by one?
+        # "After recalculation ... the procedure is repeated".
+        # Let's remove all that violate FET.
+
+        mask_keep = ~bad_indices
+        t_curr = t_curr[mask_keep]
+        y_curr = y_curr[mask_keep]
+
+    # Final Prediction
+    # If loop finished or broke, we use the last coeffs.
+    # Need to handle case where loop breaks due to low N *before* computing coeffs?
+    # Actually we compute coeffs at start of loop.
+
+    # If we exited loop because N < limit, we might want to use the LAST valid fit?
+    # But if N < limit initially?
+    if 'coeffs' not in locals():
+        return np.nan
+
+    X_target = make_harmonic_matrix(np.array([target_t]), freqs)
+    y_target = (X_target @ coeffs)[0]
+
+    return y_target
 
 def reconstruct_hants(
-    image: Union[str, Path],
+    image: str,
     target_time: str,
-    output_path: Optional[Union[str, Path]] = None,
+    output_path: Optional[str] = None,
     nof: int = 3,
     sf: str = 'low',
     fet: float = 0.05,
     dod: int = 5,
     n_jobs: int = -1,
-    cache_dir: Union[str, Path] = "data/cache/local",
+    cache_dir: str = "./cache",
     force_refresh: bool = False
 ) -> np.ndarray:
     """
@@ -231,7 +179,7 @@ def reconstruct_hants(
     # 1. Load Data
     loader = RSCube(image, cache_dir=cache_dir, force_refresh=force_refresh)
     data = loader.load()
-    cube = np.ma.filled(data["cube"], np.nan)
+    cube = data["cube"]
     timestamps = data["timestamps"]
 
     # 2. Prepare Time
@@ -254,7 +202,7 @@ def reconstruct_hants(
     if n_jobs <= 0:
         n_jobs = cpu_count()
 
-    _log("reconstruct_hants", f"Reconstructing {image} at {target_time} (NOF={nof}, SF={sf}, FET={fet})")
+    print(f"[HANTS] Reconstructing {image} at {target_time} (NOF={nof}, SF={sf}, FET={fet})...")
 
     def _process_row(i):
         row_pred = np.full(W, np.nan, dtype=np.float32)
@@ -294,6 +242,103 @@ def reconstruct_hants(
             transform=transform,
         ) as dst:
             dst.write(out, 1)
-        _log("reconstruct_hants", f"Saved to: {out_p}")
+        print(f"[Success] Saved to: {out_p}")
 
     return out
+
+
+# ── Compatibility bridge ──
+
+
+def _apply_hants_valid_mask(y, sf, idrt):
+    valid_mask = np.isfinite(y)
+    if idrt is None:
+        return valid_mask
+    if sf == 'low':
+        valid_mask &= (y > idrt)
+    elif sf == 'high':
+        valid_mask &= (y < idrt)
+    else:
+        valid_mask &= np.isfinite(y)
+    return valid_mask
+
+
+def _fit_hants_coeffs(t_curr, y_curr, freqs):
+    if len(y_curr) == 0:
+        return None
+    X = make_harmonic_matrix(t_curr, freqs)
+    if X.shape[0] < X.shape[1]:
+        return None
+    coeffs, _, _, _ = np.linalg.lstsq(X, y_curr, rcond=None)
+    return coeffs
+
+
+def fit_hants_pixel_params(t, y, nof=3, sf='low', idrt=None, fet=0.05, dod=5, period=365.25):
+    coeff_count = 1 + 2 * max(0, nof - 1)
+    params = {
+        "valid": False, "nof": int(nof), "period": float(period),
+        "coeffs": np.full(coeff_count, np.nan, dtype=np.float64),
+        "fill_value": float(np.nanmedian(y)) if np.isfinite(y).any() else np.nan,
+    }
+    freqs = [i / period for i in range(1, nof)]
+    num_params = 1 + 2 * (nof - 1)
+
+    valid_mask = np.isfinite(y)
+    if idrt is not None:
+        if sf == 'low':
+            valid_mask &= (y > idrt)
+        elif sf == 'high':
+            valid_mask &= (y < idrt)
+    if np.sum(valid_mask) == 0:
+        return params
+
+    t_curr = t[valid_mask].copy()
+    y_curr = y[valid_mask].copy()
+    coeffs = None
+    max_iter = 20
+    for _ in range(max_iter):
+        n_obs = len(y_curr)
+        if n_obs < num_params + dod:
+            break
+        X = make_harmonic_matrix(t_curr, freqs)
+        coeffs, _, _, _ = np.linalg.lstsq(X, y_curr, rcond=None)
+        y_pred_curr = X @ coeffs
+        residuals = y_curr - y_pred_curr
+        if sf == 'low':
+            bad_indices = residuals < -fet
+        elif sf == 'high':
+            bad_indices = residuals > fet
+        else:
+            bad_indices = np.abs(residuals) > fet
+        if not np.any(bad_indices):
+            break
+        mask_keep = ~bad_indices
+        t_curr = t_curr[mask_keep]
+        y_curr = y_curr[mask_keep]
+    if coeffs is None:
+        coeffs = _fit_hants_coeffs(t_curr, y_curr, freqs)
+    if coeffs is None:
+        return params
+    params["valid"] = True
+    params["coeffs"][:len(coeffs)] = coeffs
+    return params
+
+
+def predict_hants_from_params(params, target_t):
+    if not bool(params.get("valid", False)):
+        return float(params.get("fill_value", np.nan))
+    coeffs = np.asarray(params["coeffs"], dtype=np.float64)
+    nof = int(params["nof"])
+    period = float(params["period"])
+    freqs = [i / period for i in range(1, nof)]
+    X_target = make_harmonic_matrix(np.array([target_t], dtype=np.float64), freqs)
+    return float((X_target @ coeffs[:X_target.shape[1]])[0])
+
+
+def predict_hants_curve_from_params(params, target_t_array):
+    return np.array([predict_hants_from_params(params, float(t)) for t in target_t_array], dtype=np.float64)
+
+
+def hants_curve_pixel(t, y, target_t_array, nof=3, sf='low', idrt=None, fet=0.05, dod=5, period=365.25):
+    params = fit_hants_pixel_params(t, y, nof=nof, sf=sf, idrt=idrt, fet=fet, dod=dod, period=period)
+    return predict_hants_curve_from_params(params, target_t_array)

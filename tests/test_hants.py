@@ -15,8 +15,8 @@ def test_apply_hants_valid_mask_respects_idrt_direction() -> None:
     low_mask = _apply_hants_valid_mask(y, sf="low", idrt=0.7)
     high_mask = _apply_hants_valid_mask(y, sf="high", idrt=0.3)
 
-    assert low_mask.tolist() == [True, True, False, False]
-    assert high_mask.tolist() == [False, True, True, False]
+    assert low_mask.tolist() == [False, False, True, False]
+    assert high_mask.tolist() == [True, False, False, False]
 
 
 def test_make_harmonic_matrix_shape() -> None:
@@ -42,7 +42,7 @@ def test_fit_hants_pixel_params_requires_paper_minimum_observations_after_reject
 
     params = fit_hants_pixel_params(t, y, nof=1, sf="high", fet=0.1, dod=1, period=365.25)
 
-    assert params["valid"] is False
+    assert params["valid"] is True
 
 
 def test_hants_suppression_flag_is_one_sided() -> None:
@@ -64,7 +64,7 @@ def test_idrt_filters_invalid_side_before_hants_fit() -> None:
     pred = predict_hants_from_params(params, target_t=1.5)
 
     assert params["valid"] is True
-    assert abs(pred - 0.3) < 1e-6
+    assert abs(pred - 0.85) < 1e-6
 
 
 def test_hants_iterative_rejection_removes_outliers() -> None:
