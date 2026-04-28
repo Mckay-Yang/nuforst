@@ -10,13 +10,13 @@ from src.hants import (
 )
 
 
-def test_apply_hants_valid_mask_respects_idrt_direction() -> None:
+def test_apply_hants_valid_mask_lower_upper() -> None:
     y = np.array([0.1, 0.5, 0.9, np.nan])
-    low_mask = _apply_hants_valid_mask(y, sf="low", idrt=0.7)
-    high_mask = _apply_hants_valid_mask(y, sf="high", idrt=0.3)
+    lower_mask = _apply_hants_valid_mask(y, valid_min=0.7)
+    upper_mask = _apply_hants_valid_mask(y, valid_max=0.3)
 
-    assert low_mask.tolist() == [False, False, True, False]
-    assert high_mask.tolist() == [True, False, False, False]
+    assert lower_mask.tolist() == [False, False, True, False]
+    assert upper_mask.tolist() == [True, False, False, False]
 
 
 def test_make_harmonic_matrix_shape() -> None:
@@ -56,11 +56,11 @@ def test_hants_suppression_flag_is_one_sided() -> None:
     assert abs(high_pred - 1.0) < 1e-6
 
 
-def test_idrt_filters_invalid_side_before_hants_fit() -> None:
+def test_valid_min_filters_invalid_low_before_hants_fit() -> None:
     t = np.array([0.0, 1.0, 2.0, 3.0], dtype=np.float64)
     y = np.array([0.2, 0.4, 0.8, 0.9], dtype=np.float64)
 
-    params = fit_hants_pixel_params(t, y, nof=1, sf="low", idrt=0.7, fet=0.1, dod=0, period=365.25)
+    params = fit_hants_pixel_params(t, y, nof=1, sf="low", valid_min=0.7, fet=0.1, dod=0, period=365.25)
     pred = predict_hants_from_params(params, target_t=1.5)
 
     assert params["valid"] is True

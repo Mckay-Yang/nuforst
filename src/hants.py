@@ -45,23 +45,19 @@ def hants_pixel(
     t: np.ndarray,
     y: np.ndarray,
     target_t: float,
-    nof: int = 3, # Number of frequencies. 3 means: 0, 1/T, 2/T
-    sf: str = 'low', # 'low' means reject low values (e.g. clouds in NDVI)
-    idrt: float = None, # Invalid data rejection threshold
-    fet: float = 0.05, # Fit error tolerance
-    dod: int = 5, # Degree of overdeterminedness
-    period: float = 365.25
+    nof: int = 3,
+    sf: str = 'low',
+    valid_min: float = None,
+    valid_max: float = None,
+    fet: float = 0.05,
+    dod: int = 5,
+    period: float = 365.25,
 ) -> float:
-    """
-    Apply HANTS algorithm to a single pixel.
-    """
-    # 1. Initial valid data check
     valid_mask = np.isfinite(y)
-    if idrt is not None:
-        if sf == 'low':
-            valid_mask &= (y > idrt)
-        elif sf == 'high':
-            valid_mask &= (y < idrt)
+    if valid_min is not None:
+        valid_mask &= (y >= valid_min)
+    if valid_max is not None:
+        valid_mask &= (y <= valid_max)
 
     if np.sum(valid_mask) == 0:
         return np.nan
@@ -69,90 +65,44 @@ def hants_pixel(
     t_curr = t[valid_mask]
     y_curr = y[valid_mask]
 
-    # 2. Setup frequencies
-    # NOF includes 0 freq. If NOF=3, we use freq 0, 1/period, 2/period
-    freqs = [i / period for i in range(1, nof)] # 0 is handled by intercept column
-
-    # Number of parameters: 1 (mean) + 2 * (NOF-1)
-    # Paper: 2 * NOF - 1. (NOF includes zero).
-    # e.g. NOF=3 -> Mean, Amp1, Ph1, Amp2, Ph2 -> 5 params.
-    # 1 + 2*(3-1) = 5. Correct.
+    freqs = [i / period for i in range(1, nof)]
     num_params = 1 + 2 * (nof - 1)
 
-    # Iteration
-    max_iter = 20 # Safety break
+    last_good_coeffs = None
+    max_iter = 20
     for _ in range(max_iter):
         n_obs = len(y_curr)
         if n_obs < num_params + dod:
-            # Not enough points
             break
 
-        # Build Matrix
         X = make_harmonic_matrix(t_curr, freqs)
-
-        # Fit Least Squares
-        # lstsq returns: x, residuals, rank, s
         coeffs, _, _, _ = np.linalg.lstsq(X, y_curr, rcond=None)
+        last_good_coeffs = coeffs
 
-        # Calculate fit values for CURRENT points to check outliers
         y_pred_curr = X @ coeffs
         residuals = y_curr - y_pred_curr
 
-        # Check outliers
-        # SF = 'low' means reject low values. Low values have y_curr < y_pred => residual < 0
-        # Paper: "large positive or negative deviation ... removed"
-        # Paper (Sec 2): "Hi/Lo suppression flag (SF)... indicates whether high or low values (outliers) should be rejected"
-        # Example: "SF = low; ... cloudy observations lead to low NDVI values."
-        # This implies we reject points where y_obs is significantly LOWER than y_fit.
-        # i.e. residual (y_obs - y_fit) is large NEGATIVE.
-
-        candidates_to_reject = np.zeros(n_obs, dtype=bool)
-
         if sf == 'low':
-            # Reject if y_obs is too low -> residual is negative and magnitude > FET
-            # Paper: "absolute difference in the Hi/Lo direction ... determined"
-            # "Iteration stops when the difference of all remaining points becomes smaller than the FET"
-            diffs = residuals
-            # We care about negative residuals
-            bad_indices = (diffs < -fet)
+            bad_indices = (residuals < -fet)
         elif sf == 'high':
-            # Reject if y_obs is too high -> residual is positive and > FET
-            diffs = residuals
-            bad_indices = (diffs > fet)
+            bad_indices = (residuals > fet)
         else:
-            # Reject both? Paper implies one direction usually.
-            # "HANTS cannot reject outliers in the opposite direction of the SF"
             bad_indices = (np.abs(residuals) > fet)
 
         if not np.any(bad_indices):
-            # Convergence: No points exceed FET in the specified direction
             break
 
-        # Identify the WORST outlier to remove? Or all?
-        # Paper says: "Input data points that have a large ... deviation ... are removed".
-        # Usually HANTS removes *all* outliers outside tolerance in one step?
-        # Or one by one?
-        # "After recalculation ... the procedure is repeated".
-        # Let's remove all that violate FET.
+        if np.sum(~bad_indices) < num_params + dod:
+            break
 
-        mask_keep = ~bad_indices
-        t_curr = t_curr[mask_keep]
-        y_curr = y_curr[mask_keep]
+        t_curr = t_curr[~bad_indices]
+        y_curr = y_curr[~bad_indices]
 
-    # Final Prediction
-    # If loop finished or broke, we use the last coeffs.
-    # Need to handle case where loop breaks due to low N *before* computing coeffs?
-    # Actually we compute coeffs at start of loop.
-
-    # If we exited loop because N < limit, we might want to use the LAST valid fit?
-    # But if N < limit initially?
-    if 'coeffs' not in locals():
+    if last_good_coeffs is None:
         return np.nan
 
     X_target = make_harmonic_matrix(np.array([target_t]), freqs)
-    y_target = (X_target @ coeffs)[0]
-
-    return y_target
+    return (X_target @ last_good_coeffs)[0]
 
 def reconstruct_hants(
     image: str,
@@ -160,22 +110,14 @@ def reconstruct_hants(
     output_path: Optional[str] = None,
     nof: int = 3,
     sf: str = 'low',
+    valid_min: float = None,
+    valid_max: float = None,
     fet: float = 0.05,
     dod: int = 5,
     n_jobs: int = -1,
     cache_dir: str = "./cache",
-    force_refresh: bool = False
+    force_refresh: bool = False,
 ) -> np.ndarray:
-    """
-    Reconstruct Landsat image using HANTS (Roerink et al. 2000).
-
-    Parameters:
-    - nof: Number of frequencies (including mean). Default 3 (Mean, Annual, Semi-Annual).
-    - sf: Suppression flag ('low' or 'high'). 'low' rejects low outliers (e.g. cloud shadows or clouds in NDVI).
-          For Surface Reflectance clouds are usually High.
-    - fet: Fit Error Tolerance.
-    - dod: Degree of Overdeterminedness.
-    """
     # 1. Load Data
     loader = RSCube(image, cache_dir=cache_dir, force_refresh=force_refresh)
     data = loader.load()
@@ -210,7 +152,9 @@ def reconstruct_hants(
             y = cube[:, i, j]
             pred = hants_pixel(
                 t_days, y, target_t_day,
-                nof=nof, sf=sf, fet=fet, dod=dod
+                nof=nof, sf=sf,
+                valid_min=valid_min, valid_max=valid_max,
+                fet=fet, dod=dod,
             )
             row_pred[j] = pred
         return i, row_pred
@@ -250,16 +194,12 @@ def reconstruct_hants(
 # ── Compatibility bridge ──
 
 
-def _apply_hants_valid_mask(y, sf, idrt):
+def _apply_hants_valid_mask(y, valid_min=None, valid_max=None):
     valid_mask = np.isfinite(y)
-    if idrt is None:
-        return valid_mask
-    if sf == 'low':
-        valid_mask &= (y > idrt)
-    elif sf == 'high':
-        valid_mask &= (y < idrt)
-    else:
-        valid_mask &= np.isfinite(y)
+    if valid_min is not None:
+        valid_mask &= (y >= valid_min)
+    if valid_max is not None:
+        valid_mask &= (y <= valid_max)
     return valid_mask
 
 
@@ -273,7 +213,7 @@ def _fit_hants_coeffs(t_curr, y_curr, freqs):
     return coeffs
 
 
-def fit_hants_pixel_params(t, y, nof=3, sf='low', idrt=None, fet=0.05, dod=5, period=365.25):
+def fit_hants_pixel_params(t, y, nof=3, sf='low', valid_min=None, valid_max=None, fet=0.05, dod=5, period=365.25):
     coeff_count = 1 + 2 * max(0, nof - 1)
     params = {
         "valid": False, "nof": int(nof), "period": float(period),
@@ -284,17 +224,16 @@ def fit_hants_pixel_params(t, y, nof=3, sf='low', idrt=None, fet=0.05, dod=5, pe
     num_params = 1 + 2 * (nof - 1)
 
     valid_mask = np.isfinite(y)
-    if idrt is not None:
-        if sf == 'low':
-            valid_mask &= (y > idrt)
-        elif sf == 'high':
-            valid_mask &= (y < idrt)
+    if valid_min is not None:
+        valid_mask &= (y >= valid_min)
+    if valid_max is not None:
+        valid_mask &= (y <= valid_max)
     if np.sum(valid_mask) == 0:
         return params
 
     t_curr = t[valid_mask].copy()
     y_curr = y[valid_mask].copy()
-    coeffs = None
+    last_good_coeffs = None
     max_iter = 20
     for _ in range(max_iter):
         n_obs = len(y_curr)
@@ -302,6 +241,7 @@ def fit_hants_pixel_params(t, y, nof=3, sf='low', idrt=None, fet=0.05, dod=5, pe
             break
         X = make_harmonic_matrix(t_curr, freqs)
         coeffs, _, _, _ = np.linalg.lstsq(X, y_curr, rcond=None)
+        last_good_coeffs = coeffs
         y_pred_curr = X @ coeffs
         residuals = y_curr - y_pred_curr
         if sf == 'low':
@@ -312,15 +252,16 @@ def fit_hants_pixel_params(t, y, nof=3, sf='low', idrt=None, fet=0.05, dod=5, pe
             bad_indices = np.abs(residuals) > fet
         if not np.any(bad_indices):
             break
-        mask_keep = ~bad_indices
-        t_curr = t_curr[mask_keep]
-        y_curr = y_curr[mask_keep]
-    if coeffs is None:
-        coeffs = _fit_hants_coeffs(t_curr, y_curr, freqs)
-    if coeffs is None:
+        if np.sum(~bad_indices) < num_params + dod:
+            break
+        t_curr = t_curr[~bad_indices]
+        y_curr = y_curr[~bad_indices]
+    if last_good_coeffs is None:
+        last_good_coeffs = _fit_hants_coeffs(t_curr, y_curr, freqs)
+    if last_good_coeffs is None:
         return params
     params["valid"] = True
-    params["coeffs"][:len(coeffs)] = coeffs
+    params["coeffs"][:len(last_good_coeffs)] = last_good_coeffs
     return params
 
 
@@ -339,6 +280,6 @@ def predict_hants_curve_from_params(params, target_t_array):
     return np.array([predict_hants_from_params(params, float(t)) for t in target_t_array], dtype=np.float64)
 
 
-def hants_curve_pixel(t, y, target_t_array, nof=3, sf='low', idrt=None, fet=0.05, dod=5, period=365.25):
-    params = fit_hants_pixel_params(t, y, nof=nof, sf=sf, idrt=idrt, fet=fet, dod=dod, period=period)
+def hants_curve_pixel(t, y, target_t_array, nof=3, sf='low', valid_min=None, valid_max=None, fet=0.05, dod=5, period=365.25):
+    params = fit_hants_pixel_params(t, y, nof=nof, sf=sf, valid_min=valid_min, valid_max=valid_max, fet=fet, dod=dod, period=period)
     return predict_hants_curve_from_params(params, target_t_array)

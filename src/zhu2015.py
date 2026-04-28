@@ -22,27 +22,16 @@ def _get_julian_date(timestamps: np.ndarray) -> np.ndarray:
     # We'll use the first timestamp as t=0 to keep numbers small.
     return timestamps / 86400.0
 
-def make_design_matrix(x: np.ndarray, order: int) -> np.ndarray:
-    """
-    Construct design matrix for harmonic model with linear trend.
-    x: array of time points (days)
-    order: 1 (Simple), 2 (Advanced), 3 (Full)
-
-    Columns: [cos(2pi*x/T), sin(2pi*x/T), ..., x]
-    Intercept is handled by Lasso fit_intercept=True.
-    """
+def make_design_matrix(x: np.ndarray, order: int, ref_x_mean: float = None) -> np.ndarray:
     cols = []
-    # Linear trend
-    # Paper Equation 1: c1 * x
-    # We add 'x' as a feature.
-
-    # Harmonics
     w = 2 * np.pi / DAYS_PER_YEAR
     for k in range(1, order + 1):
         cols.append(np.cos(k * w * x))
         cols.append(np.sin(k * w * x))
-
-    cols.append(x)
+    if ref_x_mean is not None:
+        cols.append(np.asarray(x) - float(ref_x_mean))
+    else:
+        cols.append(np.asarray(x))
     return np.column_stack(cols)
 
 def fit_predict_pixel(
@@ -51,12 +40,6 @@ def fit_predict_pixel(
     target_t_day: float,
     lasso_alpha: float = 0.001
 ) -> Tuple[float, int]:
-    """
-    Fit model for a single pixel and predict at target time.
-    Returns (prediction, model_used)
-    model_used: 0=Median, 1=Simple, 2=Advanced, 3=Full
-    """
-    # Filter valid data
     valid_mask = np.isfinite(y)
     if not np.any(valid_mask):
         return np.nan, 0
@@ -64,12 +47,6 @@ def fit_predict_pixel(
     t_valid = t_days[valid_mask]
     y_valid = y[valid_mask]
     n_obs = len(y_valid)
-
-    # Model Selection Logic (Zhu et al. 2015)
-    # < 6: Median
-    # 6 <= N < 18: Simple (Order 1)
-    # 18 <= N < 24: Advanced (Order 2)
-    # >= 24: Full (Order 3)
 
     if n_obs < 6:
         return np.median(y_valid), 0
@@ -80,29 +57,17 @@ def fit_predict_pixel(
     elif 18 <= n_obs < 24:
         order = 2
         model_id = 2
-    else: # n_obs >= 24
+    else:
         order = 3
         model_id = 3
 
-    # Build design matrix
-    X = make_design_matrix(t_valid, order)
-
-    # Fit LASSO
-    # Note: Zhu 2015 uses LASSO.
-    # alpha controls regularization.
-    # Paper doesn't specify alpha, we assume a small value or CV.
-    # Using fixed small alpha for now as in many remote sensing implementations.
-    # We should normalize X? sklearn Lasso does not normalize by default,
-    # but harmonic terms are bound [-1, 1], time x is unbounded.
-    # Usually standardizing 'x' is good.
-    # However, for simplicity and consistency with harmonic scales, we might just run it.
-    # Let's standardize x internally if needed? Lasso(normalize=False) is default.
+    x_mean = float(np.mean(t_valid))
+    X = make_design_matrix(t_valid, order, ref_x_mean=x_mean)
 
     clf = Lasso(alpha=lasso_alpha, fit_intercept=True, max_iter=2000)
     clf.fit(X, y_valid)
 
-    # Predict
-    X_target = make_design_matrix(np.array([target_t_day]), order)
+    X_target = make_design_matrix(np.array([target_t_day]), order, ref_x_mean=x_mean)
     y_pred = clf.predict(X_target)[0]
 
     return y_pred, model_id
@@ -227,13 +192,16 @@ def _pack_zhu_coefficients(coef, order, max_order=MAX_ZHU_ORDER):
     return packed
 
 
-def _make_full_design_matrix(x, max_order=MAX_ZHU_ORDER):
+def _make_full_design_matrix(x, max_order=MAX_ZHU_ORDER, ref_x_mean=None):
     cols = []
     w = 2 * np.pi / DAYS_PER_YEAR
     for k in range(1, max_order + 1):
         cols.append(np.cos(k * w * x))
         cols.append(np.sin(k * w * x))
-    cols.append(x)
+    if ref_x_mean is not None:
+        cols.append(np.asarray(x) - float(ref_x_mean))
+    else:
+        cols.append(np.asarray(x))
     return np.column_stack(cols)
 
 
@@ -251,6 +219,7 @@ def fit_zhu2015_pixel_params(
         "segment_median_values": np.full(segment_count, np.nan, dtype=np.float64),
         "segment_intercepts": np.zeros(segment_count, dtype=np.float64),
         "segment_coefficients": np.zeros((segment_count, 2 * max_order + 1), dtype=np.float64),
+        "x_mean": np.float64(0.0),
     }
     valid_mask = np.isfinite(y) & np.isfinite(t_days)
     if not np.any(valid_mask):
@@ -269,8 +238,10 @@ def fit_zhu2015_pixel_params(
         params["segment_unit_qas"][0] = unit_qa
         params["segment_has_model"][0] = 0
         params["segment_median_values"][0] = float(np.median(y_valid))
+        params["x_mean"] = np.float64(float(np.mean(t_valid)))
         return params
-    X = make_design_matrix(t_valid, order)
+    x_mean = float(np.mean(t_valid))
+    X = make_design_matrix(t_valid, order, ref_x_mean=x_mean)
     clf = Lasso(alpha=lasso_alpha, fit_intercept=True, max_iter=2000)
     clf.fit(X, y_valid)
     params["valid"] = True
@@ -284,6 +255,7 @@ def fit_zhu2015_pixel_params(
     params["segment_coefficients"][0] = _pack_zhu_coefficients(
         np.asarray(clf.coef_, dtype=np.float64), order, max_order=max_order,
     )
+    params["x_mean"] = np.float64(x_mean)
     return params
 
 
@@ -308,6 +280,7 @@ def predict_zhu2015_from_params(params, target_t_day):
     qa = qa_prefix * 10 + int(unit_qas[seg_idx])
     if not has_model[seg_idx]:
         return float(median_vals[seg_idx]), qa
+    x_mean = float(params.get("x_mean", 0.0))
     max_order = int(params.get("max_order", MAX_ZHU_ORDER))
     w = 2 * np.pi / DAYS_PER_YEAR
     ncols = 2 * max_order + 1
@@ -315,7 +288,7 @@ def predict_zhu2015_from_params(params, target_t_day):
     for k in range(1, max_order + 1):
         row[2 * (k - 1)] = np.cos(k * w * target_t_day)
         row[2 * k - 1] = np.sin(k * w * target_t_day)
-    row[-1] = target_t_day
+    row[-1] = target_t_day - x_mean
     pred = float(intercepts[seg_idx] + row @ coeffs[seg_idx])
     return pred, qa
 
@@ -339,19 +312,22 @@ def extract_segments(t_days, y, lasso_alpha=0.001):
     n_obs = len(y_valid)
     order = _select_model_order(n_obs)
     unit_qa = _select_unit_qa(n_obs)
+    x_mean = float(np.mean(t_valid))
     if order == 0:
         return [{
             "start_idx": 0, "end_idx": n_obs - 1,
             "clf": None, "order": 0, "unit_qa": unit_qa,
             "median_val": float(np.median(y_valid)),
+            "x_mean": x_mean,
         }]
-    X = make_design_matrix(t_valid, order)
+    X = make_design_matrix(t_valid, order, ref_x_mean=x_mean)
     clf = Lasso(alpha=lasso_alpha, fit_intercept=True, max_iter=2000)
     clf.fit(X, y_valid)
     return [{
         "start_idx": 0, "end_idx": n_obs - 1,
         "clf": clf, "order": order, "unit_qa": unit_qa,
         "median_val": 0.0,
+        "x_mean": x_mean,
     }]
 
 
@@ -362,5 +338,6 @@ def predict_target(segments, t_days, target_t_day):
     qa = 0 * 10 + seg["unit_qa"]
     if seg["clf"] is None:
         return seg["median_val"], qa
-    pred = seg["clf"].predict(make_design_matrix(np.array([target_t_day]), seg["order"]))[0]
+    x_mean = seg.get("x_mean", 0.0)
+    pred = seg["clf"].predict(make_design_matrix(np.array([target_t_day]), seg["order"], ref_x_mean=x_mean))[0]
     return pred, qa
