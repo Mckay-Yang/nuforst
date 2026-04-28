@@ -1,0 +1,9 @@
+{
+  "nof": 3,
+  "sf": "low",
+  "fet": 0.05,
+  "dod": 5,
+  "valid_min": null,
+  "valid_max": null,
+  "period": 365.25
+}

@@ -747,7 +747,7 @@ def reconstruct_full_scene_for_location(
         )}.get(key)
         if val is not None:
             build_nufrost_args[key] = val
-    nufrost_args = build_args(dict(build_nufrost_args)) if "nufrost" in methods else None
+    nufrost_args = build_args("nufrost", dict(build_nufrost_args)) if "nufrost" in methods else None
     shared_freqs = None
     if nufrost_args is not None and getattr(nufrost_args, "frequency_selection", None) == "shared_spectral":
         first_prepared = next(iter(prepared_bands.values()))
@@ -780,7 +780,7 @@ def reconstruct_full_scene_for_location(
             output_path = build_output_path(output_root=output_root, method_name=method_name, source_file=stack_paths[0], target_time=target_time, source_name=source_name, lon=lon, lat=lat)
             t0 = time.perf_counter()
             if method_name == "nufrost":
-                args = nufrost_args or build_args(dict(build_nufrost_args))
+                args = nufrost_args or build_args("nufrost", dict(build_nufrost_args))
                 prediction = nufrost_core(masked_cube, masked_timestamps, target_time, args=args, shared_freqs=shared_freqs)
             elif method_name == "hants":
                 prediction = reconstruct_hants_from_cube(masked_cube, masked_timestamps, target_time, n_jobs=n_jobs)

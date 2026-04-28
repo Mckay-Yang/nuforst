@@ -16,7 +16,7 @@ from src.evaluation import (
 
 
 def test_load_evaluation_cube_and_sampling_helpers(single_tile_path: str, cache_dir) -> None:
-    args = build_args({"cache_dir": cache_dir, "force_refresh": False})
+    args = build_args("nufrost", {"cache_dir": cache_dir, "force_refresh": False})
     prepared = load_evaluation_cube([single_tile_path], args)
 
     assert prepared["cube"].ndim == 3
@@ -34,7 +34,7 @@ def test_load_evaluation_cube_uses_split_cache_layout(fixture_input_dir, tmp_pat
 
     cache_root = tmp_path / "cache" / "local"
     chunks = find_image_chunks(fixture_input_dir.as_posix(), lon=100.112, lat=25.654, band="B2", cache_dir=cache_root)
-    args = build_args({"cache_dir": cache_root, "force_refresh": True})
+    args = build_args("nufrost", {"cache_dir": cache_root, "force_refresh": True})
 
     prepared = load_evaluation_cube(chunks, args)
 
@@ -44,7 +44,7 @@ def test_load_evaluation_cube_uses_split_cache_layout(fixture_input_dir, tmp_pat
 
 
 def test_evaluate_algorithms_on_cube_smoke(single_tile_path: str, cache_dir) -> None:
-    args = build_args({"cache_dir": cache_dir, "force_refresh": False, "min_obs": 6, "n_jobs": 1})
+    args = build_args("nufrost", {"cache_dir": cache_dir, "force_refresh": False, "min_obs": 6, "n_jobs": 1})
     prepared = load_evaluation_cube([single_tile_path], args)
     sampled_points = sample_random_points(prepared["cube"], prepared["t_days"], min_obs=args.min_obs, num_points=10, seed=123)
 
@@ -62,7 +62,7 @@ def test_evaluate_algorithms_on_cube_smoke(single_tile_path: str, cache_dir) -> 
 
 
 def test_evaluate_timeseries_on_cube_smoke(single_tile_path: str, cache_dir) -> None:
-    args = build_args({"cache_dir": cache_dir, "force_refresh": False, "min_obs": 6, "n_jobs": 1})
+    args = build_args("nufrost", {"cache_dir": cache_dir, "force_refresh": False, "min_obs": 6, "n_jobs": 1})
     prepared = load_evaluation_cube([single_tile_path], args)
     sampled_pixels = sample_gap_pixels(prepared["cube"], prepared["t_days"], min_obs=args.min_obs, num_samples=5, seed=123)
 
@@ -81,7 +81,7 @@ def test_evaluate_timeseries_on_cube_smoke(single_tile_path: str, cache_dir) -> 
 
 
 def test_streaming_evaluation_path_avoids_npz(single_tile_path: str, cache_dir) -> None:
-    args = build_args({"cache_dir": cache_dir, "force_refresh": False, "min_obs": 6, "n_jobs": 1})
+    args = build_args("nufrost", {"cache_dir": cache_dir, "force_refresh": False, "min_obs": 6, "n_jobs": 1})
 
     with open_evaluation_source([single_tile_path], args) as prepared:
         sampled_points = sample_random_points_from_source(prepared["source"], prepared["t_days"], min_obs=args.min_obs, num_points=10, seed=123)
@@ -111,7 +111,7 @@ def test_streaming_evaluation_path_avoids_npz(single_tile_path: str, cache_dir) 
 
 
 def test_evaluate_algorithms_from_source_parallel(single_tile_path: str, cache_dir) -> None:
-    args = build_args({"cache_dir": cache_dir, "force_refresh": False, "min_obs": 6, "n_jobs": 2})
+    args = build_args("nufrost", {"cache_dir": cache_dir, "force_refresh": False, "min_obs": 6, "n_jobs": 2})
     with open_evaluation_source([single_tile_path], args) as prepared:
         sampled_points = sample_random_points_from_source(
             prepared["source"], prepared["t_days"], min_obs=args.min_obs, num_points=20, seed=123
@@ -129,7 +129,7 @@ def test_evaluate_algorithms_from_source_parallel(single_tile_path: str, cache_d
 
 
 def test_evaluate_timeseries_from_source_parallel(single_tile_path: str, cache_dir) -> None:
-    args = build_args({"cache_dir": cache_dir, "force_refresh": False, "min_obs": 6, "n_jobs": 2})
+    args = build_args("nufrost", {"cache_dir": cache_dir, "force_refresh": False, "min_obs": 6, "n_jobs": 2})
     with open_evaluation_source([single_tile_path], args) as prepared:
         sampled_pixels = sample_gap_pixels_from_source(
             prepared["source"], prepared["t_days"], min_obs=args.min_obs, num_samples=10, seed=123
@@ -150,7 +150,7 @@ def test_evaluate_timeseries_from_source_parallel(single_tile_path: str, cache_d
 def test_evaluate_timeseries_from_source_callback(single_tile_path: str, cache_dir) -> None:
     """Test that on_batch_done callback is invoked correctly."""
     import warnings
-    args = build_args({"cache_dir": cache_dir, "force_refresh": False, "min_obs": 6, "n_jobs": 1})
+    args = build_args("nufrost", {"cache_dir": cache_dir, "force_refresh": False, "min_obs": 6, "n_jobs": 1})
     
     call_log = []
     def mock_callback(batch_results, batch_start, batch_end):
@@ -192,7 +192,7 @@ def test_evaluate_timeseries_from_source_callback(single_tile_path: str, cache_d
 def test_evaluate_timeseries_from_source_callback_exception(single_tile_path: str, cache_dir) -> None:
     """Test that exceptions in on_batch_done are caught and warned."""
     import warnings
-    args = build_args({"cache_dir": cache_dir, "force_refresh": False, "min_obs": 6, "n_jobs": 1})
+    args = build_args("nufrost", {"cache_dir": cache_dir, "force_refresh": False, "min_obs": 6, "n_jobs": 1})
     
     call_count = 0
     def failing_callback(batch_results, batch_start, batch_end):

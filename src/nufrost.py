@@ -323,7 +323,7 @@ def reconstruct_nufrost(
     if output_path:
         overrides["output_path"] = output_path
 
-    args = build_args(overrides=overrides)
+    args = build_args("nufrost", overrides=overrides)
 
     # 2. 加载数据
     loader = RSCube(args.image, cache_dir=args.cache_dir, force_refresh=args.force_refresh)

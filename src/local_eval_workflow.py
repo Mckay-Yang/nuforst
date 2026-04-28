@@ -253,7 +253,7 @@ def gap_days_for_index(t_days: np.ndarray, index_value: float) -> Tuple[int, flo
 
 
 def build_eval_args(image_paths: Sequence[str], cache_dir: Path, n_jobs: int, overrides: Optional[Mapping[str, object]] = None):
-    args = build_args(dict(overrides or {}))
+    args = build_args("nufrost", dict(overrides or {}))
     args.image = list(image_paths)
     args.cache_dir = cache_dir.as_posix()
     args.force_refresh = False

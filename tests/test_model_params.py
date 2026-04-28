@@ -105,7 +105,7 @@ def test_cube_param_roundtrip_reconstructs_complete_image(tmp_path) -> None:
     )
     cube[2, 0, 0] = np.nan
 
-    args = build_args({"n_jobs": 1, "show_progress": False, "min_obs": 6, "modes": 64, "num_peaks": 4})
+    args = build_args("nufrost", {"n_jobs": 1, "show_progress": False, "min_obs": 6, "modes": 64, "num_peaks": 4})
     params = fit_cube_params(cube, timestamps, algorithm="nufrost", args=args, max_freqs=10)
 
     path = tmp_path / "nufrost_params.npz"
@@ -118,7 +118,7 @@ def test_cube_param_roundtrip_reconstructs_complete_image(tmp_path) -> None:
 
 
 def test_param_cube_from_streaming_source_avoids_npz(single_tile_path: str, cache_dir, tmp_path) -> None:
-    args = build_args({"cache_dir": cache_dir, "n_jobs": 1, "show_progress": False, "min_obs": 6, "modes": 64, "num_peaks": 4})
+    args = build_args("nufrost", {"cache_dir": cache_dir, "n_jobs": 1, "show_progress": False, "min_obs": 6, "modes": 64, "num_peaks": 4})
 
     with TimeSeriesRasterSource([single_tile_path], cache_dir=cache_dir) as source:
         params = fit_param_cube_from_source(source, algorithm="nufrost", args=args, max_freqs=10)

@@ -56,7 +56,7 @@ def test_nufrost_core_returns_image_for_small_cube() -> None:
     )
     cube[2, 0, 0] = np.nan
 
-    args = build_args(
+    args = build_args("nufrost",
         {
             "n_jobs": 1,
             "show_progress": False,

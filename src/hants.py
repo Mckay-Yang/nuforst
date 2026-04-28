@@ -3,7 +3,7 @@ import pandas as pd
 from typing import Tuple, Optional, Union, List, Any, Dict as DictType
 from .data_loader import RSCube
 from .nufrost import timestamps_to_seconds
-from config import Args, build_args
+from config import Args, HantsArgs, build_args
 import rasterio
 from pathlib import Path
 from tqdm import tqdm

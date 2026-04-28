@@ -41,7 +41,7 @@ def fit_cube_params(
     max_segments: int = 10,
 ) -> Dict[str, Any]:
     if args is None:
-        args = build_args({})
+        args = build_args(algorithm.lower(), {})
 
     algorithm = algorithm.lower()
     _, height, width = cube.shape
@@ -167,7 +167,7 @@ def fit_param_cube_from_source(
     width = int(meta["width"])
     timestamps = np.asarray(meta["timestamps"])
     if args is None:
-        args = build_args({})
+        args = build_args(algorithm.lower(), {})
 
     algorithm = algorithm.lower()
     t_sec = timestamps_to_seconds(timestamps, unit=args.time_unit)
