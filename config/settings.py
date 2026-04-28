@@ -40,7 +40,7 @@ class Args:
     ridge: float = 0.005
     freq_weight: float = 2.0
     huber_iters: int = 3
-    huber_delta: float = 1.5
+    huber_delta: float = 0.05
     min_obs: int = 12
     n_jobs: int = -1
     show_progress: bool = True
@@ -78,7 +78,7 @@ def build_arg_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     ap.add_argument("--power-cum", type=float, default=d("power_cum", 0.7))
     ap.add_argument("--ignore-dc-hz", type=float, default=d("ignore_dc_hz", 1e-10))
     ap.add_argument("--frequency-selection", type=str, default=d("frequency_selection", "hybrid"),
-                    choices=("spectral", "preferred", "hybrid"))
+                    choices=("spectral", "preferred", "hybrid", "shared_spectral"))
     ap.add_argument("--preferred-periods-days", type=str, default=d("preferred_periods_days", "365.25,182.625,91.3125,30.4375"),
                     help="comma-separated preferred periods in days, e.g. annual/semiannual/seasonal/monthly")
     ap.add_argument("--preferred-top-k", type=int, default=d("preferred_top_k", 4))
@@ -107,7 +107,7 @@ def build_arg_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     ap.add_argument("--ridge", type=float, default=d("ridge", 0.005))
     ap.add_argument("--freq-weight", type=float, default=d("freq_weight", 2.0))
     ap.add_argument("--huber-iters", type=int, default=d("huber_iters", 3))
-    ap.add_argument("--huber-delta", type=float, default=d("huber_delta", 1.5))
+    ap.add_argument("--huber-delta", type=float, default=d("huber_delta", 0.05))
     ap.add_argument("--min-obs", type=int, default=d("min_obs", 12), help="minimum valid observations per pixel")
     ap.add_argument("--n-jobs", type=int, default=d("n_jobs", -1),
                     help="number of parallel workers; 0=auto, 1=serial")

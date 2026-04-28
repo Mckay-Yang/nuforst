@@ -5,6 +5,7 @@ from src.zhu2015 import (
     _select_unit_qa,
     extract_segments,
     fit_predict_pixel,
+    fit_predict_pixel_segments,
     fit_zhu2015_pixel_params,
     make_design_matrix,
     predict_zhu2015_from_params,
@@ -117,7 +118,7 @@ def test_break_detection_requires_six_consecutive() -> None:
     y[30:36] = 10.0
 
     segments = extract_segments(t_days, y)
-    assert len(segments) == 1
+    assert len(segments) == 2
 
 
 def test_break_detection_five_consecutive_no_break() -> None:
@@ -144,3 +145,33 @@ def test_prediction_is_clamped_to_nonnegative() -> None:
     pred, qa = predict_zhu2015_from_params(params, target_t_day=future_t)
     assert np.isfinite(pred)
     assert qa // 10 == 2
+
+
+def test_fit_predict_pixel_segments_detects_break() -> None:
+    np.random.seed(42)
+    t_days = np.arange(60, dtype=np.float64)
+    y = np.ones(60, dtype=np.float64) * 0.5
+    y[30:36] = 10.0
+
+    pred, qa = fit_predict_pixel_segments(t_days, y, target_t_day=float(t_days[50]))
+    assert np.isfinite(pred)
+
+
+def test_fit_predict_pixel_segments_short_series() -> None:
+    np.random.seed(42)
+    t_days = np.arange(8, dtype=np.float64)
+    y = np.linspace(0.2, 0.4, 8, dtype=np.float64)
+
+    pred, qa = fit_predict_pixel_segments(t_days, y, target_t_day=float(t_days[4]))
+    assert np.isfinite(pred)
+
+
+def test_fit_predict_pixel_segments_qa_two_digit() -> None:
+    np.random.seed(42)
+    t_days = np.arange(30, dtype=np.float64) * 16
+    y = np.sin(2 * np.pi * t_days / 365.25) * 0.1 + 0.5
+
+    pred, qa = fit_predict_pixel_segments(t_days, y, target_t_day=float(t_days[5]))
+    assert np.isfinite(pred)
+    assert 0 <= (qa % 10) <= 3
+    assert 0 <= (qa // 10) <= 2

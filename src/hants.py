@@ -53,56 +53,11 @@ def hants_pixel(
     dod: int = 5,
     period: float = 365.25,
 ) -> float:
-    valid_mask = np.isfinite(y)
-    if valid_min is not None:
-        valid_mask &= (y >= valid_min)
-    if valid_max is not None:
-        valid_mask &= (y <= valid_max)
-
-    if np.sum(valid_mask) == 0:
-        return np.nan
-
-    t_curr = t[valid_mask]
-    y_curr = y[valid_mask]
-
-    freqs = [i / period for i in range(1, nof)]
-    num_params = 1 + 2 * (nof - 1)
-
-    last_good_coeffs = None
-    max_iter = 20
-    for _ in range(max_iter):
-        n_obs = len(y_curr)
-        if n_obs < num_params + dod:
-            break
-
-        X = make_harmonic_matrix(t_curr, freqs)
-        coeffs, _, _, _ = np.linalg.lstsq(X, y_curr, rcond=None)
-        last_good_coeffs = coeffs
-
-        y_pred_curr = X @ coeffs
-        residuals = y_curr - y_pred_curr
-
-        if sf == 'low':
-            bad_indices = (residuals < -fet)
-        elif sf == 'high':
-            bad_indices = (residuals > fet)
-        else:
-            bad_indices = (np.abs(residuals) > fet)
-
-        if not np.any(bad_indices):
-            break
-
-        if np.sum(~bad_indices) < num_params + dod:
-            break
-
-        t_curr = t_curr[~bad_indices]
-        y_curr = y_curr[~bad_indices]
-
-    if last_good_coeffs is None:
-        return np.nan
-
-    X_target = make_harmonic_matrix(np.array([target_t]), freqs)
-    return (X_target @ last_good_coeffs)[0]
+    params = fit_hants_pixel_params(
+        t, y, nof=nof, sf=sf, valid_min=valid_min, valid_max=valid_max,
+        fet=fet, dod=dod, period=period,
+    )
+    return predict_hants_from_params(params, target_t)
 
 def reconstruct_hants(
     image: str,
@@ -219,6 +174,7 @@ def fit_hants_pixel_params(t, y, nof=3, sf='low', valid_min=None, valid_max=None
         "valid": False, "nof": int(nof), "period": float(period),
         "coeffs": np.full(coeff_count, np.nan, dtype=np.float64),
         "fill_value": float(np.nanmedian(y)) if np.isfinite(y).any() else np.nan,
+        "n_iterations": 0,
     }
     freqs = [i / period for i in range(1, nof)]
     num_params = 1 + 2 * (nof - 1)
@@ -233,35 +189,45 @@ def fit_hants_pixel_params(t, y, nof=3, sf='low', valid_min=None, valid_max=None
 
     t_curr = t[valid_mask].copy()
     y_curr = y[valid_mask].copy()
-    last_good_coeffs = None
-    max_iter = 20
-    for _ in range(max_iter):
+    if len(y_curr) < num_params + dod:
+        return params
+
+    coeffs = None
+    for it in range(min(len(y_curr), 50)):
         n_obs = len(y_curr)
         if n_obs < num_params + dod:
             break
         X = make_harmonic_matrix(t_curr, freqs)
-        coeffs, _, _, _ = np.linalg.lstsq(X, y_curr, rcond=None)
-        last_good_coeffs = coeffs
+        XTX = X.T @ X
+        XTy = X.T @ y_curr
+        try:
+            coeffs = np.linalg.solve(XTX, XTy)
+        except np.linalg.LinAlgError:
+            break
         y_pred_curr = X @ coeffs
         residuals = y_curr - y_pred_curr
         if sf == 'low':
-            bad_indices = residuals < -fet
+            bad = residuals < -fet
         elif sf == 'high':
-            bad_indices = residuals > fet
+            bad = residuals > fet
         else:
-            bad_indices = np.abs(residuals) > fet
-        if not np.any(bad_indices):
+            bad = np.abs(residuals) > fet
+        if not np.any(bad):
+            params["n_iterations"] = it + 1
             break
-        if np.sum(~bad_indices) < num_params + dod:
-            break
-        t_curr = t_curr[~bad_indices]
-        y_curr = y_curr[~bad_indices]
-    if last_good_coeffs is None:
-        last_good_coeffs = _fit_hants_coeffs(t_curr, y_curr, freqs)
-    if last_good_coeffs is None:
+        mask_keep = ~bad
+        t_curr = t_curr[mask_keep]
+        y_curr = y_curr[mask_keep]
+        params["n_iterations"] = it + 1
+
+    if len(y_curr) < num_params + dod:
+        return params
+    if coeffs is None:
+        coeffs = _fit_hants_coeffs(t_curr, y_curr, freqs)
+    if coeffs is None:
         return params
     params["valid"] = True
-    params["coeffs"][:len(last_good_coeffs)] = last_good_coeffs
+    params["coeffs"][:len(coeffs)] = coeffs
     return params
 
 
