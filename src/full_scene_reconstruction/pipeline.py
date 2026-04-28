@@ -873,6 +873,10 @@ def reconstruct_full_scene_for_all_locations(
     force_refresh: bool = False,
     min_valid_ratio: float = DEFAULT_MIN_VALID_RATIO,
     late_fraction: float = DEFAULT_LATE_FRACTION,
+    frequency_selection: Optional[str] = None,
+    spectral_top_k: Optional[int] = None,
+    preferred_top_k: Optional[int] = None,
+    num_peaks: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     data_root = Path(data_root)
     data_dir = _resolve_data_dir(source_name, data_root)
@@ -897,6 +901,10 @@ def reconstruct_full_scene_for_all_locations(
                 force_refresh=force_refresh,
                 min_valid_ratio=min_valid_ratio,
                 late_fraction=late_fraction,
+                frequency_selection=frequency_selection,
+                spectral_top_k=spectral_top_k,
+                preferred_top_k=preferred_top_k,
+                num_peaks=num_peaks,
             )
         )
     return results
