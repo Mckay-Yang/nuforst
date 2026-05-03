@@ -27,7 +27,7 @@ from ..data_loader import (
 from ..hants import hants_pixel
 from ..logger import log as _log
 from ..nufrost import nufrost_core, timestamps_to_seconds, next_even, select_peaks_adaptive, refine_parabolic, _preferred_periods_to_freqs
-from ..zhu2015 import fit_predict_pixel
+from ..zhu2015 import fit_predict_pixel_segments
 
 
 SENTINEL_SOURCE = "sentinel-2"
@@ -559,9 +559,9 @@ def reconstruct_zhu2015_from_cube(
     def _process_row(row_idx: int):
         row = np.full((2, width), np.nan, dtype=np.float32)
         for col_idx in range(width):
-            pred, qa = fit_predict_pixel(t_days, cube[:, row_idx, col_idx], target_t_day, lasso_alpha=lasso_alpha)
+            pred, qa = fit_predict_pixel_segments(t_days, cube[:, row_idx, col_idx], target_t_day, lasso_alpha=lasso_alpha)
             row[0, col_idx] = pred
-            row[1, col_idx] = qa
+            row[1, col_idx] = int(qa) if np.isfinite(qa) else np.nan
         return row_idx, row
 
     for row_idx, row in _run_parallel_rows(height, _process_row, n_jobs=n_jobs, desc="Zhu2015 Rows"):
@@ -707,6 +707,7 @@ def reconstruct_full_scene_for_location(
     counts_before: Dict[str, int] = {}
     counts_after: Dict[str, int] = {}
     prediction_arrays: Dict[str, Dict[str, np.ndarray]] = {method: {} for method in methods}
+    zhu2015_qa_arrays: Dict[str, np.ndarray] = {}
     ground_truth_arrays: Dict[str, np.ndarray] = {}
     band_meta: Dict[str, Mapping[str, object]] = {}
     prepared_bands: Dict[str, Dict[str, object]] = {}
@@ -796,6 +797,8 @@ def reconstruct_full_scene_for_location(
             _write_prediction(output_path, prediction_2d, data)
             output_map[method_name][band_name] = str(output_path)
             prediction_arrays[method_name][band_name] = prediction_2d
+            if method_name == "zhu2015":
+                zhu2015_qa_arrays[band_name] = np.asarray(prediction[1], dtype=np.uint8)
 
     ordered_bands = list(band_stacks.keys())
     validate_band_metadata_consistency(ordered_bands, band_meta)
@@ -822,6 +825,18 @@ def reconstruct_full_scene_for_location(
         )
         write_band_stack(merged_prediction_path, prediction_arrays[method_name], ordered_bands, first_meta)
         merged_prediction_map[method_name] = str(merged_prediction_path)
+
+    if "zhu2015" in methods and zhu2015_qa_arrays:
+        qa_path = build_scene_stack_output_path(
+            output_root=output_root,
+            method_name="zhu2015",
+            source_name=source_name,
+            lon=lon,
+            lat=lat,
+            target_time=target_time,
+            suffix="qa",
+        )
+        write_band_stack(qa_path, zhu2015_qa_arrays, ordered_bands, first_meta)
 
     for method_name in methods:
         for band_name, per_band_path in output_map[method_name].items():

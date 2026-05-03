@@ -46,7 +46,7 @@ def fit_model(t_days: np.ndarray, y: np.ndarray, lasso_alpha: float):
 
     x_mean = float(np.mean(t_days))
     X = make_design_matrix(t_days, order, ref_x_mean=x_mean)
-    clf = Lasso(alpha=lasso_alpha, fit_intercept=True, max_iter=2000)
+    clf = Lasso(alpha=lasso_alpha, fit_intercept=True, max_iter=1000)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ConvergenceWarning)
         clf.fit(X, y)
@@ -94,7 +94,7 @@ def fit_predict_pixel(
     x_mean = float(np.mean(t_valid))
     X = make_design_matrix(t_valid, order, ref_x_mean=x_mean)
 
-    clf = Lasso(alpha=lasso_alpha, fit_intercept=True, max_iter=2000)
+    clf = Lasso(alpha=lasso_alpha, fit_intercept=True, max_iter=1000)
     clf.fit(X, y_valid)
 
     X_target = make_design_matrix(np.array([target_t_day]), order, ref_x_mean=x_mean)
@@ -257,6 +257,39 @@ def fit_zhu2015_pixel_params(
         return params
     t_valid = np.asarray(t_days[valid_mask], dtype=np.float64)
     y_valid = np.asarray(y[valid_mask], dtype=np.float64)
+    n_obs = len(y_valid)
+
+    if n_obs >= 12:
+        clf_pre, unit_qa, order, base_rmse, x_mean = fit_model(t_valid, y_valid, lasso_alpha)
+        if clf_pre is not None and base_rmse > 0:
+            coef_pre = np.asarray(clf_pre.coef_, dtype=np.float64)
+            intercept_pre = float(clf_pre.intercept_)
+            consecutive = 0
+            has_break = False
+            for i in range(n_obs):
+                pred = _predict_single(coef_pre, intercept_pre, t_valid[i], order, x_mean)
+                if abs(y_valid[i] - pred) > max(2.0 * base_rmse, 0.01):
+                    consecutive += 1
+                    if consecutive >= 6:
+                        has_break = True
+                        break
+                else:
+                    consecutive = 0
+            if not has_break:
+                params["valid"] = True
+                params["n_segments"] = 1
+                params["segment_start_days"][0] = float(t_valid[0])
+                params["segment_end_days"][0] = float(t_valid[-1])
+                params["segment_orders"][0] = order
+                params["segment_unit_qas"][0] = unit_qa
+                params["segment_has_model"][0] = 1
+                params["segment_intercepts"][0] = float(clf_pre.intercept_)
+                params["segment_coefficients"][0] = _pack_zhu_coefficients(
+                    coef_pre, order, max_order=max_order,
+                )
+                params["segment_x_means"][0] = float(x_mean)
+                params["x_mean"] = np.float64(x_mean)
+                return params
 
     segments = extract_segments(t_valid, y_valid, lasso_alpha=lasso_alpha)
     if not segments:
