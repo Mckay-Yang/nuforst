@@ -599,23 +599,41 @@ def fit_nufrost_pixel_params(
         )
     if max_freqs is not None:
         freqs_sel = freqs_sel[:max(0, int(max_freqs))]
-    X = design_matrix(t_rel, freqs_sel, include_trend=include_trend, include_dc=True)
-    beta, _ = robust_fit_freq_ridge(X, yy_scaled, freqs_sel, lam=ridge_lam, iters=huber_iters, delta=huber_delta,
-                                    include_dc=True, include_trend=include_trend, freq_weight=freq_weight)
 
-    if outlier_sigma > 0 and len(yy) >= min_obs:
-        y_pred = X @ beta
-        residuals = yy_scaled - y_pred
-        mad = float(np.median(np.abs(residuals - np.median(residuals))))
-        threshold = outlier_sigma * 1.4826 * max(mad, 1e-12)
-        clean_mask = np.abs(residuals) <= threshold
-        if clean_mask.sum() >= max(3, min_obs) and clean_mask.sum() < len(yy):
-            t_clean = t_rel[clean_mask]
-            y_clean = yy_scaled[clean_mask]
-            X2 = design_matrix(t_clean, freqs_sel, include_trend=include_trend, include_dc=True)
-            beta2, _ = robust_fit_freq_ridge(X2, y_clean, freqs_sel, lam=ridge_lam, iters=huber_iters, delta=huber_delta,
-                                             include_dc=True, include_trend=include_trend, freq_weight=freq_weight)
-            beta = beta2
+    num_params = 1 + int(include_trend) + 2 * len(freqs_sel)
+    if outlier_sigma > 0 and len(yy) >= min_obs and num_params > 0:
+        min_needed = max(min_obs, num_params + 2)
+        t_curr = t_rel
+        y_curr = yy_scaled
+        beta = None
+        for _ in range(min(len(yy), 50)):
+            n_obs = len(y_curr)
+            if n_obs < min_needed:
+                break
+            X_curr = design_matrix(t_curr, freqs_sel, include_trend=include_trend, include_dc=True)
+            beta_curr, _ = robust_fit_freq_ridge(X_curr, y_curr, freqs_sel, lam=ridge_lam,
+                                                   iters=huber_iters, delta=huber_delta,
+                                                   include_dc=True, include_trend=include_trend,
+                                                   freq_weight=freq_weight)
+            beta = beta_curr
+            y_pred = X_curr @ beta_curr
+            residuals = y_curr - y_pred
+            mad = float(np.median(np.abs(residuals - np.median(residuals))))
+            threshold = outlier_sigma * 1.4826 * max(mad, 1e-12)
+            clean_mask = np.abs(residuals) <= threshold
+            if clean_mask.all():
+                break
+            t_curr = t_curr[clean_mask]
+            y_curr = y_curr[clean_mask]
+        if beta is None:
+            X = design_matrix(t_rel, freqs_sel, include_trend=include_trend, include_dc=True)
+            beta, _ = robust_fit_freq_ridge(X, yy_scaled, freqs_sel, lam=ridge_lam, iters=huber_iters,
+                                             delta=huber_delta, include_dc=True, include_trend=include_trend,
+                                             freq_weight=freq_weight)
+    else:
+        X = design_matrix(t_rel, freqs_sel, include_trend=include_trend, include_dc=True)
+        beta, _ = robust_fit_freq_ridge(X, yy_scaled, freqs_sel, lam=ridge_lam, iters=huber_iters, delta=huber_delta,
+                                        include_dc=True, include_trend=include_trend, freq_weight=freq_weight)
 
     params = {
         "valid": True, "include_trend": include_trend,
