@@ -44,6 +44,7 @@ class NufrostArgs:
     huber_iters: int = 3
     huber_delta: float = 0.05
     min_obs: int = 12
+    outlier_sigma: float = 2.0
 
 
 @dataclass

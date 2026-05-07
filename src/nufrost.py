@@ -392,9 +392,10 @@ def nufrost_core(cube: np.ndarray, timestamps: np.ndarray, target_time: str, arg
                 spectral_merge_tol=args.spectral_merge_tol,
                 refine_peaks=args.refine_peaks, include_trend=args.include_trend,
                 ridge_lam=args.ridge, freq_weight=args.freq_weight, huber_iters=args.huber_iters, huber_delta=args.huber_delta,
-                min_obs=args.min_obs,
-                shared_freqs=shared_freqs,
-            )
+                    min_obs=args.min_obs,
+                    shared_freqs=shared_freqs,
+                    outlier_sigma=args.outlier_sigma,
+                )
             row[j] = pred
         return i, row
 
@@ -528,6 +529,7 @@ def fit_nufrost_pixel_params(
     preferred_top_k=4, spectral_top_k=4, spectral_merge_tol=0.15,
     refine_peaks=True, include_trend=True, ridge_lam=0.01, freq_weight=2.0,
     huber_iters=3, huber_delta=1.5, min_obs=12, max_freqs=None, shared_freqs=None,
+    outlier_sigma=2.0,
 ):
     m = np.isfinite(y) & np.isfinite(t_sec)
     if m.sum() < max(3, min_obs):
@@ -600,6 +602,21 @@ def fit_nufrost_pixel_params(
     X = design_matrix(t_rel, freqs_sel, include_trend=include_trend, include_dc=True)
     beta, _ = robust_fit_freq_ridge(X, yy_scaled, freqs_sel, lam=ridge_lam, iters=huber_iters, delta=huber_delta,
                                     include_dc=True, include_trend=include_trend, freq_weight=freq_weight)
+
+    if outlier_sigma > 0 and len(yy) >= min_obs:
+        y_pred = X @ beta
+        residuals = yy_scaled - y_pred
+        mad = float(np.median(np.abs(residuals - np.median(residuals))))
+        threshold = outlier_sigma * 1.4826 * max(mad, 1e-12)
+        clean_mask = np.abs(residuals) <= threshold
+        if clean_mask.sum() >= max(3, min_obs) and clean_mask.sum() < len(yy):
+            t_clean = t_rel[clean_mask]
+            y_clean = yy_scaled[clean_mask]
+            X2 = design_matrix(t_clean, freqs_sel, include_trend=include_trend, include_dc=True)
+            beta2, _ = robust_fit_freq_ridge(X2, y_clean, freqs_sel, lam=ridge_lam, iters=huber_iters, delta=huber_delta,
+                                             include_dc=True, include_trend=include_trend, freq_weight=freq_weight)
+            beta = beta2
+
     params = {
         "valid": True, "include_trend": include_trend,
         "n_freqs_used": len(freqs_sel), "t_min": float(t.min()),
@@ -672,6 +689,7 @@ def _padded_fit_nufrost_pixel_params(
     preferred_top_k=4, spectral_top_k=4, spectral_merge_tol=0.15,
     refine_peaks=True, include_trend=True, ridge_lam=0.01, freq_weight=2.0,
     huber_iters=3, huber_delta=1.5, min_obs=12, max_freqs=10, shared_freqs=None,
+    outlier_sigma=2.0,
 ):
     raw = _orig_fit(
         t_sec, y, nufft_modes=nufft_modes, eps=eps, num_peaks=num_peaks,
@@ -685,6 +703,7 @@ def _padded_fit_nufrost_pixel_params(
         ridge_lam=ridge_lam, freq_weight=freq_weight,
         huber_iters=huber_iters, huber_delta=huber_delta, min_obs=min_obs,
         max_freqs=max_freqs, shared_freqs=shared_freqs,
+        outlier_sigma=outlier_sigma,
     )
     raw["freqs"] = _pad_freqs(raw["freqs"], max(1, max_freqs or 10))
     raw["beta"] = _pad_beta(raw["beta"], max(1, max_freqs or 10), bool(raw.get("include_trend", True)))
@@ -707,7 +726,7 @@ def predict_single_pixel(
     preferred_top_k=4, spectral_top_k=4, spectral_merge_tol=0.15,
     refine_peaks=True, include_trend=True,
     ridge_lam=0.01, freq_weight=2.0, huber_iters=3, huber_delta=1.5,
-    min_obs=12, max_freqs=None, shared_freqs=None,
+    min_obs=12, max_freqs=None, shared_freqs=None, outlier_sigma=2.0,
 ):
     params = fit_nufrost_pixel_params(
         t_sec, y,
@@ -724,5 +743,6 @@ def predict_single_pixel(
         min_obs=min_obs,
         max_freqs=max_freqs or max(num_peaks, preferred_top_k + spectral_top_k, 1),
         shared_freqs=shared_freqs,
+        outlier_sigma=outlier_sigma,
     )
     return predict_nufrost_from_params(params, target_t), int(params.get("n_freqs_used", 0))
