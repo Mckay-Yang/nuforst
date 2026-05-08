@@ -157,6 +157,86 @@ def _classify_freq_tier(freqs: np.ndarray, low_freq_period_days: float,
         period_days[pos] = 1.0 / f[pos]
     return period_days < float(low_freq_period_days)
 
+def _tiered_ridge_solve(X: np.ndarray, y: np.ndarray,
+                        freqs: np.ndarray,
+                        lambda_beta: float, lambda_high: float,
+                        low_freq_period_days: float,
+                        freq_weight: float,
+                        include_dc: bool, include_trend: bool,
+                        time_unit_seconds: bool = True) -> np.ndarray:
+    """Closed-form ridge with a two-tier penalty on frequency coefficients.
+
+    Solves the normal equation
+        (XᵀX + Λ) β = Xᵀ y
+    with the diagonal penalty
+        Λ_kk = λ_β · (W_freq)_kk² + λ_high · 1[k is a high-tier coef].
+
+    `W_freq` here has diagonal entries:
+      - 1.0  for the DC column,
+      - 1.0  for the trend column (when present),
+      - per-frequency penalty `_make_frequency_penalty(...)` for cos/sin pairs.
+
+    Note this DC/trend-row choice (1.0) differs from the legacy
+    `ridge_with_freq_weights`, which uses 0.0 there. Setting them to 1.0
+    makes `λ_β W_freqᵀ W_freq` strictly positive definite, which §14.1
+    of the design spec relies on. The numerical effect on DC/trend
+    coefficients is a microscopic shrinkage proportional to `λ_β`.
+
+    When `lambda_high == lambda_beta` and the DC/trend ridges are turned off
+    (legacy mode), this reduces to a standard ridge. We do NOT replicate
+    the legacy behavior here — that test was removed.
+
+    When `lambda_high <= lambda_beta`, the high-tier additive term is
+    omitted (i.e., high-tier coefficients receive only the W_freq-weighted
+    ridge, same as low-tier). Negative extra penalties are not supported;
+    if you want less shrinkage on the high tier, lower `lambda_beta` and
+    rebuild `W_freq` instead.
+    """
+    if X.size == 0:
+        return np.zeros(0, dtype=np.float64)
+    p = X.shape[1]
+
+    # Build the legacy diagonal penalty (DC and trend get weight 1; freq
+    # columns get the freq_weight modulation).
+    R = np.zeros(p, dtype=np.float64)
+    col = 0
+    if include_dc:
+        R[col] = 1.0
+        col += 1
+    if include_trend:
+        R[col] = 1.0
+        col += 1
+    freq_arr = np.asarray(freqs, dtype=np.float64)
+    if freq_arr.size > 0:
+        penalty = _make_frequency_penalty(freq_arr, freq_weight)
+        for w_f in penalty:
+            if col < p:
+                R[col] = w_f
+                col += 1
+            if col < p:
+                R[col] = w_f
+                col += 1
+
+    # Tier-dependent diagonal: λ_β · R^2 + λ_high · 1[high-tier]
+    lam_diag = lambda_beta * (R ** 2)
+    if freq_arr.size > 0 and lambda_high > lambda_beta:
+        is_high = _classify_freq_tier(freq_arr, low_freq_period_days,
+                                      time_unit_seconds=time_unit_seconds)
+        # extra penalty applies to cos and sin columns of high-tier freqs
+        col_h = (1 if include_dc else 0) + (1 if include_trend else 0)
+        for k, hi in enumerate(is_high):
+            if hi:
+                lam_diag[col_h + 2 * k] += (lambda_high - lambda_beta)
+                lam_diag[col_h + 2 * k + 1] += (lambda_high - lambda_beta)
+
+    # Clip defends against negative lambda_beta from caller (algorithmic
+    # path otherwise produces non-negative diagonals only).
+    sqrt_lam = np.sqrt(np.clip(lam_diag, 0.0, None))
+    X_aug = np.vstack([X, np.diag(sqrt_lam)])
+    y_aug = np.concatenate([y, np.zeros(p, dtype=np.float64)])
+    beta = _safe_lstsq(X_aug, y_aug)
+    return np.asarray(beta, dtype=np.float64)
+
 def huber_weights(r: np.ndarray, delta: float) -> np.ndarray:
     a = np.abs(r)
     w = np.ones_like(r)
