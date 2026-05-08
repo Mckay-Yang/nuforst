@@ -285,6 +285,15 @@ def _fused_lasso_1d(r: np.ndarray, lambda_step: float,
         raise ValueError(f"weights length {w.size} != n-1 ({n - 1})")
     lam = lambda_step * w
 
+    # Disable sentinel: when the smallest per-step penalty already dwarfs
+    # the data magnitude by ~1e6×, the fused-lasso solution is provably the
+    # constant signal equal to mean(r). Short-circuit to avoid spending
+    # FISTA iterations on a problem whose answer is closed-form.
+    r_abs_max = float(np.max(np.abs(r))) if n > 0 else 0.0
+    lam_min = float(lam.min()) if lam.size > 0 else 0.0
+    if lam_min > 0.0 and lam_min >= 1e6 * (r_abs_max + 1.0):
+        return np.full(n, float(r.mean()), dtype=np.float64)
+
     step = 0.25  # < 1 / ||D D^T||_2
 
     z = np.zeros(n - 1, dtype=np.float64)
@@ -318,6 +327,112 @@ def _fused_lasso_1d(r: np.ndarray, lambda_step: float,
     DT_z[:-1] -= z
     DT_z[1:] += z
     return r - DT_z
+
+def fit_nufrost_pixel_step_singleband(
+    t_sec: np.ndarray,
+    y: np.ndarray,
+    freqs_sel: np.ndarray,
+    *,
+    lambda_beta: float,
+    lambda_high: float,
+    lambda_step: float,
+    low_freq_period_days: float,
+    step_dt_weighting: bool,
+    max_outer_iter: int,
+    outer_tol: float,
+    freq_weight: float,
+    include_trend: bool,
+    min_obs: int = 12,
+) -> dict:
+    """Single-band per-pixel fit with step term + tiered ridge.
+
+    Solves the §3 BCD problem at native data scale (no y_scale normalization).
+    Callers operating on Sentinel-2 DN values should rescale before calling
+    if a different penalty regime is desired.
+
+    Returns a dict with keys:
+        valid, beta, u, freqs, t_min, t_rel_mean, n_iter, fill_value,
+        include_trend
+    `u` is returned at the same scale as `y`, padded to length len(y) with
+    zeros at masked-out indices.
+    """
+    m = np.isfinite(y) & np.isfinite(t_sec)
+    n_kept = int(m.sum())
+    out_u = np.zeros_like(y, dtype=np.float64)
+    freqs_arr = np.asarray(freqs_sel, dtype=np.float64)
+    if n_kept < max(3, min_obs):
+        return {
+            "valid": False,
+            "beta": np.zeros(0, dtype=np.float64),
+            "u": out_u,
+            "freqs": freqs_arr,
+            "t_min": float("nan"),
+            "t_rel_mean": float("nan"),
+            "n_iter": 0,
+            "fill_value": float(np.nanmean(y)) if np.isfinite(y).any() else float("nan"),
+            "include_trend": include_trend,
+        }
+
+    t = np.asarray(t_sec[m], dtype=np.float64)
+    yy = np.asarray(y[m], dtype=np.float64)
+    t_rel = t - t.min()
+    t_rel_mean = float(t_rel.mean())
+
+    X = design_matrix(t_rel, freqs_sel, include_trend=include_trend, include_dc=True)
+    if X.shape[1] == 0:
+        return {
+            "valid": False,
+            "beta": np.zeros(0, dtype=np.float64),
+            "u": out_u,
+            "freqs": freqs_arr,
+            "t_min": float(t.min()),
+            "t_rel_mean": t_rel_mean,
+            "n_iter": 0,
+            "fill_value": float(np.nanmean(yy)),
+            "include_trend": include_trend,
+        }
+
+    weights = _difference_weights(t, enable_dt_weighting=step_dt_weighting)
+    u = np.zeros_like(yy, dtype=np.float64)
+    beta = _tiered_ridge_solve(
+        X, yy - u, freqs_sel,
+        lambda_beta=lambda_beta, lambda_high=lambda_high,
+        low_freq_period_days=low_freq_period_days,
+        freq_weight=freq_weight,
+        include_dc=True, include_trend=include_trend,
+    )
+
+    n_iter = 0
+    for n_iter in range(1, max_outer_iter + 1):
+        beta_old = beta
+        u_old = u
+        residual = yy - X @ beta
+        u = _fused_lasso_1d(residual, lambda_step=lambda_step, weights=weights)
+        beta = _tiered_ridge_solve(
+            X, yy - u, freqs_sel,
+            lambda_beta=lambda_beta, lambda_high=lambda_high,
+            low_freq_period_days=low_freq_period_days,
+            freq_weight=freq_weight,
+            include_dc=True, include_trend=include_trend,
+        )
+        denom = max(float(np.linalg.norm(beta_old)) + float(np.linalg.norm(u_old)), 1e-12)
+        delta = float(np.linalg.norm(beta - beta_old) + np.linalg.norm(u - u_old))
+        if delta / denom < outer_tol:
+            break
+
+    full_u = np.zeros_like(y, dtype=np.float64)
+    full_u[m] = u
+    return {
+        "valid": True,
+        "beta": beta,
+        "u": full_u,
+        "freqs": freqs_arr,
+        "t_min": float(t.min()),
+        "t_rel_mean": t_rel_mean,
+        "n_iter": n_iter,
+        "fill_value": float(np.nanmean(yy)),
+        "include_trend": include_trend,
+    }
 
 def huber_weights(r: np.ndarray, delta: float) -> np.ndarray:
     a = np.abs(r)
