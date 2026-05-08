@@ -490,6 +490,137 @@ def _joint_outlier_mask(residuals: np.ndarray,
     return score <= threshold
 
 
+def _solve_tridiag_thomas(diag: np.ndarray, off: np.ndarray,
+                           rhs: np.ndarray) -> np.ndarray:
+    """In-place Thomas solver for symmetric tridiagonal `Ax = rhs`.
+
+    Args:
+        diag: shape (n,) main diagonal of A.
+        off: shape (n-1,) sub/super-diagonal of A.
+        rhs: shape (n,) or (n, B) right-hand side; solved column-wise.
+
+    Returns:
+        x: same shape as rhs. New array; inputs unchanged.
+    """
+    n = diag.size
+    if rhs.ndim == 1:
+        rhs2 = rhs.reshape(n, 1)
+    else:
+        rhs2 = rhs
+    cprime = np.empty(n - 1, dtype=np.float64)
+    dprime = np.empty_like(rhs2, dtype=np.float64)
+    cprime[0] = off[0] / diag[0]
+    dprime[0] = rhs2[0] / diag[0]
+    for i in range(1, n):
+        denom = diag[i] - off[i - 1] * cprime[i - 1]
+        if i < n - 1:
+            cprime[i] = off[i] / denom
+        dprime[i] = (rhs2[i] - off[i - 1] * dprime[i - 1]) / denom
+    x = np.empty_like(dprime)
+    x[-1] = dprime[-1]
+    for i in range(n - 2, -1, -1):
+        x[i] = dprime[i] - cprime[i] * x[i + 1]
+    if rhs.ndim == 1:
+        return x.ravel()
+    return x
+
+
+def _group_fused_lasso_admm(R: np.ndarray, lambda_step: float,
+                             weights: np.ndarray,
+                             rho: float = 1.0,
+                             max_iter: int = 80,
+                             tol: float = 1e-4) -> np.ndarray:
+    """Solve the multi-band group fused lasso via ADMM.
+
+    Solves
+        min_U  0.5 * ||R - U||_F^2
+             + lambda_step * sum_i weights_i * ||(D U)_i||_2
+
+    where D in R^{(n-1) x n} is the first-difference operator and
+    ||.||_2 acts on the row of D U at time index i, treating the
+    band axis as the group.
+
+    For a 2-D R of shape (n, B). For 1-D input it returns 1-D.
+
+    Convergence: ADMM on convex objective with proximable g = group L1.
+    Boyd (2011) Theorem 1 gives objective and primal-residual convergence;
+    iterate convergence holds because (1/2)||R - U||_F^2 is strictly convex
+    in U (spec section 14.5.2).
+    """
+    R_in = np.asarray(R, dtype=np.float64)
+    squeeze = R_in.ndim == 1
+    if squeeze:
+        R_in = R_in.reshape(-1, 1)
+    n, B = R_in.shape
+    if n == 0:
+        out = np.zeros((0, B), dtype=np.float64)
+        return out.ravel() if squeeze else out
+    if n == 1:
+        out = R_in.copy()
+        return out.ravel() if squeeze else out
+    w = np.asarray(weights, dtype=np.float64)
+    if w.size != n - 1:
+        raise ValueError(f"weights length {w.size} != n-1 ({n - 1})")
+    if lambda_step <= 0.0:
+        out = R_in.copy()
+        return out.ravel() if squeeze else out
+
+    lam = lambda_step * w  # shape (n-1,)
+
+    # Disable sentinel: when the smallest per-step penalty already exceeds
+    # max_i ||(D R)_i||_2 by a comfortable margin, V is zeroed at every
+    # iteration and U converges to the per-band column mean. Short-circuit.
+    if lam.size > 0:
+        DR = np.diff(R_in, axis=0)
+        dr_max = float(np.max(np.linalg.norm(DR, axis=1))) if DR.size > 0 else 0.0
+        lam_min = float(lam.min())
+        if lam_min > 0.0 and lam_min >= 10.0 * (dr_max + 1e-12):
+            means = R_in.mean(axis=0, keepdims=True)
+            out = np.broadcast_to(means, (n, B)).copy()
+            return out.ravel() if squeeze else out
+
+    # Build I + rho * D^T D as a tridiagonal SPD matrix.
+    diag = np.full(n, 1.0 + 2.0 * rho, dtype=np.float64)
+    diag[0] = 1.0 + rho
+    diag[-1] = 1.0 + rho
+    off = np.full(n - 1, -rho, dtype=np.float64)
+
+    V = np.zeros((n - 1, B), dtype=np.float64)
+    Lam = np.zeros((n - 1, B), dtype=np.float64)
+    U_prev = R_in.copy()
+
+    U = R_in.copy()
+    for _ in range(max_iter):
+        # U-update: solve (I + rho D^T D) U = R + rho D^T (V - Lam)
+        diff = V - Lam                               # (n-1, B)
+        DT_term = np.zeros((n, B), dtype=np.float64)
+        DT_term[:-1] -= diff
+        DT_term[1:] += diff
+        rhs = R_in + rho * DT_term
+        U = _solve_tridiag_thomas(diag, off, rhs)
+
+        # V-update: group soft-threshold per row
+        DU = np.diff(U, axis=0)                      # (n-1, B)
+        Z = DU + Lam
+        norms = np.linalg.norm(Z, axis=1)            # (n-1,)
+        thresh = lam / rho                           # (n-1,)
+        scale = np.where(norms > 0, np.maximum(0.0, 1.0 - thresh / np.maximum(norms, 1e-30)), 0.0)
+        V = scale[:, None] * Z
+
+        # Dual update
+        Lam = Lam + DU - V
+
+        # Convergence: primal residual on each block
+        primal = np.max(np.abs(DU - V))
+        change = np.max(np.abs(U - U_prev))
+        U_prev = U
+        if primal < tol and change < tol:
+            break
+
+    out = U
+    return out.ravel() if squeeze else out
+
+
 def huber_weights(r: np.ndarray, delta: float) -> np.ndarray:
     a = np.abs(r)
     w = np.ones_like(r)
