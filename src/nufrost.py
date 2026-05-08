@@ -801,6 +801,145 @@ def fit_nufrost_pixel_multiband(
     }
 
 
+def nufrost_core_multiband(
+    band_cubes: 'DictType[str, np.ndarray]',
+    timestamps: np.ndarray,
+    target_time: str,
+    args,
+    shared_freqs=None,
+) -> 'DictType[str, np.ndarray]':
+    """Run the multi-band NUFROST fit on a stacked per-band cube dict.
+
+    band_cubes: {band_name: cube of shape (n, H, W)}, all sharing the same n.
+    Returns: {band_name: prediction of shape (H, W)} matching the legacy
+    `nufrost_core` per-band output contract.
+
+    Per pixel we:
+        1. Build Y (n, B) from band_cubes at (i, j).
+        2. Pick freqs_sel: shared_freqs (required; pipeline must compute it).
+        3. Call fit_nufrost_pixel_multiband.
+        4. Predict at target_t per band: y_b(t*) = X(t*) beta_b + last_segment(u_b).
+    """
+    if not band_cubes:
+        return {}
+
+    band_order = list(band_cubes.keys())
+    cube0 = band_cubes[band_order[0]]
+    n_t, H, W = cube0.shape
+    for name, cube in band_cubes.items():
+        if cube.shape != (n_t, H, W):
+            raise ValueError(f"Band {name} shape {cube.shape} differs from {cube0.shape}")
+
+    t_sec = timestamps_to_seconds(timestamps, unit=args.time_unit)
+    target_dt = parse_timestamp_str(target_time)
+    if target_dt is None:
+        raise ValueError(f"Unrecognized target_time: {target_time}")
+    target_t = target_dt.timestamp()
+    if args.time_unit == "days":
+        target_t = target_t / 86400.0
+
+    out = {name: np.full((H, W), np.nan, dtype=np.float32) for name in band_order}
+
+    if shared_freqs is None:
+        raise ValueError(
+            "nufrost_core_multiband requires shared_freqs; pipeline must "
+            "compute it via build_shared_frequency_pool before calling."
+        )
+    freqs_sel = np.asarray(shared_freqs, dtype=np.float64)
+
+    def _predict_pixel(i: int, j: int):
+        Y = np.stack([band_cubes[b][:, i, j] for b in band_order], axis=1)
+        params = fit_nufrost_pixel_multiband(
+            t_sec, Y, freqs_sel=freqs_sel,
+            lambda_beta=args.ridge,
+            lambda_high=args.lambda_high,
+            lambda_step=args.lambda_step,
+            low_freq_period_days=args.low_freq_period_days,
+            step_dt_weighting=args.step_dt_weighting,
+            joint_outlier=args.joint_outlier,
+            joint_outlier_sigma=args.joint_outlier_sigma,
+            max_outer_iter=args.max_outer_iter,
+            outer_tol=args.outer_tol,
+            admm_rho=args.admm_rho,
+            admm_max_iter=args.admm_max_iter,
+            admm_tol=args.admm_tol,
+            freq_weight=args.freq_weight,
+            include_trend=args.include_trend,
+            min_obs=args.min_obs,
+        )
+        if not params["valid"]:
+            return i, j, np.array([np.nanmean(Y[:, b]) for b in range(len(band_order))], dtype=np.float32)
+        beta = params["beta"]                       # (p, B)
+        # Compute X(t*): row vector aligned with t_min from kept obs
+        t_star_rel = float(target_t - params["t_min"])
+        cols = [1.0]
+        if include_trend := params.get("include_trend", True):
+            cols.append(t_star_rel - params.get("t_rel_mean", 0.0))
+        for f in freqs_sel:
+            w = 2 * np.pi * f
+            cols.append(np.cos(w * t_star_rel))
+            cols.append(np.sin(w * t_star_rel))
+        x_star = np.array(cols, dtype=np.float64)[: beta.shape[0]]
+        # Step term value at t*: use last kept (base AND joint-mask) observation.
+        u_full = params["u"]                        # (n, B)
+        mask = params["mask"]                       # (n,)
+        if mask.any():
+            t_obs = t_sec[mask]
+            order = np.searchsorted(t_obs, target_t, side="right") - 1
+            order = max(0, min(order, t_obs.size - 1))
+            seg_vals = u_full[mask][order]
+        else:
+            seg_vals = np.zeros(beta.shape[1], dtype=np.float64)
+        preds = x_star @ beta + seg_vals
+        return i, j, preds.astype(np.float32)
+
+    n_jobs = args.n_jobs
+    if n_jobs <= 0:
+        n_jobs = max(1, int(os.cpu_count() or 1)) if cpu_count is None else max(1, int(cpu_count()))
+    n_jobs = min(n_jobs, H * W)
+
+    print(f"[System] Starting NUFROST multi-band reconstruction with {n_jobs} jobs...")
+
+    pixel_indices = [(i, j) for i in range(H) for j in range(W)]
+    if not JOBLIB_AVAILABLE or n_jobs == 1:
+        iterator = pixel_indices
+        if args.show_progress and TQDM_AVAILABLE:
+            iterator = tqdm(iterator, total=len(pixel_indices), desc="Processing Pixels")
+        for i, j in iterator:
+            _, _, preds = _predict_pixel(i, j)
+            for k, name in enumerate(band_order):
+                out[name][i, j] = preds[k]
+        return out
+
+    assert Parallel is not None and delayed is not None
+    try:
+        if args.show_progress and TQDM_AVAILABLE:
+            try:
+                results_gen = Parallel(n_jobs=n_jobs, prefer="processes", return_as="generator")(
+                    delayed(_predict_pixel)(i, j) for i, j in pixel_indices
+                )
+                for i, j, preds in tqdm(results_gen, total=len(pixel_indices), desc="Processing Pixels"):
+                    for k, name in enumerate(band_order):
+                        out[name][i, j] = preds[k]
+                return out
+            except TypeError:
+                pass
+        results = Parallel(n_jobs=n_jobs, prefer="processes")(
+            delayed(_predict_pixel)(i, j) for i, j in pixel_indices
+        )
+        for i, j, preds in results:
+            for k, name in enumerate(band_order):
+                out[name][i, j] = preds[k]
+    except Exception as e:
+        print(f"[Error] Parallel execution failed: {e}. Falling back to serial.")
+        for i, j in pixel_indices:
+            _, _, preds = _predict_pixel(i, j)
+            for k, name in enumerate(band_order):
+                out[name][i, j] = preds[k]
+
+    return out
+
+
 def huber_weights(r: np.ndarray, delta: float) -> np.ndarray:
     a = np.abs(r)
     w = np.ones_like(r)
