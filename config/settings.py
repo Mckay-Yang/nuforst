@@ -51,6 +51,11 @@ class NufrostArgs:
     step_dt_weighting: bool = True
     max_outer_iter: int = 5
     outer_tol: float = 1e-3
+    joint_outlier: bool = True
+    joint_outlier_sigma: float = 2.5
+    admm_rho: float = 1.0
+    admm_max_iter: int = 80
+    admm_tol: float = 1e-4
 
 
 @dataclass

@@ -22,5 +22,10 @@
   "low_freq_period_days": 60.0,
   "step_dt_weighting": true,
   "max_outer_iter": 5,
-  "outer_tol": 1e-3
+  "outer_tol": 1e-3,
+  "joint_outlier": true,
+  "joint_outlier_sigma": 2.5,
+  "admm_rho": 1.0,
+  "admm_max_iter": 80,
+  "admm_tol": 1e-4
 }
