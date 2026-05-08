@@ -26,7 +26,7 @@ from ..data_loader import (
 )
 from ..hants import hants_pixel
 from ..logger import log as _log
-from ..nufrost import nufrost_core, timestamps_to_seconds, next_even, select_peaks_adaptive, refine_parabolic, _preferred_periods_to_freqs
+from ..nufrost import nufrost_core, nufrost_core_multiband, timestamps_to_seconds, next_even, select_peaks_adaptive, refine_parabolic, _preferred_periods_to_freqs
 from ..zhu2015 import fit_predict_pixel_segments
 
 
@@ -771,6 +771,26 @@ def reconstruct_full_scene_for_location(
         shared_freqs = np.array(sorted(set(float(f) for f in combined if np.isfinite(f) and f > nufrost_args.ignore_dc_hz)), dtype=np.float64)
         _log("reconstruct_full_scene_for_location", f"Shared NUFROST frequencies: {len(shared_freqs)} (spectral={len(spectral_freqs)} preferred={pref_top})")
 
+    # If NUFROST is requested with the multi-band step term enabled, run it
+    # once across all bands so that the group fused lasso can find shared
+    # break points. Otherwise fall back to the per-band legacy path.
+    nufrost_predictions: Dict[str, np.ndarray] = {}
+    if "nufrost" in methods:
+        active_args = nufrost_args or build_args("nufrost", dict(build_nufrost_args))
+        if getattr(active_args, "lambda_step", 1e30) < 1e30 and len(prepared_bands) > 0:
+            _log("reconstruct_full_scene_for_location", "Running NUFROST multi-band path")
+            band_cubes_for_multi = {b: prepared_bands[b]["masked_cube"] for b in band_stacks.keys()}
+            shared_ts = next(iter(prepared_bands.values()))["masked_timestamps"]
+            t0 = time.perf_counter()
+            preds_by_band = nufrost_core_multiband(
+                band_cubes_for_multi, shared_ts, target_time,
+                args=active_args, shared_freqs=shared_freqs,
+            )
+            elapsed = time.perf_counter() - t0
+            for b, arr in preds_by_band.items():
+                timing_seconds["nufrost"][b] = elapsed / max(1, len(preds_by_band))
+                nufrost_predictions[b] = arr
+
     for band_name, prepared in prepared_bands.items():
         stack_paths = prepared["stack_paths"]
         data = prepared["data"]
@@ -781,15 +801,21 @@ def reconstruct_full_scene_for_location(
             output_path = build_output_path(output_root=output_root, method_name=method_name, source_file=stack_paths[0], target_time=target_time, source_name=source_name, lon=lon, lat=lat)
             t0 = time.perf_counter()
             if method_name == "nufrost":
-                args = nufrost_args or build_args("nufrost", dict(build_nufrost_args))
-                prediction = nufrost_core(masked_cube, masked_timestamps, target_time, args=args, shared_freqs=shared_freqs)
+                if band_name in nufrost_predictions:
+                    prediction = nufrost_predictions[band_name]
+                    elapsed = timing_seconds["nufrost"].get(band_name, 0.0)
+                else:
+                    args = nufrost_args or build_args("nufrost", dict(build_nufrost_args))
+                    prediction = nufrost_core(masked_cube, masked_timestamps, target_time, args=args, shared_freqs=shared_freqs)
+                    elapsed = time.perf_counter() - t0
             elif method_name == "hants":
                 prediction = reconstruct_hants_from_cube(masked_cube, masked_timestamps, target_time, n_jobs=n_jobs)
+                elapsed = time.perf_counter() - t0
             elif method_name == "zhu2015":
                 prediction = reconstruct_zhu2015_from_cube(masked_cube, masked_timestamps, target_time, n_jobs=n_jobs)
+                elapsed = time.perf_counter() - t0
             else:
                 raise ValueError(f"Unsupported method: {method_name}")
-            elapsed = time.perf_counter() - t0
             timing_seconds[method_name][band_name] = elapsed
             _log("reconstruct_full_scene_for_location", f"Band {band_name} / {method_name}: {elapsed:.1f}s")
 
