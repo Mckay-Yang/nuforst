@@ -252,6 +252,73 @@ def _difference_weights(t_sec: np.ndarray, enable_dt_weighting: bool) -> np.ndar
     dt_clamped = np.maximum(dt_days, 1.0)
     return 1.0 / np.sqrt(dt_clamped)
 
+def _fused_lasso_1d(r: np.ndarray, lambda_step: float,
+                    weights: np.ndarray,
+                    max_iter: int = 5000, tol: float = 1e-9) -> np.ndarray:
+    """Reference fused lasso via accelerated (FISTA) proximal gradient on the dual.
+
+    Solves   min_u 0.5 ||r - u||^2 + lambda_step * sum_i w_i |u_{i+1} - u_i|
+
+    by iterating on the dual variable z in R^{n-1}:
+
+        u = r - D^T z
+        z <- project_{|z_i| <= lam_i}(z + step * D u)
+
+    where D is the first-difference operator and lam_i = lambda_step * w_i.
+    Step size 1 / ||D D^T||_2 = 1/4 guarantees convergence (since the
+    largest eigenvalue of D D^T on R^{n-1} is < 4). FISTA momentum gives
+    O(1/k^2) convergence on the dual objective, important when lambda is
+    very large because the slowest mode otherwise drags out for thousands
+    of plain-gradient steps.
+    """
+    r = np.ascontiguousarray(r, dtype=np.float64)
+    n = r.size
+    if n == 0:
+        return np.zeros(0, dtype=np.float64)
+    if n == 1:
+        return r.copy()
+    if lambda_step <= 0.0:
+        return r.copy()
+
+    w = np.ascontiguousarray(weights, dtype=np.float64)
+    if w.size != n - 1:
+        raise ValueError(f"weights length {w.size} != n-1 ({n - 1})")
+    lam = lambda_step * w
+
+    step = 0.25  # < 1 / ||D D^T||_2
+
+    z = np.zeros(n - 1, dtype=np.float64)
+    y = z.copy()             # FISTA extrapolated point
+    t_prev = 1.0
+    u_prev = None
+
+    for _ in range(max_iter):
+        # u from extrapolated dual y: u = r - D^T y
+        DT_y = np.zeros(n, dtype=np.float64)
+        DT_y[:-1] -= y
+        DT_y[1:] += y
+        u = r - DT_y
+        # gradient step on y
+        Du = np.diff(u)
+        z_new = y + step * Du
+        np.clip(z_new, -lam, lam, out=z_new)
+        # FISTA extrapolation
+        t_new = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * t_prev * t_prev))
+        y = z_new + ((t_prev - 1.0) / t_new) * (z_new - z)
+
+        if u_prev is not None and np.max(np.abs(u - u_prev)) < tol:
+            z = z_new
+            break
+        z = z_new
+        t_prev = t_new
+        u_prev = u
+
+    # Recompute final primal from latest z (consistency).
+    DT_z = np.zeros(n, dtype=np.float64)
+    DT_z[:-1] -= z
+    DT_z[1:] += z
+    return r - DT_z
+
 def huber_weights(r: np.ndarray, delta: float) -> np.ndarray:
     a = np.abs(r)
     w = np.ones_like(r)
