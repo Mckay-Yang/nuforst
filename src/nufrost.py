@@ -135,6 +135,28 @@ def design_matrix(t: np.ndarray, freqs: Union[Sequence[float], np.ndarray], incl
         cols.append(np.sin(w*t))
     return np.vstack(cols).T if cols else np.empty((len(t),0))
 
+def _classify_freq_tier(freqs: np.ndarray, low_freq_period_days: float,
+                        time_unit_seconds: bool = True) -> np.ndarray:
+    """Return boolean mask: True where frequency belongs to high-freq tier
+    (period < low_freq_period_days). Zero frequencies are treated as low.
+
+    Args:
+        freqs: 1D array of frequencies in Hz (when time_unit_seconds=True)
+            or in cycles/day (when False).
+        low_freq_period_days: tier threshold in days.
+        time_unit_seconds: True if `freqs` are Hz.
+    """
+    f = np.asarray(freqs, dtype=np.float64)
+    if f.size == 0:
+        return np.zeros(0, dtype=np.bool_)
+    pos = f > 0.0
+    period_days = np.full_like(f, np.inf)
+    if time_unit_seconds:
+        period_days[pos] = 1.0 / (f[pos] * 86400.0)
+    else:
+        period_days[pos] = 1.0 / f[pos]
+    return period_days < float(low_freq_period_days)
+
 def huber_weights(r: np.ndarray, delta: float) -> np.ndarray:
     a = np.abs(r)
     w = np.ones_like(r)
