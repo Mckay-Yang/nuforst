@@ -237,6 +237,21 @@ def _tiered_ridge_solve(X: np.ndarray, y: np.ndarray,
     beta = _safe_lstsq(X_aug, y_aug)
     return np.asarray(beta, dtype=np.float64)
 
+def _difference_weights(t_sec: np.ndarray, enable_dt_weighting: bool) -> np.ndarray:
+    """Return per-step weights w_i for the difference operator.
+
+    w_i = 1 / sqrt(max(Δt_i_in_days, 1.0)) when enabled, else 1.0.
+    Output length is `len(t_sec) - 1`.
+    """
+    n = len(t_sec)
+    if n <= 1:
+        return np.zeros(0, dtype=np.float64)
+    if not enable_dt_weighting:
+        return np.ones(n - 1, dtype=np.float64)
+    dt_days = np.diff(np.asarray(t_sec, dtype=np.float64)) / 86400.0
+    dt_clamped = np.maximum(dt_days, 1.0)
+    return 1.0 / np.sqrt(dt_clamped)
+
 def huber_weights(r: np.ndarray, delta: float) -> np.ndarray:
     a = np.abs(r)
     w = np.ones_like(r)
