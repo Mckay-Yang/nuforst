@@ -621,6 +621,186 @@ def _group_fused_lasso_admm(R: np.ndarray, lambda_step: float,
     return out.ravel() if squeeze else out
 
 
+def fit_nufrost_pixel_multiband(
+    t_sec: np.ndarray,
+    Y: np.ndarray,
+    freqs_sel: np.ndarray,
+    *,
+    lambda_beta: float,
+    lambda_high: float,
+    lambda_step: float,
+    low_freq_period_days: float,
+    step_dt_weighting: bool,
+    joint_outlier: bool,
+    joint_outlier_sigma: float,
+    max_outer_iter: int,
+    outer_tol: float,
+    admm_rho: float,
+    admm_max_iter: int,
+    admm_tol: float,
+    freq_weight: float,
+    include_trend: bool,
+    min_obs: int = 12,
+) -> dict:
+    """Multi-band per-pixel NUFROST fit: tiered ridge beta per band, group
+    fused lasso step term u shared via break-point locations across bands.
+
+    Y: shape (n, B) where n is the number of timestamps and B the bands.
+    Returns a dict with keys:
+        valid, beta (p, B), u (n, B), freqs, t_min, t_rel_mean, n_iter,
+        mask (n,), include_trend
+    `u` is at native data scale, padded back to the full input length.
+    Indices outside `base_mask` (NaN-y or NaN-t inputs) are filled with 0.
+    Indices excluded by the joint outlier mask carry forward the last
+    accepted segment value, so prediction code never sees artificial dips
+    at outlier timestamps.
+    """
+    Y = np.asarray(Y, dtype=np.float64)
+    if Y.ndim == 1:
+        Y = Y.reshape(-1, 1)
+    n_full, B = Y.shape
+    t_full = np.asarray(t_sec, dtype=np.float64)
+    if t_full.size != n_full:
+        raise ValueError(f"t_sec length {t_full.size} != Y rows {n_full}")
+    freqs_arr = np.asarray(freqs_sel, dtype=np.float64)
+
+    # Per-row finite mask (need all bands finite to participate).
+    finite_y = np.isfinite(Y).all(axis=1)
+    finite_t = np.isfinite(t_full)
+    base_mask = finite_y & finite_t
+    n_kept_base = int(base_mask.sum())
+    out_u = np.zeros((n_full, B), dtype=np.float64)
+
+    if n_kept_base < max(3, min_obs):
+        return {
+            "valid": False,
+            "beta": np.zeros((0, B), dtype=np.float64),
+            "u": out_u,
+            "freqs": freqs_arr,
+            "t_min": float("nan"),
+            "t_rel_mean": float("nan"),
+            "n_iter": 0,
+            "mask": base_mask,
+            "include_trend": include_trend,
+        }
+
+    t_kept = t_full[base_mask]
+    Y_kept = Y[base_mask]
+    t_min = float(t_kept.min())
+    t_rel = t_kept - t_min
+    t_rel_mean = float(t_rel.mean())
+
+    X_full = design_matrix(t_rel, freqs_sel, include_trend=include_trend, include_dc=True)
+    if X_full.shape[1] == 0:
+        return {
+            "valid": False,
+            "beta": np.zeros((0, B), dtype=np.float64),
+            "u": out_u,
+            "freqs": freqs_arr,
+            "t_min": t_min,
+            "t_rel_mean": t_rel_mean,
+            "n_iter": 0,
+            "mask": base_mask,
+            "include_trend": include_trend,
+        }
+
+    # Joint outlier preprocessing: do a quick per-band ridge with no step
+    # term, compute residuals, then apply MAD-based joint mask.
+    if joint_outlier and n_kept_base >= max(min_obs, 2 * X_full.shape[1]):
+        residuals = np.zeros_like(Y_kept)
+        sigmas = np.zeros(B, dtype=np.float64)
+        for b in range(B):
+            beta_b = _tiered_ridge_solve(
+                X_full, Y_kept[:, b], freqs_sel,
+                lambda_beta=lambda_beta, lambda_high=lambda_high,
+                low_freq_period_days=low_freq_period_days,
+                freq_weight=freq_weight,
+                include_dc=True, include_trend=include_trend,
+            )
+            r_b = Y_kept[:, b] - X_full @ beta_b
+            residuals[:, b] = r_b
+            sigmas[b] = float(np.median(np.abs(r_b - np.median(r_b)))) * 1.4826
+        mask_joint = _joint_outlier_mask(residuals, sigmas, sigma=joint_outlier_sigma)
+    else:
+        mask_joint = np.ones(n_kept_base, dtype=np.bool_)
+
+    n_kept = int(mask_joint.sum())
+    if n_kept < max(3, min_obs):
+        # Fall back to disabling the joint mask if it shrunk the data too much.
+        mask_joint = np.ones(n_kept_base, dtype=np.bool_)
+        n_kept = n_kept_base
+
+    t_use = t_kept[mask_joint]
+    Y_use = Y_kept[mask_joint]
+    t_use_rel = t_use - t_use.min()
+    X = design_matrix(t_use_rel, freqs_sel, include_trend=include_trend, include_dc=True)
+    weights = _difference_weights(t_use, enable_dt_weighting=step_dt_weighting)
+
+    # BCD outer loop: beta per band (closed form), then U via ADMM (joint).
+    p = X.shape[1]
+    Beta = np.zeros((p, B), dtype=np.float64)
+    for b in range(B):
+        Beta[:, b] = _tiered_ridge_solve(
+            X, Y_use[:, b], freqs_sel,
+            lambda_beta=lambda_beta, lambda_high=lambda_high,
+            low_freq_period_days=low_freq_period_days,
+            freq_weight=freq_weight,
+            include_dc=True, include_trend=include_trend,
+        )
+    U = np.zeros_like(Y_use)
+
+    n_iter = 0
+    for n_iter in range(1, max_outer_iter + 1):
+        Beta_old = Beta
+        U_old = U
+        residual = Y_use - X @ Beta
+        U = _group_fused_lasso_admm(
+            residual, lambda_step=lambda_step, weights=weights,
+            rho=admm_rho, max_iter=admm_max_iter, tol=admm_tol,
+        )
+        for b in range(B):
+            Beta[:, b] = _tiered_ridge_solve(
+                X, Y_use[:, b] - U[:, b], freqs_sel,
+                lambda_beta=lambda_beta, lambda_high=lambda_high,
+                low_freq_period_days=low_freq_period_days,
+                freq_weight=freq_weight,
+                include_dc=True, include_trend=include_trend,
+            )
+        denom = max(float(np.linalg.norm(Beta_old)) + float(np.linalg.norm(U_old)), 1e-12)
+        delta = float(np.linalg.norm(Beta - Beta_old) + np.linalg.norm(U - U_old))
+        if delta / denom < outer_tol:
+            break
+
+    # Pad U back to full length: place values at base_mask & joint_mask
+    # positions; carry-forward last value across joint-masked-out positions.
+    U_kept = np.zeros((n_kept_base, B), dtype=np.float64)
+    U_kept[mask_joint] = U
+    # carry-forward across mask gaps for the kept (base_mask) range
+    for b in range(B):
+        last = 0.0
+        for i in range(n_kept_base):
+            if mask_joint[i]:
+                last = U_kept[i, b]
+            else:
+                U_kept[i, b] = last
+    out_u[base_mask] = U_kept
+
+    full_mask = np.zeros(n_full, dtype=np.bool_)
+    full_mask[base_mask] = mask_joint
+
+    return {
+        "valid": True,
+        "beta": Beta,
+        "u": out_u,
+        "freqs": freqs_arr,
+        "t_min": float(t_use.min()),
+        "t_rel_mean": float(t_use_rel.mean()),
+        "n_iter": n_iter,
+        "mask": full_mask,
+        "include_trend": include_trend,
+    }
+
+
 def huber_weights(r: np.ndarray, delta: float) -> np.ndarray:
     a = np.abs(r)
     w = np.ones_like(r)
