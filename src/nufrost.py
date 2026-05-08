@@ -434,6 +434,62 @@ def fit_nufrost_pixel_step_singleband(
         "include_trend": include_trend,
     }
 
+
+def _joint_outlier_mask(residuals: np.ndarray,
+                         sigmas: np.ndarray,
+                         sigma: float) -> np.ndarray:
+    """Single-pass joint outlier mask across bands.
+
+    Args:
+        residuals: shape (n, B) per-band residuals from a quick ridge fit.
+        sigmas: shape (B,) per-band MAD-derived robust scale estimates.
+            Bands with sigma <= 0 are excluded from the joint score.
+        sigma: rejection threshold applied to MAD(score).
+
+    Returns:
+        mask: shape (n,) bool. True where the joint anomaly score is within
+        sigma * MAD(score) of the median; False where the timestep is
+        rejected as a correlated outlier across bands.
+    """
+    R = np.asarray(residuals, dtype=np.float64)
+    if R.ndim != 2:
+        raise ValueError(f"residuals must be 2-D (n, B); got shape {R.shape}")
+    n, B = R.shape
+    if n == 0:
+        return np.zeros(0, dtype=np.bool_)
+
+    s = np.asarray(sigmas, dtype=np.float64)
+    if s.size != B:
+        raise ValueError(f"sigmas length {s.size} != B={B}")
+
+    # Standardize residuals; ignore degenerate bands (sigma <= 0).
+    valid_band = s > 0
+    if not np.any(valid_band):
+        return np.ones(n, dtype=np.bool_)
+    Rz = np.zeros_like(R)
+    Rz[:, valid_band] = R[:, valid_band] / s[valid_band]
+
+    # Single effective band: fall back to a marginal sigma threshold on the
+    # standardized residual. The MAD-of-score recipe used for B>=2 is biased
+    # for a half-normal score distribution and would over-reject here.
+    n_valid = int(np.sum(valid_band))
+    if n_valid == 1:
+        z = Rz[:, valid_band].ravel()
+        return np.abs(z) <= sigma
+
+    # Joint anomaly score per timestep.
+    score = np.linalg.norm(Rz[:, valid_band], axis=1)
+
+    # Threshold via MAD on the score.
+    med = float(np.median(score))
+    mad = float(np.median(np.abs(score - med))) * 1.4826
+    if mad <= 0.0:
+        # Fallback: degenerate score distribution; keep everything finite.
+        return np.isfinite(score)
+    threshold = med + sigma * mad
+    return score <= threshold
+
+
 def huber_weights(r: np.ndarray, delta: float) -> np.ndarray:
     a = np.abs(r)
     w = np.ones_like(r)
