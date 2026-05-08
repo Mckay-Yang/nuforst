@@ -45,6 +45,12 @@ class NufrostArgs:
     huber_delta: float = 0.05
     min_obs: int = 12
     outlier_sigma: float = 2.0
+    lambda_step: float = 1e30
+    lambda_high: float = 0.005
+    low_freq_period_days: float = 60.0
+    step_dt_weighting: bool = True
+    max_outer_iter: int = 5
+    outer_tol: float = 1e-3
 
 
 @dataclass
