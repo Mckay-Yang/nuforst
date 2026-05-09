@@ -27,6 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--spectral-top-k", type=int, default=None)
     parser.add_argument("--preferred-top-k", type=int, default=None)
     parser.add_argument("--num-peaks", type=int, default=None)
+    parser.add_argument("--rerun-methods", nargs="+", default=[])
     return parser
 
 
@@ -40,6 +41,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "methods": tuple(args.methods),
         "n_jobs": args.n_jobs,
         "force_refresh": args.force_refresh,
+        "rerun_methods": tuple(args.rerun_methods),
     }
     for key in ("frequency_selection", "spectral_top_k", "preferred_top_k", "num_peaks"):
         val = getattr(args, key, None)

@@ -365,9 +365,11 @@ def make_masked_time_series(cube: np.ndarray, timestamps: Sequence[str], target_
 
 def extract_prediction_2d(method_name: str, prediction: np.ndarray) -> np.ndarray:
     if method_name == "zhu2015":
-        if prediction.ndim != 3 or prediction.shape[0] < 1:
-            raise ValueError("Zhu2015 prediction must have shape (2, H, W) or compatible.")
-        return np.asarray(prediction[0], dtype=np.float32)
+        if prediction.ndim == 2:
+            return np.asarray(prediction, dtype=np.float32)
+        if prediction.ndim == 3 and prediction.shape[0] >= 1:
+            return np.asarray(prediction[0], dtype=np.float32)
+        raise ValueError("Zhu2015 prediction must have shape (H, W) or compatible.")
     return np.asarray(prediction, dtype=np.float32)
 
 
@@ -554,19 +556,37 @@ def reconstruct_zhu2015_from_cube(
     target_t_day = (target_dt.timestamp() - t0_sec) / 86400.0
 
     _, height, width = cube.shape
-    out = np.full((2, height, width), np.nan, dtype=np.float32)
+    out = np.full((height, width), np.nan, dtype=np.float32)
 
     def _process_row(row_idx: int):
-        row = np.full((2, width), np.nan, dtype=np.float32)
+        row = np.full(width, np.nan, dtype=np.float32)
         for col_idx in range(width):
-            pred, qa = fit_predict_pixel_segments(t_days, cube[:, row_idx, col_idx], target_t_day, lasso_alpha=lasso_alpha)
-            row[0, col_idx] = pred
-            row[1, col_idx] = int(qa) if np.isfinite(qa) else np.nan
+            row[col_idx] = fit_predict_pixel_segments(t_days, cube[:, row_idx, col_idx], target_t_day, lasso_alpha=lasso_alpha)
         return row_idx, row
 
     for row_idx, row in _run_parallel_rows(height, _process_row, n_jobs=n_jobs, desc="Zhu2015 Rows"):
-        out[:, row_idx, :] = row
+        out[row_idx, :] = row
     return out
+
+
+def _existing_merged_prediction_path(
+    output_root: Path,
+    method_name: str,
+    source_name: str,
+    lon: float,
+    lat: float,
+    target_time: str,
+) -> Optional[Path]:
+    path = build_scene_stack_output_path(
+        output_root=output_root,
+        method_name=method_name,
+        source_name=source_name,
+        lon=lon,
+        lat=lat,
+        target_time=target_time,
+        suffix="prediction",
+    )
+    return path if path.exists() else None
 
 
 def _write_prediction(output_path: Path, array: np.ndarray, meta: Mapping[str, object]) -> None:
@@ -651,11 +671,13 @@ def reconstruct_full_scene_for_location(
     spectral_top_k: Optional[int] = None,
     preferred_top_k: Optional[int] = None,
     num_peaks: Optional[int] = None,
+    rerun_methods: Sequence[str] = (),
 ) -> Dict[str, Any]:
     _log("reconstruct_full_scene_for_location", f"Start source={source_name} lon={lon:.4f} lat={lat:.4f} methods={list(methods)} window_size={window_size}")
     output_root = Path(output_root)
     data_root = Path(data_root)
     cache_dir = Path(cache_dir)
+    rerun_methods = tuple(str(method) for method in rerun_methods)
 
     data_dir = _resolve_data_dir(source_name, data_root)
     band_stacks = discover_location_band_stacks(data_dir, source_name=source_name, lon=lon, lat=lat, cache_dir=cache_dir)
@@ -678,7 +700,7 @@ def reconstruct_full_scene_for_location(
         preferred_top_k=preferred_top_k,
         num_peaks=num_peaks,
     )
-    if existing_summary is not None:
+    if existing_summary is not None and not rerun_methods:
         _log("reconstruct_full_scene_for_location", f"Skipping (existing summary): {existing_summary}")
         return {"skipped": True, "summary_path": str(existing_summary)}
 
@@ -700,14 +722,25 @@ def reconstruct_full_scene_for_location(
     )
     _log("reconstruct_full_scene_for_location", f"Selected target_time={target_time}")
 
-    output_map: Dict[str, Dict[str, str]] = {method: {} for method in methods}
     merged_prediction_map: Dict[str, str] = {}
+    reusable_methods: set[str] = set()
+    for method_name in methods:
+        if method_name == "nufrost" or method_name in rerun_methods:
+            continue
+        existing_prediction = _existing_merged_prediction_path(
+            output_root, method_name, source_name, lon, lat, target_time,
+        )
+        if existing_prediction is not None:
+            reusable_methods.add(method_name)
+            merged_prediction_map[method_name] = str(existing_prediction)
+            _log("reconstruct_full_scene_for_location", f"Reusing existing {method_name} prediction: {existing_prediction}")
+
+    output_map: Dict[str, Dict[str, str]] = {method: {} for method in methods}
     timing_seconds: Dict[str, Dict[str, float]] = {method: {} for method in methods}
     mask_indices: Dict[str, int] = {}
     counts_before: Dict[str, int] = {}
     counts_after: Dict[str, int] = {}
     prediction_arrays: Dict[str, Dict[str, np.ndarray]] = {method: {} for method in methods}
-    zhu2015_qa_arrays: Dict[str, np.ndarray] = {}
     ground_truth_arrays: Dict[str, np.ndarray] = {}
     band_meta: Dict[str, Mapping[str, object]] = {}
     prepared_bands: Dict[str, Dict[str, object]] = {}
@@ -797,6 +830,8 @@ def reconstruct_full_scene_for_location(
         masked_cube = prepared["masked_cube"]
         masked_timestamps = prepared["masked_timestamps"]
         for method_name in methods:
+            if method_name in reusable_methods:
+                continue
             _log("reconstruct_full_scene_for_location", f"Band {band_name}: running {method_name}")
             output_path = build_output_path(output_root=output_root, method_name=method_name, source_file=stack_paths[0], target_time=target_time, source_name=source_name, lon=lon, lat=lat)
             t0 = time.perf_counter()
@@ -823,8 +858,6 @@ def reconstruct_full_scene_for_location(
             _write_prediction(output_path, prediction_2d, data)
             output_map[method_name][band_name] = str(output_path)
             prediction_arrays[method_name][band_name] = prediction_2d
-            if method_name == "zhu2015":
-                zhu2015_qa_arrays[band_name] = np.asarray(prediction[1], dtype=np.uint8)
 
     ordered_bands = list(band_stacks.keys())
     validate_band_metadata_consistency(ordered_bands, band_meta)
@@ -840,6 +873,8 @@ def reconstruct_full_scene_for_location(
     write_band_stack(gt_path, ground_truth_arrays, ordered_bands, first_meta)
 
     for method_name in methods:
+        if method_name in reusable_methods:
+            continue
         merged_prediction_path = build_scene_stack_output_path(
             output_root=output_root,
             method_name=method_name,
@@ -851,18 +886,6 @@ def reconstruct_full_scene_for_location(
         )
         write_band_stack(merged_prediction_path, prediction_arrays[method_name], ordered_bands, first_meta)
         merged_prediction_map[method_name] = str(merged_prediction_path)
-
-    if "zhu2015" in methods and zhu2015_qa_arrays:
-        qa_path = build_scene_stack_output_path(
-            output_root=output_root,
-            method_name="zhu2015",
-            source_name=source_name,
-            lon=lon,
-            lat=lat,
-            target_time=target_time,
-            suffix="qa",
-        )
-        write_band_stack(qa_path, zhu2015_qa_arrays, ordered_bands, first_meta)
 
     for method_name in methods:
         for band_name, per_band_path in output_map[method_name].items():
@@ -918,6 +941,7 @@ def reconstruct_full_scene_for_all_locations(
     spectral_top_k: Optional[int] = None,
     preferred_top_k: Optional[int] = None,
     num_peaks: Optional[int] = None,
+    rerun_methods: Sequence[str] = (),
 ) -> List[Dict[str, Any]]:
     data_root = Path(data_root)
     data_dir = _resolve_data_dir(source_name, data_root)
@@ -946,6 +970,7 @@ def reconstruct_full_scene_for_all_locations(
                 spectral_top_k=spectral_top_k,
                 preferred_top_k=preferred_top_k,
                 num_peaks=num_peaks,
+                rerun_methods=rerun_methods,
             )
         )
     return results
