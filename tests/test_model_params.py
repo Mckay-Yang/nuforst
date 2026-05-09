@@ -71,13 +71,12 @@ def test_zhu2015_pixel_params_reproduce_direct_prediction(
 ) -> None:
     target_t = float(synthetic_t_days[3])
 
-    direct_pred, direct_qa = fit_predict_pixel(synthetic_t_days, synthetic_signal, target_t_day=target_t)
+    direct_pred = fit_predict_pixel(synthetic_t_days, synthetic_signal, target_t_day=target_t)
     params = fit_zhu2015_pixel_params(synthetic_t_days, synthetic_signal, max_segments=10)
-    param_pred, param_qa = predict_zhu2015_from_params(params, target_t)
+    param_pred = predict_zhu2015_from_params(params, target_t)
 
     assert np.isfinite(param_pred)
     assert abs(param_pred - direct_pred) < 1e-6
-    assert isinstance(param_qa, (int, np.integer))
 
 
 def test_cube_param_roundtrip_reconstructs_complete_image(tmp_path) -> None:

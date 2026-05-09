@@ -342,6 +342,107 @@ def test_reconstruct_full_scene_dispatches_methods_with_shared_job_budget(tmp_pa
     assert result["merged_prediction_outputs"]["nufrost"].endswith("[nufrost]_sentinel-2_lon94.260500_lat29.773300_2024-02-01T00-00-00_prediction.tif")
 
 
+def test_reconstruct_zhu2015_from_cube_returns_prediction_only(monkeypatch) -> None:
+    from src.full_scene_reconstruction.pipeline import reconstruct_zhu2015_from_cube
+
+    def fake_fit_predict_pixel_segments(t_days, y, target_t_day, lasso_alpha=0.001):
+        return 42.0
+
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.fit_predict_pixel_segments", fake_fit_predict_pixel_segments)
+    cube = np.stack(
+        [
+            np.full((2, 3), 1.0, dtype=np.float32),
+            np.full((2, 3), 2.0, dtype=np.float32),
+        ],
+        axis=0,
+    )
+    timestamps = np.asarray(["2024-01-01T00:00:00", "2024-02-01T00:00:00"], dtype="U32")
+
+    output = reconstruct_zhu2015_from_cube(cube, timestamps, "2024-02-01T00:00:00", n_jobs=1)
+
+    assert output.shape == (2, 3)
+    assert np.all(output == 42.0)
+
+
+def test_reconstruct_full_scene_reuses_existing_baseline_and_fills_missing_without_zhu_qa(tmp_path: Path, monkeypatch) -> None:
+    from src.full_scene_reconstruction import reconstruct_full_scene_for_location
+
+    calls = []
+    lon = 94.2605
+    lat = 29.7733
+    target_time = "2024-02-01T00:00:00"
+    meta = {
+        "transform": (1.0, 0.0, 10.0, 0.0, -1.0, 20.0, 0.0, 0.0, 1.0),
+        "crs_wkt": None,
+    }
+    existing_hants_path = build_scene_stack_output_path(
+        output_root=tmp_path,
+        method_name="hants",
+        source_name="sentinel-2",
+        lon=lon,
+        lat=lat,
+        target_time=target_time,
+        suffix="prediction",
+    )
+    write_band_stack(existing_hants_path, {"B2": np.full((2, 2), 20.0, dtype=np.float32)}, ["B2"], meta)
+
+    def fake_discover_location_band_stacks(*args, **kwargs):
+        return {"B2": [tmp_path / "B2.vrt"]}
+
+    def fake_choose_shared_target_timestamp(*args, **kwargs):
+        return target_time, {"B2": {target_time: 1.0}}
+
+    class FakeRSCube:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def load(self):
+            return {
+                "cube": np.ma.array(
+                    [
+                        [[1.0, 2.0], [3.0, 4.0]],
+                        [[5.0, 6.0], [7.0, 8.0]],
+                    ],
+                    dtype=np.float32,
+                ),
+                "timestamps": np.asarray(["2024-01-01T00:00:00", target_time], dtype="U32"),
+                **meta,
+            }
+
+    def fake_nufrost_core(cube, timestamps, target_time, args=None, **kwargs):
+        calls.append("nufrost")
+        return np.full((cube.shape[1], cube.shape[2]), 10.0, dtype=np.float32)
+
+    def fake_reconstruct_hants(cube, timestamps, target_time, **kwargs):
+        calls.append("hants")
+        return np.full((cube.shape[1], cube.shape[2]), 21.0, dtype=np.float32)
+
+    def fake_reconstruct_zhu2015(cube, timestamps, target_time, **kwargs):
+        calls.append("zhu2015")
+        return np.full((cube.shape[1], cube.shape[2]), 30.0, dtype=np.float32)
+
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.discover_location_band_stacks", fake_discover_location_band_stacks)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.choose_shared_target_timestamp", fake_choose_shared_target_timestamp)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.RSCube", FakeRSCube)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.nufrost_core", fake_nufrost_core)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.reconstruct_hants_from_cube", fake_reconstruct_hants)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.reconstruct_zhu2015_from_cube", fake_reconstruct_zhu2015)
+
+    result = reconstruct_full_scene_for_location(
+        source_name="sentinel-2",
+        lon=lon,
+        lat=lat,
+        output_root=tmp_path,
+        data_root=tmp_path,
+        methods=("nufrost", "hants", "zhu2015"),
+        n_jobs=1,
+    )
+
+    assert calls == ["nufrost", "zhu2015"]
+    assert result["merged_prediction_outputs"]["hants"] == str(existing_hants_path)
+    assert not list((tmp_path / "sentinel-2_recon" / "94.2605_29.7733").glob("*[zhu2015]*qa*.tif"))
+
+
 def test_reconstruct_full_scene_passes_limited_budget_into_shared_scheduler(tmp_path: Path, monkeypatch) -> None:
     from src.full_scene_reconstruction import reconstruct_full_scene_for_location
 

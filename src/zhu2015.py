@@ -38,11 +38,14 @@ def make_design_matrix(x: np.ndarray, order: int, ref_x_mean: float = None) -> n
 
 
 def fit_model(t_days: np.ndarray, y: np.ndarray, lasso_alpha: float):
+    """Fit a single Zhu2015 segment LASSO model.
+
+    Returns (clf, order, rmse, x_mean). The QA digit is no longer produced.
+    """
     n_obs = len(y)
-    unit_qa = _select_unit_qa(n_obs)
     order = _select_model_order(n_obs)
     if order == 0:
-        return None, unit_qa, 0, 0.0, float(np.mean(t_days)) if len(t_days) else 0.0
+        return None, 0, 0.0, float(np.mean(t_days)) if len(t_days) else 0.0
 
     x_mean = float(np.mean(t_days))
     X = make_design_matrix(t_days, order, ref_x_mean=x_mean)
@@ -53,7 +56,7 @@ def fit_model(t_days: np.ndarray, y: np.ndarray, lasso_alpha: float):
 
     y_pred = clf.predict(X)
     rmse = float(np.sqrt(np.mean((y - y_pred) ** 2)))
-    return clf, unit_qa, order, rmse, x_mean
+    return clf, order, rmse, x_mean
 
 
 def _predict_raw(coef: np.ndarray, intercept: float, X: np.ndarray) -> np.ndarray:
@@ -69,27 +72,28 @@ def fit_predict_pixel(
     y: np.ndarray,
     target_t_day: float,
     lasso_alpha: float = 0.001
-) -> Tuple[float, int]:
+) -> float:
+    """Fit a Zhu2015 single-segment LASSO model and predict at ``target_t_day``.
+
+    The previous QA second return value has been removed.
+    """
     valid_mask = np.isfinite(y)
     if not np.any(valid_mask):
-        return np.nan, 0
+        return np.nan
 
     t_valid = t_days[valid_mask]
     y_valid = y[valid_mask]
     n_obs = len(y_valid)
 
     if n_obs < 6:
-        return np.median(y_valid), 0
+        return float(np.median(y_valid))
 
     if 6 <= n_obs < 18:
         order = 1
-        model_id = 1
     elif 18 <= n_obs < 24:
         order = 2
-        model_id = 2
     else:
         order = 3
-        model_id = 3
 
     x_mean = float(np.mean(t_valid))
     X = make_design_matrix(t_valid, order, ref_x_mean=x_mean)
@@ -98,9 +102,7 @@ def fit_predict_pixel(
     clf.fit(X, y_valid)
 
     X_target = make_design_matrix(np.array([target_t_day]), order, ref_x_mean=x_mean)
-    y_pred = clf.predict(X_target)[0]
-
-    return y_pred, model_id
+    return float(clf.predict(X_target)[0])
 
 def reconstruct_zhu2015(
     image: str,
@@ -149,8 +151,7 @@ def reconstruct_zhu2015(
         row_pred = np.full(W, np.nan, dtype=np.float32)
         for j in range(W):
             y = cube[:, i, j]
-            pred, _ = fit_predict_pixel(t_days, y, target_t_day, lasso_alpha=lasso_alpha)
-            row_pred[j] = pred
+            row_pred[j] = fit_predict_pixel(t_days, y, target_t_day, lasso_alpha=lasso_alpha)
         return i, row_pred
 
     # Use tqdm for progress
@@ -201,16 +202,6 @@ def _select_model_order(n_obs):
     return 3
 
 
-def _select_unit_qa(n_obs, perennial_snow=False):
-    if perennial_snow:
-        return 3
-    if n_obs >= 12:
-        return 0
-    if n_obs >= 6:
-        return 1
-    return 2
-
-
 def _pack_zhu_coefficients(coef, order, max_order=MAX_ZHU_ORDER):
     packed = np.zeros(2 * max_order + 1, dtype=np.float64)
     if order <= 0:
@@ -244,7 +235,6 @@ def fit_zhu2015_pixel_params(
         "segment_start_days": np.full(segment_count, np.nan, dtype=np.float64),
         "segment_end_days": np.full(segment_count, np.nan, dtype=np.float64),
         "segment_orders": np.zeros(segment_count, dtype=np.int16),
-        "segment_unit_qas": np.full(segment_count, 255, dtype=np.int16),
         "segment_has_model": np.zeros(segment_count, dtype=np.int8),
         "segment_median_values": np.full(segment_count, np.nan, dtype=np.float64),
         "segment_x_means": np.zeros(segment_count, dtype=np.float64),
@@ -260,7 +250,7 @@ def fit_zhu2015_pixel_params(
     n_obs = len(y_valid)
 
     if n_obs >= 12:
-        clf_pre, unit_qa, order, base_rmse, x_mean = fit_model(t_valid, y_valid, lasso_alpha)
+        clf_pre, order, base_rmse, x_mean = fit_model(t_valid, y_valid, lasso_alpha)
         if clf_pre is not None and base_rmse > 0:
             coef_pre = np.asarray(clf_pre.coef_, dtype=np.float64)
             intercept_pre = float(clf_pre.intercept_)
@@ -281,7 +271,6 @@ def fit_zhu2015_pixel_params(
                 params["segment_start_days"][0] = float(t_valid[0])
                 params["segment_end_days"][0] = float(t_valid[-1])
                 params["segment_orders"][0] = order
-                params["segment_unit_qas"][0] = unit_qa
                 params["segment_has_model"][0] = 1
                 params["segment_intercepts"][0] = float(clf_pre.intercept_)
                 params["segment_coefficients"][0] = _pack_zhu_coefficients(
@@ -301,7 +290,6 @@ def fit_zhu2015_pixel_params(
         params["segment_start_days"][idx] = float(t_valid[seg["start_idx"]])
         params["segment_end_days"][idx] = float(t_valid[seg["end_idx"]])
         params["segment_orders"][idx] = int(seg["order"])
-        params["segment_unit_qas"][idx] = int(seg["unit_qa"])
         params["segment_median_values"][idx] = float(seg["median_val"])
         params["segment_x_means"][idx] = float(seg.get("x_mean", 0.0))
         if seg["clf"] is not None:
@@ -315,19 +303,22 @@ def fit_zhu2015_pixel_params(
 
 
 def predict_zhu2015_from_params(params, target_t_day):
+    """Predict surface reflectance from cached Zhu2015 parameters.
+
+    Returns a single float prediction. The previous QA second return value
+    has been removed.
+    """
     if not params.get("valid", False) or int(params.get("n_segments", 0)) == 0:
-        return np.nan, 255
+        return np.nan
     n_segments = int(params["n_segments"])
     starts = params["segment_start_days"][:n_segments]
     ends = params["segment_end_days"][:n_segments]
-    unit_qas = params["segment_unit_qas"][:n_segments]
     has_model = params["segment_has_model"][:n_segments]
     median_vals = params["segment_median_values"][:n_segments]
     x_means = params.get("segment_x_means", np.zeros(n_segments, dtype=np.float64))[:n_segments]
     intercepts = params["segment_intercepts"][:n_segments]
     coeffs = params["segment_coefficients"][:n_segments]
     seg_idx = -1
-    qa_prefix = 0
     for idx in range(n_segments):
         if starts[idx] <= target_t_day <= ends[idx]:
             seg_idx = idx
@@ -335,13 +326,10 @@ def predict_zhu2015_from_params(params, target_t_day):
     if seg_idx < 0:
         if target_t_day < starts[0]:
             seg_idx = 0
-            qa_prefix = 1
         else:
             seg_idx = n_segments - 1
-            qa_prefix = 2
-    qa = qa_prefix * 10 + int(unit_qas[seg_idx])
     if not has_model[seg_idx]:
-        return float(median_vals[seg_idx]), qa
+        return float(median_vals[seg_idx])
     x_mean = float(x_means[seg_idx])
     max_order = int(params.get("max_order", MAX_ZHU_ORDER))
     w = 2 * np.pi / DAYS_PER_YEAR
@@ -351,16 +339,14 @@ def predict_zhu2015_from_params(params, target_t_day):
         row[2 * (k - 1)] = np.cos(k * w * target_t_day)
         row[2 * k - 1] = np.sin(k * w * target_t_day)
     row[-1] = target_t_day - x_mean
-    pred = float(intercepts[seg_idx] + row @ coeffs[seg_idx])
-    return pred, qa
+    return float(intercepts[seg_idx] + row @ coeffs[seg_idx])
 
 
 def predict_curve_pixel(t_days, y, target_t_days, lasso_alpha=0.001):
     params = fit_zhu2015_pixel_params(t_days, y, lasso_alpha=lasso_alpha)
     preds = np.zeros(len(target_t_days), dtype=np.float32)
     for i, target_t in enumerate(target_t_days):
-        pred, _ = predict_zhu2015_from_params(params, float(target_t))
-        preds[i] = pred
+        preds[i] = predict_zhu2015_from_params(params, float(target_t))
     return preds
 
 
@@ -369,7 +355,8 @@ def fit_predict_pixel_segments(
     y: np.ndarray,
     target_t_day: float,
     lasso_alpha: float = 0.001,
-) -> Tuple[float, int]:
+) -> float:
+    """Fit segments and return a single Zhu2015 prediction at ``target_t_day``."""
     params = fit_zhu2015_pixel_params(t_days, y, lasso_alpha=lasso_alpha)
     return predict_zhu2015_from_params(params, target_t_day)
 
@@ -385,10 +372,10 @@ def extract_segments(t_days, y, lasso_alpha=0.001):
     segments = []
 
     if n_obs < 12:
-        clf, unit_qa, order, _, x_mean = fit_model(t_valid, y_valid, lasso_alpha)
+        clf, order, _, x_mean = fit_model(t_valid, y_valid, lasso_alpha)
         return [{
             "start_idx": 0, "end_idx": n_obs - 1,
-            "clf": clf, "order": order, "unit_qa": unit_qa,
+            "clf": clf, "order": order,
             "median_val": float(np.median(y_valid)) if clf is None else 0.0,
             "x_mean": x_mean,
         }]
@@ -399,7 +386,7 @@ def extract_segments(t_days, y, lasso_alpha=0.001):
         if remaining < 6:
             segments.append({
                 "start_idx": start_idx, "end_idx": n_obs - 1,
-                "clf": None, "order": 0, "unit_qa": 2,
+                "clf": None, "order": 0,
                 "median_val": float(np.median(y_valid[start_idx:])),
                 "x_mean": float(np.mean(t_valid[start_idx:])),
             })
@@ -409,22 +396,15 @@ def extract_segments(t_days, y, lasso_alpha=0.001):
         if init_end - start_idx < 12:
             init_end = min(start_idx + 12, n_obs)
 
-        clf, unit_qa, order, base_rmse, x_mean = fit_model(
+        clf, order, base_rmse, x_mean = fit_model(
             t_valid[start_idx:init_end], y_valid[start_idx:init_end], lasso_alpha,
         )
         if clf is None:
             segments.append({
                 "start_idx": start_idx, "end_idx": n_obs - 1,
-                "clf": None, "order": 0, "unit_qa": 2,
+                "clf": None, "order": 0,
                 "median_val": float(np.median(y_valid[start_idx:init_end])),
                 "x_mean": float(np.mean(t_valid[start_idx:init_end])),
-            })
-            break
-        if unit_qa != 0:
-            segments.append({
-                "start_idx": start_idx, "end_idx": n_obs - 1,
-                "clf": clf, "order": order, "unit_qa": unit_qa,
-                "median_val": 0.0, "x_mean": x_mean,
             })
             break
 
@@ -463,15 +443,15 @@ def extract_segments(t_days, y, lasso_alpha=0.001):
             if len(seg_y) < 6:
                 segments.append({
                     "start_idx": start_idx, "end_idx": seg_end,
-                    "clf": None, "order": 0, "unit_qa": 2,
+                    "clf": None, "order": 0,
                     "median_val": float(np.median(seg_y)),
                     "x_mean": float(np.mean(seg_t)),
                 })
             else:
-                clf_final, unit_qa, order, _, x_mean = fit_model(seg_t, seg_y, lasso_alpha)
+                clf_final, order, _, x_mean = fit_model(seg_t, seg_y, lasso_alpha)
                 segments.append({
                     "start_idx": start_idx, "end_idx": seg_end,
-                    "clf": clf_final, "order": order, "unit_qa": unit_qa,
+                    "clf": clf_final, "order": order,
                     "median_val": float(np.median(seg_y)) if clf_final is None else 0.0,
                     "x_mean": x_mean,
                 })
@@ -479,10 +459,10 @@ def extract_segments(t_days, y, lasso_alpha=0.001):
         else:
             seg_t = t_valid[start_idx:n_obs]
             seg_y = y_valid[start_idx:n_obs]
-            clf_final, unit_qa, order, _, x_mean = fit_model(seg_t, seg_y, lasso_alpha)
+            clf_final, order, _, x_mean = fit_model(seg_t, seg_y, lasso_alpha)
             segments.append({
                 "start_idx": start_idx, "end_idx": n_obs - 1,
-                "clf": clf_final, "order": order, "unit_qa": unit_qa,
+                "clf": clf_final, "order": order,
                 "median_val": float(np.median(seg_y)) if clf_final is None else 0.0,
                 "x_mean": x_mean,
             })
@@ -492,10 +472,10 @@ def extract_segments(t_days, y, lasso_alpha=0.001):
 
 
 def predict_target(segments, t_days, target_t_day):
+    """Predict using a list of fitted segments. Returns a single float."""
     if not segments:
-        return np.nan, 255
+        return np.nan
     seg = None
-    qa_prefix = 0
     for candidate in segments:
         if t_days[candidate["start_idx"]] <= target_t_day <= t_days[candidate["end_idx"]]:
             seg = candidate
@@ -503,13 +483,9 @@ def predict_target(segments, t_days, target_t_day):
     if seg is None:
         if target_t_day < t_days[segments[0]["start_idx"]]:
             seg = segments[0]
-            qa_prefix = 1
         else:
             seg = segments[-1]
-            qa_prefix = 2
-    qa = qa_prefix * 10 + seg["unit_qa"]
     if seg["clf"] is None:
-        return seg["median_val"], qa
+        return float(seg["median_val"])
     x_mean = seg.get("x_mean", 0.0)
-    pred = seg["clf"].predict(make_design_matrix(np.array([target_t_day]), seg["order"], ref_x_mean=x_mean))[0]
-    return pred, qa
+    return float(seg["clf"].predict(make_design_matrix(np.array([target_t_day]), seg["order"], ref_x_mean=x_mean))[0])

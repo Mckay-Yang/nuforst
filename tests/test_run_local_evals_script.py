@@ -113,5 +113,5 @@ def test_local_eval_workflow_skips_completed_sparse_levels(tmp_path: Path, monke
         run_repeatability=False,
     )
 
-    assert calls == [5000, 10000, 20000]
+    assert calls == [200, 500, 2000]
     assert summary["sparse"] == 9
