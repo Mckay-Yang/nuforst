@@ -848,7 +848,7 @@ def nufrost_core_multiband(
     freqs_sel = np.asarray(shared_freqs, dtype=np.float64)
 
     def _predict_pixel(i: int, j: int):
-        Y = np.stack([band_cubes[b][:, i, j] for b in band_order], axis=1)
+        Y = np.stack([band_cubes[b][:, i, j] for b in band_order], axis=1).astype(np.float64)
         params = fit_nufrost_pixel_multiband(
             t_sec, Y, freqs_sel=freqs_sel,
             lambda_beta=args.ridge,
@@ -1296,6 +1296,23 @@ def select_frequencies(
     preferred_top_k, spectral_top_k, spectral_merge_tol,
     power_cum, ignore_dc_hz, refine_peaks,
 ):
+    """Select harmonic frequencies for NUFROST fitting.
+
+    selection_mode semantics:
+        - "preferred": only the preferred (canonical) periods, snapped to the
+          spectrum.
+        - "spectral": only top-k peaks from the NUFFT power spectrum.
+        - "hybrid": both preferred and spectral peaks (union).
+        - "shared_spectral": expected to be computed once at the scene level
+          (see full_scene_reconstruction.pipeline.build_shared_frequency_pool)
+          and passed through ``shared_freqs``. When that path is NOT used
+          (e.g. single-pixel API calls with ``shared_freqs=None``) we fall
+          back to the same union behaviour as ``hybrid`` so callers still
+          get a meaningful set of frequencies instead of degenerating to
+          DC + trend.
+    """
+    if selection_mode == "shared_spectral":
+        selection_mode = "hybrid"
     selected = []
     if selection_mode in ("preferred", "hybrid") and preferred_freqs.size > 0:
         pref_valid = preferred_freqs[np.isfinite(preferred_freqs) & (preferred_freqs > ignore_dc_hz)]

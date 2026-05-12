@@ -16,7 +16,7 @@
   "huber_iters": 3,
   "huber_delta": 0.05,
   "min_obs": 12,
-  "outlier_sigma": 2.0,
+  "outlier_sigma": 2.5,
   "lambda_step": 1e30,
   "lambda_high": 0.005,
   "low_freq_period_days": 60.0,
