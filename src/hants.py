@@ -46,10 +46,10 @@ def hants_pixel(
     y: np.ndarray,
     target_t: float,
     nof: int = 3,
-    sf: str = 'low',
+    sf: str = 'high',
     valid_min: float = None,
     valid_max: float = None,
-    fet: float = 0.05,
+    fet: float = 500.0,
     dod: int = 5,
     period: float = 365.25,
 ) -> float:
@@ -64,10 +64,10 @@ def reconstruct_hants(
     target_time: str,
     output_path: Optional[str] = None,
     nof: int = 3,
-    sf: str = 'low',
+    sf: str = 'high',
     valid_min: float = None,
     valid_max: float = None,
-    fet: float = 0.05,
+    fet: float = 500.0,
     dod: int = 5,
     n_jobs: int = -1,
     cache_dir: str = "./cache",
@@ -168,7 +168,7 @@ def _fit_hants_coeffs(t_curr, y_curr, freqs):
     return coeffs
 
 
-def fit_hants_pixel_params(t, y, nof=3, sf='low', valid_min=None, valid_max=None, fet=0.05, dod=5, period=365.25):
+def fit_hants_pixel_params(t, y, nof=3, sf='high', valid_min=None, valid_max=None, fet=500.0, dod=5, period=365.25):
     coeff_count = 1 + 2 * max(0, nof - 1)
     params = {
         "valid": False, "nof": int(nof), "period": float(period),
@@ -246,6 +246,6 @@ def predict_hants_curve_from_params(params, target_t_array):
     return np.array([predict_hants_from_params(params, float(t)) for t in target_t_array], dtype=np.float64)
 
 
-def hants_curve_pixel(t, y, target_t_array, nof=3, sf='low', valid_min=None, valid_max=None, fet=0.05, dod=5, period=365.25):
+def hants_curve_pixel(t, y, target_t_array, nof=3, sf='high', valid_min=None, valid_max=None, fet=500.0, dod=5, period=365.25):
     params = fit_hants_pixel_params(t, y, nof=nof, sf=sf, valid_min=valid_min, valid_max=valid_max, fet=fet, dod=dod, period=period)
     return predict_hants_curve_from_params(params, target_t_array)

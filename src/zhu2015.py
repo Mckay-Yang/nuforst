@@ -71,7 +71,7 @@ def fit_predict_pixel(
     t_days: np.ndarray,
     y: np.ndarray,
     target_t_day: float,
-    lasso_alpha: float = 0.001
+    lasso_alpha: float = 0.1
 ) -> float:
     """Fit a Zhu2015 single-segment LASSO model and predict at ``target_t_day``.
 
@@ -108,7 +108,7 @@ def reconstruct_zhu2015(
     image: str,
     target_time: str,
     output_path: Optional[str] = None,
-    lasso_alpha: float = 0.0001,
+    lasso_alpha: float = 0.1,
     n_jobs: int = -1,
     cache_dir: str = "./cache",
     force_refresh: bool = False
@@ -227,7 +227,7 @@ def _make_full_design_matrix(x, max_order=MAX_ZHU_ORDER, ref_x_mean=None):
 
 
 def fit_zhu2015_pixel_params(
-    t_days, y, lasso_alpha=0.001, max_segments=64, max_order=MAX_ZHU_ORDER,
+    t_days, y, lasso_alpha=0.1, max_segments=64, max_order=MAX_ZHU_ORDER,
 ):
     segment_count = max(1, max_segments)
     params = {
@@ -342,7 +342,7 @@ def predict_zhu2015_from_params(params, target_t_day):
     return float(intercepts[seg_idx] + row @ coeffs[seg_idx])
 
 
-def predict_curve_pixel(t_days, y, target_t_days, lasso_alpha=0.001):
+def predict_curve_pixel(t_days, y, target_t_days, lasso_alpha=0.1):
     params = fit_zhu2015_pixel_params(t_days, y, lasso_alpha=lasso_alpha)
     preds = np.zeros(len(target_t_days), dtype=np.float32)
     for i, target_t in enumerate(target_t_days):
@@ -354,7 +354,7 @@ def fit_predict_pixel_segments(
     t_days: np.ndarray,
     y: np.ndarray,
     target_t_day: float,
-    lasso_alpha: float = 0.001,
+    lasso_alpha: float = 0.1,
 ) -> float:
     """Fit segments and return a single Zhu2015 prediction at ``target_t_day``."""
     params = fit_zhu2015_pixel_params(t_days, y, lasso_alpha=lasso_alpha)
@@ -362,7 +362,7 @@ def fit_predict_pixel_segments(
 
 # ── Additional compatibility functions ──
 
-def extract_segments(t_days, y, lasso_alpha=0.001):
+def extract_segments(t_days, y, lasso_alpha=0.1):
     valid_mask = np.isfinite(y) & np.isfinite(t_days)
     if not np.any(valid_mask):
         return []

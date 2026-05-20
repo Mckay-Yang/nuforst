@@ -516,8 +516,8 @@ def reconstruct_hants_from_cube(
     target_time: str,
     *,
     nof: int = 3,
-    sf: str = "low",
-    fet: float = 0.05,
+    sf: str = "high",
+    fet: float = 500.0,
     dod: int = 5,
     n_jobs: int = -1,
 ) -> np.ndarray:
@@ -546,7 +546,7 @@ def reconstruct_zhu2015_from_cube(
     timestamps: Sequence[str],
     target_time: str,
     *,
-    lasso_alpha: float = 0.001,
+    lasso_alpha: float = 0.1,
     n_jobs: int = -1,
 ) -> np.ndarray:
     target_dt = _parse_target_datetime(target_time)

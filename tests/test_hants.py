@@ -128,3 +128,16 @@ def test_hants_converges_with_iteration_cap() -> None:
     assert n_iters >= 1
     pred = predict_hants_from_params(params, target_t=100.0)
     assert abs(pred - 0.5) < 0.5
+
+
+def test_default_hants_fet_handles_dn_scale_without_median_fallback() -> None:
+    t = np.arange(80, dtype=np.float64) * 30.0
+    y = 1800.0 + 400.0 * np.sin(2 * np.pi * t / 365.25)
+    y[::13] -= 1200.0
+
+    params = fit_hants_pixel_params(t, y)
+    curve = hants_curve_pixel(t, y, t)
+
+    assert params["valid"] is True
+    assert np.nanstd(curve) > 100.0
+    assert np.nanmax(curve) < 5000.0

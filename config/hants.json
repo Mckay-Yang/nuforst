@@ -1,7 +1,7 @@
 {
   "nof": 3,
-  "sf": "low",
-  "fet": 0.05,
+  "sf": "high",
+  "fet": 500.0,
   "dod": 5,
   "valid_min": null,
   "valid_max": null,

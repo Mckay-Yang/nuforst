@@ -66,8 +66,8 @@ class HantsArgs:
     time_unit: str = "seconds"
     output_path: Path = field(default_factory=Path)
     nof: int = 3
-    sf: str = "low"
-    fet: float = 0.05
+    sf: str = "high"
+    fet: float = 500.0
     dod: int = 5
     valid_min: Optional[float] = None
     valid_max: Optional[float] = None
@@ -81,7 +81,7 @@ class Zhu2015Args:
     n_jobs: int = -1
     time_unit: str = "seconds"
     output_path: Path = field(default_factory=Path)
-    lasso_alpha: float = 0.001
+    lasso_alpha: float = 0.1
 
 
 METHOD_ARGS = {
