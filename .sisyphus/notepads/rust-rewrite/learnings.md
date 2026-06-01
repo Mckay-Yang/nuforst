@@ -69,3 +69,61 @@ The `gdal-sys` build.rs uses `pkg-config` crate which invokes the `pkg-config` b
 This binary was NOT in the conda `geo-science` env. Setting `GDAL_VERSION`,
 `GDAL_INCLUDE_DIR`, and `GDAL_LIB_DIR` env vars bypasses the need for pkg-config
 linking metadata.
+
+## 2026-06-01 T2: GDAL build/runtime dependencies
+
+**Build**: `gdal-sys` crate requires `pkg-config`. Install via `conda install -c conda-forge pkg-config`.
+**Runtime**: `libgdal.36.dylib` must be on `DYLD_LIBRARY_PATH`. Set:
+```bash
+export DYLD_LIBRARY_PATH=/opt/homebrew/Caskroom/miniforge/base/envs/geo-science/lib
+```
+**Environment**: The conda env `geo-science` contains `libgdal-core` but might not include the full `gdal` package with development headers. If headers are missing, install `conda install -c conda-forge gdal`.
+
+## 2026-06-01 T3: Parity fixture structure
+
+- Synthetic fixtures: `simple_harmonic`, `gaps_outliers`, `step_break` (each with config.json + data.npz)
+- Real fixture: small window (lon=100.112, lat=25.654) with nufrost/hants/zhu2015 predictions + zhu2015 QA + timestamps + inputs
+- Manifest: `tests/fixtures/rust_parity/manifest.json` — uses `name`, `type`, `description`, `files` keys (NOT `algorithm`)
+- Deterministic: confirmed via two-run checksum comparison
+
+## 2026-06-01 T4: Shared Rust core types and config
+
+### What was done
+- Created 4 module files under `rust/nufrost-core/src/`: `error.rs`, `time.rs`, `types.rs`, `config.rs`
+- Replaced placeholder `lib.rs` with re-exports, valid-mask helpers, Sentinel-2 constants, and ndarray type aliases
+- 22 unit tests pass: 9 config, 7 timestamp, 6 lib (valid mask + constants)
+- All three algorithm configs parse correctly: `config/nufrost.json`, `config/hants.json`, `config/zhu2015.json`
+- Timestamp parsing matches Python `pd.to_datetime(ts, utc=True)` → `.timestamp()` semantics
+- Missing config field produces typed `serde_json::Error` surfaced through `NufrostError::Json`
+
+### Module structure
+```
+src/
+  lib.rs    — re-exports, valid_reflectance(), sentinel2_valid_mask(), count_valid()
+  error.rs  — NufrostError enum (thiserror): InvalidTimestamp, MissingConfigField, InvalidConfigValue,
+              UnknownAlgorithm, NoValidObservations, Io, Json
+  time.rs   — parse_iso8601_to_epoch_seconds(), to_seconds_since_start(),
+              parse_timestamps_to_epoch_seconds(), parse_to_relative_days()
+  types.rs  — Algorithm enum, TimeSeries, BandMetadata, Array1D/Array2D/Array3D/Mask1D aliases
+  config.rs — NufrostConfig, HantsConfig, Zhu2015Config, ReconstructionConfig (grouped)
+```
+
+### Key decisions
+- `NufrostConfig.ridge_lam` field uses `#[serde(alias = "ridge")]` to accept Python's `"ridge"` key
+- `#[serde(deny_unknown_fields)]` on all config structs for strict validation
+- `#[serde(default = "...")]` on optional NUFROST fields matching Python NufrostArgs dataclass defaults
+- `fn validate()` methods on each config struct for semantic checks (modes>0, nof>0, lasso_alpha>=0)
+- Timestamp formats tried in order: dashed ISO8601, space-separated, date-only, Sentinel-2 compact (matching Python order)
+- All naive datetimes treated as UTC (`NaiveDateTime::and_utc()`) matching pandas `utc=True` semantics
+- Sentinel-2 valid reflectance range: `(0.0, 10000.0)` matching `_mask_invalid_reflectance_values()` in pipeline.py
+- ndarray type aliases: `Array1D` (f64), `Array2D` (f64), `Array3D` (f64), `Mask1D` (bool)
+
+### Conventions
+- `NufrostError` uses `#[from]` for `std::io::Error` and `serde_json::Error` (auto-conversion)
+- Config fields named to match Python JSON keys; `ridge_lam` is the exception with alias support
+- `TimeSeries` uses `Vec<f64>` and `Vec<bool>` — algorithm implementations will convert to ndarray internally
+- Evidence files under `.sisyphus/evidence/task-4-*.txt`
+
+### Issues encountered
+- Timestamp test failure: "20171221T035139" vs "20180105T035145" differ by 6 seconds (not exactly 15 days).
+  Fixed by using same-second timestamps in test.

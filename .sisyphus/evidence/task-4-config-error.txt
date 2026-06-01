@@ -1,0 +1,28 @@
+=== Rust Config Error Evidence ===
+
+Test: missing_required_field_is_error (config::tests)
+
+Input JSON (missing required "modes" field):
+  {"eps": 1e-12, "num_peaks": 10}
+
+Expected: serde_json deserialization error for missing field.
+Rust result: Err(serde_json::Error)
+
+Error message:
+  "missing field `modes` at line 1 column 30"
+
+Thiserror Error type: NufrostError::Json(serde_json::Error)
+The NufrostError enum provides structured error context via:
+  - MissingConfigField(field_name)  for semantic checks
+  - InvalidConfigValue { field, reason }  for validation
+  - Json(#[from] serde_json::Error)  for parse failures
+
+All config validation tests pass:
+  - nufrost_validate_zero_modes      → InvalidConfigValue on modes=0
+  - hants_validate_zero_nof           → InvalidConfigValue on nof=0
+  - zhu2015_validate_negative_alpha   → InvalidConfigValue on alpha<0
+  - missing_required_field_is_error   → serde_json parse error
+  - parse_ridge_alias                 → "ridge" key maps to ridge_lam field
+
+Verified via: cargo test -p nufrost-core -- config::tests
+  10 tests passed
