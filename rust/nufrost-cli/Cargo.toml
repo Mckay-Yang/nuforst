@@ -1,0 +1,11 @@
+[package]
+name = "nufrost-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+nufrost-core = { path = "../nufrost-core" }
+clap.workspace = true
+anyhow.workspace = true

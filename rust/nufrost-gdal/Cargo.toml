@@ -1,0 +1,16 @@
+[package]
+name = "nufrost-gdal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+nufrost-core = { path = "../nufrost-core" }
+ndarray.workspace = true
+gdal.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+approx.workspace = true
