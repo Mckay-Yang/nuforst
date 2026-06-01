@@ -113,7 +113,7 @@ pub fn make_design_matrix(
         data.push(trend);
     }
     Array2::from_shape_vec((n, n_cols), data)
-        .expect("design matrix shape invariant")
+        .unwrap()
 }
 
 // ── Coordinate descent LASSO solver ────────────────────────────────────────
@@ -143,8 +143,8 @@ pub fn lasso_fit(
     tol: f64,
 ) -> (Array1<f64>, f64) {
     let (n, p) = (x.nrows(), x.ncols());
-    assert!(n > 0, "X must have at least one row");
-    assert_eq!(n, y.len(), "X and y must have same number of rows");
+    debug_assert!(n > 0, "X must have at least one row");
+    debug_assert_eq!(n, y.len(), "X and y must have same number of rows");
 
     let x_mean = x.mean_axis(Axis(0)).unwrap();
     let y_mean = y.mean().unwrap();
@@ -215,7 +215,7 @@ pub fn fit_predict_pixel(
     target_t_day: f64,
     lasso_alpha: f64,
 ) -> Zhu2015Result {
-    assert_eq!(t_days.len(), y.len());
+    debug_assert_eq!(t_days.len(), y.len());
 
     let mut t_valid: Vec<f64> = Vec::with_capacity(t_days.len());
     let mut y_valid: Vec<f64> = Vec::with_capacity(y.len());
@@ -250,7 +250,7 @@ pub fn fit_predict_pixel(
     }
 
     let order = select_model_order(n_valid);
-    assert!(order >= 1);
+    debug_assert!(order >= 1);
 
     let x_mean = t_valid.iter().sum::<f64>() / (t_valid.len() as f64);
     let x_train = make_design_matrix(&t_valid, order, Some(x_mean));
@@ -290,7 +290,7 @@ pub fn fit_segment(
     end: usize,
     lasso_alpha: f64,
 ) -> Option<SegmentModel> {
-    assert!(start <= end && end <= t_days.len());
+    debug_assert!(start <= end && end <= t_days.len());
 
     let slice = &t_days[start..end];
     let y_slice = &y[start..end];
@@ -425,7 +425,7 @@ pub fn reconstruct_raster(
 ) -> (Vec<f64>, Vec<u32>) {
     let n_time = cube.nrows();
     let n_pixels = cube.ncols();
-    assert_eq!(n_time, t_days.len());
+    debug_assert_eq!(n_time, t_days.len());
 
     let mut predictions = vec![f64::NAN; n_pixels];
     let mut qa_band = vec![0u32; n_pixels];

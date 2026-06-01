@@ -348,8 +348,7 @@ fn nufrost_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn placeholder_no_py() {
-        assert_eq!(2_usize + 2, 4);
-    }
+    // Tests for Python bindings require a Python interpreter.
+    // Run integration tests with:
+    //   cd rust/nufrost-py && python test_bindings.py
 }

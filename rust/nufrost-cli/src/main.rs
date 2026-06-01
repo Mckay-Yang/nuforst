@@ -204,12 +204,12 @@ fn default_hants_config() -> HantsConfig {
     serde_json::from_str(
         r#"{"nof":3,"sf":"high","fet":500.0,"dod":5,"period":365.25,"valid_min":null,"valid_max":null}"#,
     )
-    .unwrap()
+    .expect("hardcoded default HANTS config must be valid")
 }
 
 /// Default Zhu2015 config matching Python `config/zhu2015.json`.
 fn default_zhu2015_config() -> Zhu2015Config {
-    serde_json::from_str(r#"{"lasso_alpha":0.1}"#).unwrap()
+    serde_json::from_str(r#"{"lasso_alpha":0.1}"#).expect("hardcoded default Zhu2015 config must be valid")
 }
 
 fn load_nufrost_config(path: Option<&std::path::Path>) -> Result<NufrostConfig> {
@@ -544,19 +544,19 @@ mod tests {
     #[test]
     fn nufrost_subcommand() {
         let cli = parse(&["nufrost"]);
-        matches!(cli.algorithm, Algorithm::Nufrost(_));
+        assert!(matches!(cli.algorithm, Algorithm::Nufrost(_)));
     }
 
     #[test]
     fn hants_subcommand() {
         let cli = parse(&["hants"]);
-        matches!(cli.algorithm, Algorithm::Hants(_));
+        assert!(matches!(cli.algorithm, Algorithm::Hants(_)));
     }
 
     #[test]
     fn zhu2015_subcommand() {
         let cli = parse(&["zhu2015"]);
-        matches!(cli.algorithm, Algorithm::Zhu2015(_));
+        assert!(matches!(cli.algorithm, Algorithm::Zhu2015(_)));
     }
 
     // ── NPZ mode option parsing ─────────────────────────────────────────
