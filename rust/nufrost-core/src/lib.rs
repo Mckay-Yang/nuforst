@@ -7,6 +7,7 @@
 pub mod config;
 pub mod error;
 pub mod hants;
+pub mod nufrost;
 pub mod time;
 pub mod types;
 pub mod zhu2015;
@@ -14,6 +15,7 @@ pub mod zhu2015;
 pub use config::{NufrostConfig, HantsConfig, Zhu2015Config, ReconstructionConfig};
 pub use error::NufrostError;
 pub use hants::{HantsResult, hants_fit, hants_predict, hants_predict_curve, hants_pixel, make_design_matrix};
+pub use nufrost::{NufrostResult, nufrost_fit_pixel, nufrost_predict, nufrost_predict_curve, nufrost_pixel};
 pub use time::{parse_iso8601_to_epoch_seconds, to_seconds_since_start, parse_timestamps_to_epoch_seconds, parse_to_relative_days};
 pub use types::{Algorithm, TimeSeries, BandMetadata};
 

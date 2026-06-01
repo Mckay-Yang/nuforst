@@ -254,3 +254,55 @@ write_zhu2015_output(path, prediction, qa, metadata) → Result<()>
 ### Pre-existing issues
 - 5 nufrost-core tests fail (ridge_solve, insufficient_data, 3 parity tests);
   these are unrelated to GDAL I/O and pre-date this task.
+
+## Task 7: Port NUFROST Algorithm to Rust (2026-06-01)
+
+### What was done
+- Created `rust/nufrost-core/src/nufrost.rs` (~1300 lines) with full NUFROST algorithm port
+- Added `pub mod nufrost;` and re-exports to `lib.rs`
+- Implemented 26 tests, all passing
+- Generated parity evidence files under `.sisyphus/evidence/`
+
+### Key findings
+
+#### NUFFT strategy: Direct DFT
+Python uses `finufft.nufft1d1(x, c, M, eps=-1)` which computes:
+    F_k = Σ c_j * exp(-i * k * x_j)   for k = -M/2 … M/2-1
+This IS the direct DFT — finufft just does it faster via spreading.
+For our small per-pixel time series (N ≤ 200 obs), direct O(N·M) sum
+is fast and guarantees exact numerical parity.
+
+#### Module declaration pitfall
+The `pub mod nufrost;` line in `lib.rs` was initially missed — tests
+compiled silently but produced zero test artifacts.  Always verify
+with `cargo test -- --list` after adding a new module.
+
+#### Fixture config merging
+The npz fixture configs only contain a subset of fields (modes, eps,
+ridge_lam, etc.).  Missing fields must default to Python defaults:
+- `outlier_sigma: 2.0` (not 0.0 — enables iterative outlier rejection)
+- `frequency_selection: "spectral"`
+- `ridge_lam: 0.005` (fixture default, quite small)
+
+#### Parsing fixture npz files
+ndarray-npy's `NpzReader` requires `.npy` suffix in the key name:
+`archive.by_name("timestamps_days.npy")` not `archive.by_name("timestamps_days")`.
+The scalar values are `Array0<f64>`, accessed via `arr[()]`.
+
+#### Ridge regression design
+When `include_trend=true`, the trend column is `t - mean(t)`, so
+`beta[0]` (DC term) represents the value at the mean timestamp,
+NOT at t=0.  The test `test_ridge_solve_simple` verifies this.
+
+#### Config deserialization fallback
+`serde_json::Value::Bool(b)` returns `&bool` — dereference with `*b`.
+The `deny_unknown_fields` on `NufrostConfig` prevents loading fixture
+configs directly; we merge fields manually in `load_config()`.
+
+### Test results
+26/26 nufrost tests pass
+91/91 total nufrost-core tests pass
+All 3 synthetic fixture parity tests pass:
+  simple_harmonic: Python=0.78301321, Rust matches
+  gaps_outliers:   Python=-0.33037508, Rust matches
+  step_break:      Python=0.80624326, Rust matches
