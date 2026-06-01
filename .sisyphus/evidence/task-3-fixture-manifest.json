@@ -1,0 +1,80 @@
+{
+  "task": "task-3-fixture-manifest",
+  "algorithms": [
+    "nufrost",
+    "hants",
+    "zhu2015"
+  ],
+  "fixtures": {
+    "synthetic": {
+      "simple_harmonic": {
+        "description": "Clean harmonic, no gaps, happy path",
+        "nufrost": [
+          "synthetic/simple_harmonic/data.npz"
+        ],
+        "hants": [
+          "synthetic/simple_harmonic/data.npz"
+        ],
+        "zhu2015": [
+          "synthetic/simple_harmonic/data.npz"
+        ],
+        "config": "synthetic/simple_harmonic/config.json"
+      },
+      "gaps_outliers": {
+        "description": "Harmonic with ~20% gaps and ~5% outliers",
+        "nufrost": [
+          "synthetic/gaps_outliers/data.npz"
+        ],
+        "hants": [
+          "synthetic/gaps_outliers/data.npz"
+        ],
+        "zhu2015": [
+          "synthetic/gaps_outliers/data.npz"
+        ],
+        "config": "synthetic/gaps_outliers/config.json"
+      },
+      "step_break": {
+        "description": "Two-segment series with structural break",
+        "nufrost": [
+          "synthetic/step_break/data.npz"
+        ],
+        "hants": [
+          "synthetic/step_break/data.npz"
+        ],
+        "zhu2015": [
+          "synthetic/step_break/data.npz"
+        ],
+        "config": "synthetic/step_break/config.json"
+      }
+    },
+    "real": {
+      "small_window": {
+        "description": "4-column, 2-row window from Sentinel-2 B2",
+        "nufrost": [
+          "real/small_window/COPERNICUS_S2_HARMONIZED_B2_lon100.112_lat25.654-0000001024-0000000000_nufrost_pred.npy"
+        ],
+        "hants": [
+          "real/small_window/COPERNICUS_S2_HARMONIZED_B2_lon100.112_lat25.654-0000001024-0000000000_hants_pred.npy"
+        ],
+        "zhu2015": [
+          "real/small_window/COPERNICUS_S2_HARMONIZED_B2_lon100.112_lat25.654-0000001024-0000000000_zhu2015_pred.npy",
+          "real/small_window/COPERNICUS_S2_HARMONIZED_B2_lon100.112_lat25.654-0000001024-0000000000_zhu2015_qa.npy"
+        ],
+        "inputs": "real/small_window/inputs.npy",
+        "timestamps": "real/small_window/timestamps.npz",
+        "config": "real/small_window/config.json"
+      }
+    }
+  },
+  "tolerances": {
+    "unit": {
+      "atol": "1e-6",
+      "rtol": "1e-5"
+    },
+    "raster": {
+      "rmse_max": "1e-4",
+      "mae_max": "1e-4",
+      "maxae_max": "1e-3"
+    }
+  }
+}

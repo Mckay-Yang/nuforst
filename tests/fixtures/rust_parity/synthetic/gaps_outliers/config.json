@@ -1,0 +1,37 @@
+{
+  "config": {
+    "hants": {
+      "dod": 5,
+      "fet": 500.0,
+      "nof": 3,
+      "period": 365.25,
+      "sf": "high",
+      "valid_max": null,
+      "valid_min": null
+    },
+    "nufrost": {
+      "eps": 1e-12,
+      "freq_weight": 2.0,
+      "huber_delta": 0.05,
+      "huber_iters": 3,
+      "ignore_dc_hz": 1e-10,
+      "include_trend": true,
+      "min_obs": 12,
+      "modes": 4096,
+      "num_peaks": 10,
+      "power_cum": 0.7,
+      "refine_peaks": true,
+      "ridge_lam": 0.005
+    },
+    "zhu2015": {
+      "lasso_alpha": 0.1
+    }
+  },
+  "description": "Harmonic with ~20% gaps and ~5% outliers.",
+  "generator_version": "1.0.0",
+  "n_observations": 80,
+  "n_valid": 64,
+  "name": "gaps_outliers",
+  "seed": 42,
+  "target_time_day": 541.0765247162811
+}
