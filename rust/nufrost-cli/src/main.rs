@@ -128,8 +128,7 @@ struct SharedArgs {
     /// Output file path.
     ///
     /// In NPZ mode: writes scalar prediction as text.
-    /// In GeoTIFF mode: writes output GeoTIFF (single-band for NUFROST/HANTS,
-    /// 2-band for Zhu2015).
+    /// In GeoTIFF mode: writes a single-band output GeoTIFF.
     #[arg(short, long)]
     output: Option<PathBuf>,
 
@@ -405,12 +404,12 @@ fn run_zhu2015_npz(args: &Zhu2015Args, fixture: &FixtureData) -> Result<()> {
     output_result(
         result.prediction,
         args.shared.output.as_ref(),
-        &format!("zhu2015_prediction (QA={})", result.qa),
+        "zhu2015_prediction",
     )?;
 
     eprintln!(
-        "Zhu2015 completed: pred={:.6}, QA={}",
-        result.prediction, result.qa
+        "Zhu2015 completed: pred={:.6}",
+        result.prediction
     );
     Ok(())
 }
@@ -480,7 +479,7 @@ fn run_zhu2015_geotiff(
         .with_context(|| "Zhu2015 GeoTIFF reconstruction failed")?;
 
     eprintln!(
-        "Zhu2015 GeoTIFF reconstruction written to {} (2-band: pred + QA)",
+        "Zhu2015 GeoTIFF reconstruction written to {}",
         output.display()
     );
     Ok(())

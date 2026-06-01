@@ -284,8 +284,6 @@ fn hants_raster_rust<'py>(
 }
 
 /// Run Zhu2015 on a full 2-D raster cube (time × pixels).
-///
-/// Returns: tuple of (predictions, qa_band) as numpy arrays.
 #[pyfunction]
 fn zhu2015_raster_rust<'py>(
     py: Python<'py>,
@@ -293,7 +291,7 @@ fn zhu2015_raster_rust<'py>(
     cube: numpy::PyReadonlyArray2<'_, f64>,
     target_t: f64,
     config_json: &str,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<u32>>)> {
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
     let config: Zhu2015Config = serde_json::from_str(config_json).map_err(|e| {
         PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid Zhu2015 config JSON: {}", e))
     })?;
@@ -309,25 +307,19 @@ fn zhu2015_raster_rust<'py>(
     }
 
     let mut predictions = vec![f64::NAN; n_pixels];
-    let mut qa_band = vec![0u32; n_pixels];
 
     use rayon::prelude::*;
 
     predictions
         .par_iter_mut()
-        .zip(qa_band.par_iter_mut())
         .enumerate()
-        .for_each(|(p, (pred, qa))| {
+        .for_each(|(p, pred)| {
         let y: Vec<f64> = cube_view.column(p).to_vec();
         let result = fit_predict_pixel(&t_days, &y, target_t, config.lasso_alpha);
         *pred = result.prediction;
-        *qa = result.qa;
     });
 
-    Ok((
-        PyArray1::from_vec(py, predictions),
-        PyArray1::from_vec(py, qa_band),
-    ))
+    Ok(PyArray1::from_vec(py, predictions))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

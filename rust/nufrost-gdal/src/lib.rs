@@ -3,8 +3,7 @@
 //
 // Provides:
 //  - RasterReader: open GeoTIFF/VRT, read metadata and band data, build valid masks
-//  - RasterWriter: create single-band and multi-band GeoTIFF output
-//  - write_zhu2015_output: 2-band (prediction + QA) output matching Python convention
+//  - RasterWriter: create single-band GeoTIFF output
 
 use std::path::Path;
 
@@ -214,44 +213,6 @@ pub struct RasterMetadata {
     pub geo_transform: GeoTransform,
     pub crs_wkt: Option<String>,
     pub nodata: Option<f64>,
-}
-
-// ---------------------------------------------------------------------------
-// Zhu2015 2-band output helper
-// ---------------------------------------------------------------------------
-
-/// Write Zhu2015 output as a 2-band GeoTIFF (band 1 = prediction, band 2 = QA).
-///
-/// Matches the Python pipeline convention where [`reconstruct_zhu2015_from_cube`]
-/// returns a 2-band array and `_write_prediction` handles it as a multi-band stack.
-pub fn write_zhu2015_output<P: AsRef<Path>>(
-    path: P,
-    prediction: &Array2<f64>,
-    qa: &Array2<f64>,
-    metadata: &RasterMetadata,
-) -> Result<()> {
-    let (rows, cols) = prediction.dim();
-    if qa.dim() != (rows, cols) {
-        anyhow::bail!(
-            "Prediction shape ({rows}, {cols}) != QA shape ({}, {})",
-            qa.dim().0,
-            qa.dim().1
-        );
-    }
-
-    let mut writer = RasterWriter::create(
-        path,
-        rows,
-        cols,
-        2,
-        &metadata.geo_transform,
-        metadata.crs_wkt.as_deref(),
-        metadata.nodata,
-    )?;
-    writer.write_band(1, prediction)?;
-    writer.write_band(2, qa)?;
-    writer.flush()?;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -491,10 +452,7 @@ pub fn reconstruct_hants_geotiff<P: AsRef<Path>>(
 ///
 /// Reads all bands from `reader`, applies
 /// [`nufrost_core::zhu2015::fit_predict_pixel`] to every pixel in parallel,
-/// and writes a 2-band GeoTIFF (Band 1 = Float32 prediction, Band 2 = Float32 QA).
-///
-/// The Float32 QA band preserves integer QA values (0-255) losslessly,
-/// matching the Python pipeline convention.
+/// and writes a single-band GeoTIFF (Float32 prediction).
 pub fn reconstruct_zhu2015_geotiff<P: AsRef<Path>>(
     reader: &RasterReader,
     timestamps_days: &[f64],
@@ -515,22 +473,12 @@ pub fn reconstruct_zhu2015_geotiff<P: AsRef<Path>>(
 
     use rayon::prelude::*;
     let mut prediction = ndarray::Array2::<f64>::from_elem((rows, cols), f64::NAN);
-    let mut qa = ndarray::Array2::<f64>::zeros((rows, cols));
 
-    // Parallel over rows with thread-local buffers
-    let pred_view = &mut prediction;
-    let qa_view = &mut qa;
-    pred_view
+    prediction
         .axis_iter_mut(ndarray::Axis(0))
         .into_par_iter()
         .enumerate()
-        .zip(
-            qa_view
-                .axis_iter_mut(ndarray::Axis(0))
-                .into_par_iter()
-                .enumerate(),
-        )
-        .for_each(|((r, mut pred_row), (_, mut qa_row))| {
+        .for_each(|(r, mut pred_row)| {
             let mut ts_buf = Vec::with_capacity(n_bands);
             let mut obs_buf = Vec::with_capacity(n_bands);
             for c in 0..cols {
@@ -552,12 +500,22 @@ pub fn reconstruct_zhu2015_geotiff<P: AsRef<Path>>(
                     } else {
                         f64::NAN
                     };
-                    qa_row[c] = result.qa as f64;
                 }
             }
         });
 
-    write_zhu2015_output(output_path, &prediction, &qa, metadata)
+    let mut writer = RasterWriter::create(
+        output_path,
+        rows,
+        cols,
+        1,
+        &metadata.geo_transform,
+        metadata.crs_wkt.as_deref(),
+        metadata.nodata,
+    )?;
+    writer.write_band(1, &prediction)?;
+    writer.flush()?;
+    Ok(())
 }
 
 // Read all bands from a reader into a 3D cube `(bands, rows, cols)`.
@@ -733,37 +691,6 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
-    // -- zhu2015 2-band output --
-
-    #[test]
-    fn write_zhu2015_output_2band() {
-        let path = Path::new("test_zhu2015_2band.tif");
-        let meta = RasterMetadata {
-            geo_transform: DEFAULT_GEO,
-            crs_wkt: None,
-            nodata: Some(-9999.0),
-        };
-
-        let prediction = Array2::from_shape_vec((5, 10), (0..50).map(|v| v as f64).collect()).unwrap();
-        let qa = Array2::from_shape_vec((5, 10), (0..50).map(|v| (v % 3) as f64).collect()).unwrap();
-
-        write_zhu2015_output(path, &prediction, &qa, &meta).unwrap();
-
-        // Read back
-        let reader = RasterReader::open(path).unwrap();
-        assert_eq!(reader.band_count(), 2);
-        assert_eq!(reader.shape(), (5, 10));
-        let b1 = reader.read_band(1).unwrap();
-        let b2 = reader.read_band(2).unwrap();
-
-        assert!((b1[[0, 0]] - 0.0).abs() < 1e-5);
-        assert!((b1[[4, 9]] - 49.0).abs() < 1e-5);
-        assert!((b2[[0, 0]] - 0.0).abs() < 1e-5);
-        assert!((b2[[1, 0]] - 1.0).abs() < 1e-5);
-
-        let _ = fs::remove_file(path);
-    }
-
     // -- shape mismatch error --
 
     #[test]
@@ -796,35 +723,6 @@ mod tests {
         .unwrap();
         w.write_band(1, &data).unwrap();
         w.flush().unwrap();
-    }
-
-    /// Writes Zhu2015 2-band test GeoTIFF for Python rasterio verification.
-    #[test]
-    fn write_evidence_zhu2015_2band() {
-        let ev_dir = Path::new(".sisyphus/evidence");
-        let _ = fs::create_dir_all(ev_dir);
-        let path = ev_dir.join("task-8-rust-written-zhu2015-2band.tif");
-
-        let rows = 4;
-        let cols = 6;
-        let meta = RasterMetadata {
-            geo_transform: [200000.0, 10.0, 0.0, 4000000.0, 0.0, -10.0],
-            crs_wkt: None,
-            nodata: Some(-32768.0),
-        };
-
-        let prediction = Array2::from_shape_vec(
-            (rows, cols),
-            (0..24).map(|v| v as f64 * 0.01).collect(),
-        )
-        .unwrap();
-        let qa = Array2::from_shape_vec(
-            (rows, cols),
-            (0..24).map(|v| (v % 4) as f64).collect(),
-        )
-        .unwrap();
-
-        write_zhu2015_output(&path, &prediction, &qa, &meta).unwrap();
     }
 
     #[test]
@@ -990,16 +888,12 @@ mod tests {
 
         reconstruct_zhu2015_geotiff(&reader, &t_days, target_t, 0.1, output, &meta).unwrap();
 
-        // Zhu2015 outputs 2 bands
-        _check_output(output, 5, 5, 2);
+        _check_output(output, 5, 5, 1);
 
         let out_r = RasterReader::open(output).unwrap();
         let pred = out_r.read_band(1).unwrap();
-        let qa = out_r.read_band(2).unwrap();
         let n_finite_pred = pred.iter().filter(|v| v.is_finite()).count();
-        let n_finite_qa = qa.iter().filter(|v| v.is_finite()).count();
         assert!(n_finite_pred > 0, "Zhu2015 prediction band should have finite values; got {n_finite_pred}");
-        assert!(n_finite_qa > 0, "Zhu2015 QA band should have values; got {n_finite_qa}");
 
         let _ = fs::remove_file(input);
         let _ = fs::remove_file(output);

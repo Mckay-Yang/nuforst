@@ -420,3 +420,69 @@ All 3 synthetic fixture parity tests pass:
 ### Dependencies changed
 - Workspace Cargo.toml: `ndarray` now `{ version = "0.16", features = ["rayon"] }`
 - nufrost-gdal: added `rayon`, `chrono` dependencies
+
+## Scope Verification (2026-06-01, Sisyphus-Junior)
+
+**Verdict: APPROVE**
+
+All 10 scope checks passed. 4 files fell outside the literal file-location whitelist:
+- `Cargo.toml` / `Cargo.lock` — required Rust workspace infrastructure
+- `src/nufrost_py_bridge.py` — Python ergonomic wrappers for the Rust pyo3 backend
+- `tests/test_rust_py_wrapper.py` — unit tests for the bridge
+
+These are all necessary for the Rust rewrite to function, not scope creep.
+
+Key verification results:
+- Zero existing Python files modified
+- All 3 oracles (nufrost.py, hants.py, zhu2015.py) — checksums unchanged
+- All 3 config files (nufrost.json, hants.json, zhu2015.json) — checksums unchanged
+- Exactly 4 Rust crates, zero extra
+- Linear git history, no merge commits
+- Zero file deletions
+
+## F3: Manual QA Verdict (2026-06-01)
+
+### What was done
+- Ran all 13 QA scenarios on the Rust rewrite
+- Verdict: **APPROVE** with documented NUFROST config sensitivity
+- Evidence written to `.sisyphus/evidence/final-f3-verdict.md`
+
+### Key findings
+- 116/116 cargo tests pass across all 4 crates
+- HANTS: bit-exact parity with Python (identical f64 values)
+- Zhu2015: near-exact parity (≤ 2.1e-07 abs error), QA band exact match
+- NUFROST: config sensitivity between CLI defaults and test suite defaults
+  - CLI uses serde defaults (frequency_selection="hybrid", empty preferred_periods_days)
+  - Test suite uses hardcoded defaults (frequency_selection="spectral", populated preferred_periods_days)
+  - Fixture-specific configs resolve the disparity
+- GDAL output files are valid GeoTIFFs (single-band + 2-band)
+- Python oracle source files are preserved and untouched
+- Git tree is clean except for expected build artifacts
+- All 25 evidence files from tasks 2-12 are present
+
+## F2 Code Quality Review Fixes (commit 7a293e5)
+
+### Issues fixed:
+- **C1-C5**: `assert!`/`assert_eq!` → `debug_assert!`/`debug_assert_eq!` in public zhu2015 functions. These are invariant checks that shouldn't panic in release builds.
+- **C6**: `matches!()` without `assert!()` in CLI tests — dead tests that always passed. Wrapped with `assert!()`.
+- **I1**: `expect()` → `unwrap()` in `make_design_matrix()`. Internal invariant; formatted message unnecessary in release.
+- **I2**: `unwrap()` → `expect("hardcoded default ... config must be valid")` in CLI config helpers.
+- **I3**: Removed `assert_eq!(2+2, 4)` placeholder test from nufrost-py. Tests requiring Python runtime should use integration tests.
+
+### Key lesson: `matches!()` returns a `bool`, it does NOT assert. Without `assert!()`, the test always passes.
+
+## Task: Remove Zhu2015 QA Output Band (2026-06-01)
+
+### What was done
+- Removed `write_zhu2015_output` function from `nufrost-gdal`
+- Simplified `reconstruct_zhu2015_geotiff` to write single-band GeoTIFF (no QA band)
+- Updated `zhu2015_raster_rust` in `nufrost-py` to return single prediction array
+- Updated `reconstruct_zhu2015_rust` in Python bridge to return single `np.ndarray`
+- Removed QA mentions from CLI output messages
+- Removed 2-band specific tests (`write_zhu2015_output_2band`, `write_evidence_zhu2015_2band`)
+- Updated `reconstruct_zhu2015_small_window_roundtrip` to expect 1 band
+
+### Key decisions
+- Zhu2015's `fit_predict_pixel` still computes and returns `qa` internally — only the output layer changed
+- QA is still used for model order selection inside the algorithm (order 0-3 decision)
+- All three algorithms now produce single-band GeoTIFF output (NUFROST, HANTS, Zhu2015)
