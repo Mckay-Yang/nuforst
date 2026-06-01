@@ -46,6 +46,52 @@ at the top level for cdylib builds.
 - Two-run reproducibility verified: all 16 files produce identical SHA-256 checksums
 - All fixture files < 7KB each (well under 1MB limit)
 
+---
+
+## Task 12: Parity and Benchmark Reports (2026-06-01)
+
+### What was done
+- Ran full workspace test suite: 116 passed, 0 failed across 4 crates
+- Executed parity comparison: Python oracle (NPZ) vs Rust CLI on all 3 synthetic fixtures
+- Collected per-pixel kernel timings and CLI raster reconstruction timings
+- Wrote `.sisyphus/evidence/task-12-parity-report.md` with detailed comparison tables
+- Wrote `.sisyphus/evidence/task-12-benchmark-report.md` with timing data and deployment docs
+- Saved raw parity data to `.sisyphus/evidence/task-12-parity-raw.json`
+
+### Parity findings
+- HANTS: bit-exact match (f64 precision), 0.0 abs error on all fixtures
+- Zhu2015: ≤2.14e-7 abs error, QA band exact match (3=3) on all fixtures
+- NUFROST: simple_harmonic matches within 2.8e-5; gaps_outliers and step_break need
+  fixture configs for parity. CLI defaults differ because NUFFT frequency discovery
+  is sensitive to `modes`, `power_cum`, `num_peaks` parameters.
+
+### Benchmark findings
+- CLI process overhead: ~6.5ms/invocation (dominates single-pixel timing)
+- Per-pixel kernel (no I/O): NUFROST 1964µs, HANTS 3.3µs, Zhu2015 5.3µs, design_matrix 0.65µs
+- Raster mode (200 bands × 100 pixels): NUFROST 2.58s, HANTS 0.07s, Zhu2015 0.10s
+- Full raster (200 bands × 2048 pixels): all ~90s, I/O-bound
+- NUFROST is ~600× slower per pixel than HANTS due to O(N×M) direct DFT (N=50, M=4096)
+
+### Deployment docs
+- Documented GDAL/conda setup, Rust toolchain, build steps, Python wrapper install
+- Noted macOS DYLD_LIBRARY_PATH requirement for GDAL runtime linking
+- 116-test verification command: `cargo test --workspace`
+
+### Issues encountered
+- `/usr/bin/time` on macOS strips DYLD_LIBRARY_PATH (SIP); must use `export` in parent shell
+- CLI --config flag expects flat (not nested) algorithm-specific JSON; fixture configs
+  are nested under `config.<algo>` and need extraction
+- `install_name_tool -add_rpath` fails on pre-built binary due to load command size limits
+- `cargo bench` harness failed initially: `NufrostConfig` has no `Default` impl;
+  must construct via `NufrostConfig::from_json()`
+
+### Key decisions
+- No Python speedup claim: Python and Rust run in different environments with
+  different I/O paths; only measured Rust performance
+- Used CLI-based timing (not criterion) to match real-world usage patterns
+- Benchmark report includes both kernel timing (intra-process) and end-to-end
+  CLI timing (with process overhead) to give complete picture
+
 ### Key findings
 - NUFROST `predict_single_pixel` works with any consistent time unit (days or seconds);
   it calls `_to_seconds_since_start()` which just subtracts min(t), so the internal math
