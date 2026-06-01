@@ -127,3 +127,34 @@ src/
 ### Issues encountered
 - Timestamp test failure: "20171221T035139" vs "20180105T035145" differ by 6 seconds (not exactly 15 days).
   Fixed by using same-second timestamps in test.
+
+## 2026-06-01 T5: HANTS algorithm port
+
+### What was done
+- Created `rust/nufrost-core/src/hants.rs` (705 → 812 lines with tests)
+- Implemented: `make_design_matrix`, `gauss_solve`, `solve_normal_equations`, `detect_outliers`, `hants_fit`, `hants_predict`, `hants_predict_curve`, `hants_pixel`, `hants_curve_pixel`, `nanmedian`
+- Added `pub mod hants` + re-exports to `lib.rs`
+- All 27 HANTS-specific tests pass; 3 parity tests against Python oracle (simple_harmonic, gaps_outliers, step_break)
+- Full suite: 49 tests pass (no regressions)
+
+### Key decisions
+- **Gaussian elimination** instead of ndarray-linalg: avoids LAPACK dependency. Matrices are tiny (max ~11x11 for typical NOF parameters). Uses partial pivoting with 1e-14 singularity threshold matching Python's `np.linalg.solve` behavior.
+- **NPZ reading**: Used a Python pre-processing step to dump NPZ to JSON (NaN→null). This avoids ndarray version conflicts (workspace uses ndarray 0.16, ndarray-npy 0.10 uses ndarray 0.17).
+- **Paper-faithful semantics preserved**:
+  - NOF includes zero-frequency mean → model has `2*nof-1` parameters
+  - SF directional rejection: "low" rejects residual < -FET, "high" rejects residual > +FET, "none" rejects |residual| > FET
+  - valid_min/valid_max pre-filtering before iterative loop
+  - DOD enforces minimum `(2*nof-1 + dod)` retained observations
+  - Iteration cap: `min(len(y_curr), 50)` matching Python
+  - Stopping: FET threshold on residuals in SF direction
+- **fill_value** = nanmedian of all observations (not just valid ones) — matches Python behavior
+
+### Conventions
+- HANTS functions take `&[f64]` slices, not ndarray types — avoids unnecessary ndarray overhead for per-pixel calls
+- `HantsResult.coeffs` is `Vec<f64>` of length `2*nof-1`; contains NaN when `valid=false`
+- Parity test tolerance: atol=1e-4, rtol=1e-4 (matches manifest guidance)
+- Evidence files: `.sisyphus/evidence/task-5-hants-parity.txt`, `task-5-hants-edge.txt`
+
+### Issues encountered
+- JSON fixture generation initially produced NaN literals which are invalid JSON. Fixed by converting NaN → null in Python.
+- `ndarray-npy` with `npz` feature was already in dev-deps from T4; used JSON-based approach instead due to ndarray version mismatch.

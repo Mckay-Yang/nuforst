@@ -16,3 +16,4 @@ thiserror.workspace = true
 [dev-dependencies]
 approx.workspace = true
 criterion.workspace = true
+ndarray-npy = { version = "0.10", features = ["npz"] }
