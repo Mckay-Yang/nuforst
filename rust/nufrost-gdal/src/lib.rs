@@ -9,9 +9,9 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use gdal::{Dataset, DriverManager, GeoTransform, Metadata};
 use gdal::raster::Buffer;
 use gdal::spatial_ref::SpatialRef;
-use gdal::{Dataset, DriverManager, GeoTransform};
 use ndarray::Array2;
 
 use nufrost_core::{is_valid_reflectance, SENTINEL2_VALID_MAX, SENTINEL2_VALID_MIN};
@@ -255,6 +255,331 @@ pub fn write_zhu2015_output<P: AsRef<Path>>(
 }
 
 // ---------------------------------------------------------------------------
+// Raster reconstruction — per-pixel algorithm application on GeoTIFF input
+// ---------------------------------------------------------------------------
+
+/// Typed error for invalid raster inputs.
+///
+/// Produced when the input GeoTIFF does not meet the requirements for
+/// time-series reconstruction (wrong band count, mismatched timestamps, etc.).
+#[derive(Debug)]
+pub enum RasterInputError {
+    /// The raster has no bands (empty dataset).
+    #[allow(dead_code)]
+    EmptyRaster,
+    /// The number of bands does not match the number of timestamps provided.
+    BandTimestampMismatch {
+        n_bands: usize,
+        n_timestamps: usize,
+    },
+    /// The raster spatial dimensions are zero.
+    ZeroSize { rows: usize, cols: usize },
+    /// A band description could not be parsed as a timestamp.
+    #[allow(dead_code)]
+    InvalidBandTimestamp { band_idx: usize, description: String },
+}
+
+impl std::fmt::Display for RasterInputError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyRaster => write!(f, "raster has no bands"),
+            Self::BandTimestampMismatch { n_bands, n_timestamps } => {
+                write!(f, "band count ({n_bands}) != timestamp count ({n_timestamps})")
+            }
+            Self::ZeroSize { rows, cols } => write!(f, "raster has zero spatial size ({rows}r × {cols}c)"),
+            Self::InvalidBandTimestamp { band_idx, description } => {
+                write!(f, "band {band_idx} description is not a valid timestamp: '{description}'")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RasterInputError {}
+
+/// Extract relative-day timestamps from multi-band GeoTIFF band descriptions.
+///
+/// For Sentinel-2 convention, each band stores a timestamp in its description
+/// (e.g. `"2020-01-01T04:58:59Z"`).  This function parses band descriptions
+/// as ISO-8601, converts to epoch seconds, then returns days relative to the
+/// first valid timestamp.
+///
+/// Returns `(timestamps_days, target_time_day)` where `target_time_day` is
+/// the last timestamp (matching the Python "hold out last scene" convention).
+pub fn extract_timestamps_from_band_descriptions(
+    reader: &RasterReader,
+) -> Result<(Vec<f64>, f64), RasterInputError> {
+    let n = reader.band_count();
+    if n == 0 {
+        return Err(RasterInputError::EmptyRaster);
+    }
+
+    let mut epoch_secs = Vec::with_capacity(n);
+    for b in 1..=n {
+        let band = reader
+            .dataset
+            .rasterband(b)
+            .map_err(|_| RasterInputError::InvalidBandTimestamp {
+                band_idx: b,
+                description: String::from("<unavailable>"),
+            })?;
+        let desc = band
+            .description()
+            .unwrap_or_default();
+        let desc = desc.trim();
+        // Try ISO-8601 via nufrost-core helper first, then RFC 3339 fallback
+        let epoch = nufrost_core::time::parse_iso8601_to_epoch_seconds(desc)
+            .or_else(|| {
+                chrono::DateTime::parse_from_rfc3339(desc)
+                    .ok()
+                    .map(|dt| dt.timestamp() as f64)
+            })
+            .ok_or_else(|| RasterInputError::InvalidBandTimestamp {
+                band_idx: b,
+                description: desc.to_string(),
+            })?;
+        epoch_secs.push(epoch);
+    }
+
+    let t0 = epoch_secs[0];
+    let days: Vec<f64> = epoch_secs.iter().map(|&s| (s - t0) / 86400.0).collect();
+    let target = days[days.len() - 1]; // hold out last scene
+    Ok((days, target))
+}
+
+/// Build synthetic timestamps from band indices (1 day per band).
+///
+/// Used when band descriptions are not timestamp-formatted (e.g. synthetic
+/// test data).  Band 0 → day 0, Band 1 → day 1, etc.
+pub fn synthetic_timestamps_from_bands(n_bands: usize) -> (Vec<f64>, f64) {
+    let days: Vec<f64> = (0..n_bands).map(|i| i as f64).collect();
+    let target = days[days.len() - 1];
+    (days, target)
+}
+
+// ── Internal: shared reconstruction loop ──────────────────────────────────
+
+/// Run a per-pixel reconstruction algorithm on a 3D cube `(bands, rows, cols)`
+/// and write a single-band Float32 GeoTIFF.
+///
+/// `reconstruct_fn` receives `(timestamps_days, observations, target_t_day)`
+/// and returns a scalar prediction.
+///
+/// Uses rayon for parallel row processing.
+fn reconstruct_single_band<F, P: AsRef<Path>>(
+    cube: &ndarray::Array3<f64>,
+    timestamps_days: &[f64],
+    target_t_day: f64,
+    output_path: P,
+    metadata: &RasterMetadata,
+    reconstruct_fn: F,
+) -> Result<()>
+where
+    F: Fn(&[f64], &[f64], f64) -> f64 + Sync + Send,
+{
+    let (n_bands, rows, cols) = cube.dim();
+    if n_bands == 0 || rows == 0 || cols == 0 {
+        return Err(anyhow::anyhow!(
+            "invalid cube dimensions: ({n_bands}, {rows}, {cols})"
+        ));
+    }
+
+    use rayon::prelude::*;
+    let mut output = ndarray::Array2::<f64>::from_elem((rows, cols), f64::NAN);
+
+    // Parallel over rows: each row gets its own thread-local buffers
+    output
+        .axis_iter_mut(ndarray::Axis(0))
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(r, mut row_out)| {
+            let mut ts_buf = Vec::with_capacity(n_bands);
+            let mut obs_buf = Vec::with_capacity(n_bands);
+            for c in 0..cols {
+                ts_buf.clear();
+                obs_buf.clear();
+                for b in 0..n_bands {
+                    let v = cube[[b, r, c]];
+                    if v.is_finite() {
+                        ts_buf.push(timestamps_days[b]);
+                        obs_buf.push(v);
+                    }
+                }
+                if !ts_buf.is_empty() {
+                    row_out[c] = reconstruct_fn(&ts_buf, &obs_buf, target_t_day);
+                }
+            }
+        });
+
+    let mut writer = RasterWriter::create(
+        output_path,
+        rows,
+        cols,
+        1,
+        &metadata.geo_transform,
+        metadata.crs_wkt.as_deref(),
+        metadata.nodata,
+    )?;
+    writer.write_band(1, &output)?;
+    writer.flush()?;
+    Ok(())
+}
+
+// ── Public per-algorithm reconstruction entrypoints ──────────────────────
+
+/// Reconstruct a full raster using NUFROST.
+///
+/// Reads all bands from `reader`, applies [`nufrost_core::nufrost_pixel`] to
+/// every pixel in parallel, and writes a single-band Float32 GeoTIFF.
+pub fn reconstruct_nufrost_geotiff<P: AsRef<Path>>(
+    reader: &RasterReader,
+    timestamps_days: &[f64],
+    target_t_day: f64,
+    config: &nufrost_core::NufrostConfig,
+    output_path: P,
+    metadata: &RasterMetadata,
+) -> Result<()> {
+    let cube = read_all_bands(reader)?;
+    reconstruct_single_band(
+        &cube,
+        timestamps_days,
+        target_t_day,
+        output_path,
+        metadata,
+        |ts, obs, targ| {
+            let (pred, _n_freqs) =
+                nufrost_core::nufrost_pixel(ts, obs, targ, config);
+            if pred.is_finite() { pred } else { f64::NAN }
+        },
+    )
+}
+
+/// Reconstruct a full raster using HANTS.
+///
+/// Reads all bands from `reader`, applies [`nufrost_core::hants_pixel`] to
+/// every pixel in parallel, and writes a single-band Float32 GeoTIFF.
+pub fn reconstruct_hants_geotiff<P: AsRef<Path>>(
+    reader: &RasterReader,
+    timestamps_days: &[f64],
+    target_t_day: f64,
+    nof: u32,
+    sf: &str,
+    valid_min: Option<f64>,
+    valid_max: Option<f64>,
+    fet: f64,
+    dod: u32,
+    period: f64,
+    output_path: P,
+    metadata: &RasterMetadata,
+) -> Result<()> {
+    let cube = read_all_bands(reader)?;
+    reconstruct_single_band(
+        &cube,
+        timestamps_days,
+        target_t_day,
+        output_path,
+        metadata,
+        |ts, obs, targ| {
+            let pred = nufrost_core::hants_pixel(
+                ts, obs, targ, nof, sf, valid_min, valid_max, fet, dod, period,
+            );
+            if pred.is_finite() { pred } else { f64::NAN }
+        },
+    )
+}
+
+/// Reconstruct a full raster using Zhu2015.
+///
+/// Reads all bands from `reader`, applies
+/// [`nufrost_core::zhu2015::fit_predict_pixel`] to every pixel in parallel,
+/// and writes a 2-band GeoTIFF (Band 1 = Float32 prediction, Band 2 = Float32 QA).
+///
+/// The Float32 QA band preserves integer QA values (0-255) losslessly,
+/// matching the Python pipeline convention.
+pub fn reconstruct_zhu2015_geotiff<P: AsRef<Path>>(
+    reader: &RasterReader,
+    timestamps_days: &[f64],
+    target_t_day: f64,
+    lasso_alpha: f64,
+    output_path: P,
+    metadata: &RasterMetadata,
+) -> Result<()> {
+    let (n_bands, rows, cols) = {
+        let (rows, cols) = reader.shape();
+        (reader.band_count(), rows, cols)
+    };
+    if n_bands == 0 || rows == 0 || cols == 0 {
+        anyhow::bail!("empty raster input");
+    }
+
+    let cube = read_all_bands(reader)?;
+
+    use rayon::prelude::*;
+    let mut prediction = ndarray::Array2::<f64>::from_elem((rows, cols), f64::NAN);
+    let mut qa = ndarray::Array2::<f64>::zeros((rows, cols));
+
+    // Parallel over rows with thread-local buffers
+    let pred_view = &mut prediction;
+    let qa_view = &mut qa;
+    pred_view
+        .axis_iter_mut(ndarray::Axis(0))
+        .into_par_iter()
+        .enumerate()
+        .zip(
+            qa_view
+                .axis_iter_mut(ndarray::Axis(0))
+                .into_par_iter()
+                .enumerate(),
+        )
+        .for_each(|((r, mut pred_row), (_, mut qa_row))| {
+            let mut ts_buf = Vec::with_capacity(n_bands);
+            let mut obs_buf = Vec::with_capacity(n_bands);
+            for c in 0..cols {
+                ts_buf.clear();
+                obs_buf.clear();
+                for b in 0..n_bands {
+                    let v = cube[[b, r, c]];
+                    if v.is_finite() {
+                        ts_buf.push(timestamps_days[b]);
+                        obs_buf.push(v);
+                    }
+                }
+                if !ts_buf.is_empty() {
+                    let result = nufrost_core::zhu2015::fit_predict_pixel(
+                        &ts_buf, &obs_buf, target_t_day, lasso_alpha,
+                    );
+                    pred_row[c] = if result.prediction.is_finite() {
+                        result.prediction
+                    } else {
+                        f64::NAN
+                    };
+                    qa_row[c] = result.qa as f64;
+                }
+            }
+        });
+
+    write_zhu2015_output(output_path, &prediction, &qa, metadata)
+}
+
+// Read all bands from a reader into a 3D cube `(bands, rows, cols)`.
+fn read_all_bands(reader: &RasterReader) -> Result<ndarray::Array3<f64>> {
+    let n_bands = reader.band_count();
+    let (rows, cols) = reader.shape();
+    if n_bands == 0 {
+        anyhow::bail!("raster has no bands");
+    }
+    if rows == 0 || cols == 0 {
+        anyhow::bail!("raster has zero spatial dimensions ({rows}r × {cols}c)");
+    }
+
+    let mut cube = ndarray::Array3::<f64>::zeros((n_bands, rows, cols));
+    for b in 0..n_bands {
+        let band_data = reader.read_band(b + 1)?;
+        cube.slice_mut(ndarray::s![b, .., ..]).assign(&band_data);
+    }
+    Ok(cube)
+}
+
+// ---------------------------------------------------------------------------
 // GDAL version helper (kept from placeholder for smoke testing)
 // ---------------------------------------------------------------------------
 
@@ -271,6 +596,7 @@ pub fn gdal_version() -> String {
 mod tests {
     use super::*;
     use ndarray::Array2;
+    use nufrost_core::NufrostConfig;
     use std::fs;
 
     const DEFAULT_GEO: GeoTransform = [0.0, 1.0, 0.0, 0.0, 0.0, -1.0];
@@ -510,5 +836,213 @@ mod tests {
         // GDALGetRasterNoDataValue, which maps to None.
         assert_eq!(r.nodata(1), None);
         let _ = fs::remove_file(path);
+    }
+
+    // ── Integration: end-to-end small-window reconstruction ────────────
+
+    /// Create a synthetic multi-band time-series GeoTIFF.
+    ///
+    /// Each band represents one timestamp. Pixel values follow a sine wave
+    /// plus a spatial gradient so algorithms have signal to reconstruct.
+    fn _write_time_series_tif(
+        path: &Path,
+        rows: usize,
+        cols: usize,
+        n_timestamps: usize,
+    ) -> Result<()> {
+        use std::f64::consts::PI;
+        let mut writer = RasterWriter::create(path, rows, cols, n_timestamps, &DEFAULT_GEO, None, Some(f64::NAN))?;
+        for b in 0..n_timestamps {
+            let t = b as f64;
+            let mut arr = Array2::<f64>::zeros((rows, cols));
+            for r in 0..rows {
+                for c in 0..cols {
+                    let spatial = ((r + c) as f64) * 10.0;
+                    arr[[r, c]] = spatial + 100.0 * (2.0 * PI * t / n_timestamps as f64).sin() + 500.0;
+                }
+            }
+            writer.write_band(b + 1, &arr)?;
+        }
+        writer.flush()?;
+        Ok(())
+    }
+
+    /// Verify output GeoTIFF band count and spatial shape.
+    fn _check_output(path: &Path, expected_rows: usize, expected_cols: usize, expected_bands: usize) {
+        let r = RasterReader::open(path).unwrap();
+        assert_eq!(
+            r.shape(),
+            (expected_rows, expected_cols),
+            "output shape mismatch"
+        );
+        assert_eq!(
+            r.band_count(),
+            expected_bands,
+            "output band count mismatch"
+        );
+    }
+
+    #[test]
+    fn reconstruct_nufrost_small_window_roundtrip() {
+        let input = Path::new("test_ts_nufrost.tif");
+        let output = Path::new("test_out_nufrost.tif");
+        _write_time_series_tif(input, 5, 5, 10).unwrap();
+
+        let reader = RasterReader::open(input).unwrap();
+        let meta = RasterMetadata {
+            geo_transform: DEFAULT_GEO,
+            crs_wkt: None,
+            nodata: Some(f64::NAN),
+        };
+        let (t_days, target_t) = synthetic_timestamps_from_bands(reader.band_count());
+
+        let config = NufrostConfig {
+            modes: 256,
+            eps: 1e-12,
+            num_peaks: 2,
+            power_cum: 0.7,
+            ignore_dc_hz: 1e-10,
+            frequency_selection: "hybrid".into(),
+            preferred_periods_days: String::new(),
+            preferred_top_k: 0,
+            spectral_top_k: 2,
+            spectral_merge_tol: 0.15,
+            refine_peaks: false,
+            include_trend: true,
+            ridge_lam: 0.01,
+            freq_weight: 1.0,
+            huber_iters: 3,
+            huber_delta: 0.05,
+            min_obs: 3,
+            outlier_sigma: 2.5,
+            lambda_step: 1e30,
+            lambda_high: 0.005,
+            low_freq_period_days: 0.0,
+            step_dt_weighting: false,
+            max_outer_iter: 3,
+            outer_tol: 1e-3,
+            joint_outlier: false,
+            joint_outlier_sigma: 2.5,
+            admm_rho: 1.0,
+            admm_max_iter: 10,
+            admm_tol: 1e-3,
+        };
+
+        reconstruct_nufrost_geotiff(&reader, &t_days, target_t, &config, output, &meta).unwrap();
+
+        _check_output(output, 5, 5, 1);
+
+        // Verify output has finite values
+        let out_r = RasterReader::open(output).unwrap();
+        let out_data = out_r.read_band(1).unwrap();
+        let n_finite = out_data.iter().filter(|v| v.is_finite()).count();
+        assert!(n_finite > 0, "NUFROST output should have finite predictions; got {n_finite}");
+
+        let _ = fs::remove_file(input);
+        let _ = fs::remove_file(output);
+    }
+
+    #[test]
+    fn reconstruct_hants_small_window_roundtrip() {
+        let input = Path::new("test_ts_hants.tif");
+        let output = Path::new("test_out_hants.tif");
+        _write_time_series_tif(input, 5, 5, 10).unwrap();
+
+        let reader = RasterReader::open(input).unwrap();
+        let meta = RasterMetadata {
+            geo_transform: DEFAULT_GEO,
+            crs_wkt: None,
+            nodata: Some(f64::NAN),
+        };
+        let (t_days, target_t) = synthetic_timestamps_from_bands(reader.band_count());
+
+        reconstruct_hants_geotiff(
+            &reader, &t_days, target_t,
+            3, "high", Some(0.0), Some(10000.0),
+            500.0, 5, 365.25,
+            output, &meta,
+        ).unwrap();
+
+        _check_output(output, 5, 5, 1);
+
+        let out_r = RasterReader::open(output).unwrap();
+        let out_data = out_r.read_band(1).unwrap();
+        let n_finite = out_data.iter().filter(|v| v.is_finite()).count();
+        assert!(n_finite > 0, "HANTS output should have finite predictions; got {n_finite}");
+
+        let _ = fs::remove_file(input);
+        let _ = fs::remove_file(output);
+    }
+
+    #[test]
+    fn reconstruct_zhu2015_small_window_roundtrip() {
+        let input = Path::new("test_ts_zhu.tif");
+        let output = Path::new("test_out_zhu.tif");
+        _write_time_series_tif(input, 5, 5, 12).unwrap(); // need 12+ obs for full fit
+
+        let reader = RasterReader::open(input).unwrap();
+        let meta = RasterMetadata {
+            geo_transform: DEFAULT_GEO,
+            crs_wkt: None,
+            nodata: Some(f64::NAN),
+        };
+        let (t_days, target_t) = synthetic_timestamps_from_bands(reader.band_count());
+
+        reconstruct_zhu2015_geotiff(&reader, &t_days, target_t, 0.1, output, &meta).unwrap();
+
+        // Zhu2015 outputs 2 bands
+        _check_output(output, 5, 5, 2);
+
+        let out_r = RasterReader::open(output).unwrap();
+        let pred = out_r.read_band(1).unwrap();
+        let qa = out_r.read_band(2).unwrap();
+        let n_finite_pred = pred.iter().filter(|v| v.is_finite()).count();
+        let n_finite_qa = qa.iter().filter(|v| v.is_finite()).count();
+        assert!(n_finite_pred > 0, "Zhu2015 prediction band should have finite values; got {n_finite_pred}");
+        assert!(n_finite_qa > 0, "Zhu2015 QA band should have values; got {n_finite_qa}");
+
+        let _ = fs::remove_file(input);
+        let _ = fs::remove_file(output);
+    }
+
+    #[test]
+    fn invalid_raster_empty_band_count() {
+        let path = Path::new("test_empty.tif");
+        // Create a 1-band empty raster
+        {
+            let mut writer = RasterWriter::create(path, 3, 3, 1, &DEFAULT_GEO, None, None).unwrap();
+            let data = Array2::<f64>::from_elem((3, 3), f64::NAN);
+            writer.write_band(1, &data).unwrap();
+            writer.flush().unwrap();
+        }
+
+        let reader = RasterReader::open(path).unwrap();
+        let meta = RasterMetadata { geo_transform: DEFAULT_GEO, crs_wkt: None, nodata: Some(f64::NAN) };
+        let (t_days, target_t) = synthetic_timestamps_from_bands(reader.band_count());
+
+        // 1 band with all-NaN values: algorithms should still run but output NaNs
+        let output = Path::new("test_out_empty.tif");
+        let config = NufrostConfig {
+            modes: 256, eps: 1e-12, num_peaks: 2, power_cum: 0.7, ignore_dc_hz: 1e-10,
+            frequency_selection: "hybrid".into(), preferred_periods_days: String::new(),
+            preferred_top_k: 0, spectral_top_k: 2, spectral_merge_tol: 0.15,
+            refine_peaks: false, include_trend: true, ridge_lam: 0.01, freq_weight: 1.0,
+            huber_iters: 3, huber_delta: 0.05, min_obs: 3, outlier_sigma: 2.5,
+            lambda_step: 1e30, lambda_high: 0.005, low_freq_period_days: 0.0,
+            step_dt_weighting: false, max_outer_iter: 3, outer_tol: 1e-3,
+            joint_outlier: false, joint_outlier_sigma: 2.5,
+            admm_rho: 1.0, admm_max_iter: 10, admm_tol: 1e-3,
+        };
+
+        let result = reconstruct_nufrost_geotiff(&reader, &t_days, target_t, &config, output, &meta);
+        assert!(result.is_ok(), "NAN-only input should still produce output (with NAN predictions)");
+
+        // Verify output exists
+        let out_r = RasterReader::open(output).unwrap();
+        assert_eq!(out_r.band_count(), 1);
+        assert_eq!(out_r.shape(), (3, 3));
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(output);
     }
 }

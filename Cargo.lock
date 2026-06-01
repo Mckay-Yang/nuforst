@@ -1965,6 +1965,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "rawpointer",
+ "rayon",
 ]
 
 [[package]]
@@ -2042,9 +2043,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "approx",
+ "chrono",
  "gdal",
  "ndarray",
  "nufrost-core",
+ "rayon",
  "thiserror 2.0.18",
 ]
 

@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.dependencies]
-ndarray = "0.16"
+ndarray = { version = "0.16", features = ["rayon"] }
 rayon = "1.10"
 chrono = "0.4"
 serde = { version = "1", features = ["derive"] }

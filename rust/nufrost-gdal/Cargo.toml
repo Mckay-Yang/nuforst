@@ -8,6 +8,8 @@ rust-version.workspace = true
 [dependencies]
 nufrost-core = { path = "../nufrost-core" }
 ndarray.workspace = true
+rayon.workspace = true
+chrono.workspace = true
 gdal.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true

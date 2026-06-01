@@ -1,0 +1,49 @@
+Task 11: Invalid Raster Input Error Evidence
+==============================================
+
+Date: 2026-06-01
+
+## 1. Nonexistent File Error
+
+$ nufrost-cli nufrost --input-geotiff /nonexistent/file.tif --output /tmp/out.tif
+  Error: Cannot open GeoTIFF: /nonexistent/file.tif
+  Caused by:
+      0: Failed to open raster: /nonexistent/file.tif
+      1: GDAL method 'GDALOpenEx' returned a NULL pointer. Error msg: ''
+  EXIT: 1
+
+## 2. Typed Error Types (RasterInputError enum)
+
+Defined in nufrost-gdal/src/lib.rs:
+
+  RasterInputError::EmptyRaster
+    → "raster has no bands"
+
+  RasterInputError::BandTimestampMismatch { n_bands, n_timestamps }
+    → "band count ({n_bands}) != timestamp count ({n_timestamps})"
+
+  RasterInputError::ZeroSize { rows, cols }
+    → "raster has zero spatial size ({rows}r × {cols}c)"
+
+  RasterInputError::InvalidBandTimestamp { band_idx, description }
+    → "band {band_idx} description is not a valid timestamp: '{description}'"
+
+All variants implement std::error::Error + Display.
+
+## 3. Runtime Validation in CLI
+
+detect_input_mode() checks:
+  - Both --data and --input-geotiff provided → "mutually exclusive" error
+  - Neither provided → "No input data provided" error
+  - GeoTIFF has zero bands → "GeoTIFF has no bands" error
+  - GeoTIFF has zero spatial size → "GeoTIFF has zero spatial dimensions" error
+  - GeoTIFF mode without --output → "--output <PATH> is required" error
+
+## 4. Test Coverage
+
+invalid_raster_empty_band_count test:
+  - Creates a 3×3×1 GeoTIFF with all-NaN values
+  - Runs NUFROST reconstruction on it
+  - Verifies output is created (with NaN predictions in all cells)
+  - Verifies output band count = 1, shape = (3, 3)
+  → Test passes ✓

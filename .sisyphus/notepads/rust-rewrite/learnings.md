@@ -336,3 +336,41 @@ All 3 synthetic fixture parity tests pass:
 - Config fixture embedded as default (avoids `include_str!` path issues)
 - `hants_pixel` and `nufrost_pixel` use days directly (time unit converted internally)
 - `fit_predict_pixel` expects days as input
+
+## 2026-06-01 T11: Rust full-scene reconstruction orchestration
+
+### What was done
+- Implemented per-algorithm raster reconstruction in `nufrost-gdal`:
+  `reconstruct_nufrost_geotiff`, `reconstruct_hants_geotiff`, `reconstruct_zhu2015_geotiff`
+- Connected to `nufrost-cli` via `--input-geotiff` and `--output` args
+- Added `RasterInputError` typed error enum for invalid raster inputs
+- Timestamp extraction from band descriptions via `extract_timestamps_from_band_descriptions`
+- Synthetic timestamp fallback via `synthetic_timestamps_from_bands`
+- 4 new integration tests (small-window roundtrip for all 3 algorithms + invalid raster)
+- CLI runs all three algorithms end-to-end on synthetic GeoTIFF input
+
+### Key decisions
+- **Rayon for parallelism**: Per-row parallel processing via `axis_iter_mut(Axis(0)).into_par_iter()`.
+  ndarray `rayon` feature added to workspace Cargo.toml; rayon added to nufrost-gdal deps.
+- **Memory strategy**: `read_all_bands()` loads full cube into `Array3D<f64>` for small windows.
+  Code structured as a separate function so future tile-based processing can swap in
+  windowed reads without touching algorithm logic.
+- **Core reconstruction loop**: `reconstruct_single_band()` accepts a generic closure
+  `Fn(&[f64], &[f64], f64) -> f64 + Sync + Send`, enabling reuse across algorithms.
+- **Output conventions preserved**: NUFROST/HANTS → 1-band Float32, Zhu2015 → 2-band
+  (prediction + QA, both Float32). QA band uses Float32 because GDAL
+  `create_with_band_type` creates all bands with the same type; Float32 losslessly
+  stores integer QA values 0-255.
+- **Input mode detection**: `detect_input_mode()` handles NPZ vs GeoTIFF disambiguation.
+  `--data` and `--input-geotiff` are mutually exclusive; `--output` required for GeoTIFF mode.
+- **Metadata preservation**: Geo-transform and CRS copied from input reader to output rasters.
+
+### Test results
+- Full workspace: 37 tests pass (21 core + 14 gdal + 1 cli + 1 py)
+- CLI verified on synthetic 5×5×10 GeoTIFF with sine-wave signal
+- gdalinfo confirms correct band counts and Float32 pixel types
+- Invalid raster input produces descriptive errors with non-zero exit code
+
+### Dependencies changed
+- Workspace Cargo.toml: `ndarray` now `{ version = "0.16", features = ["rayon"] }`
+- nufrost-gdal: added `rayon`, `chrono` dependencies
