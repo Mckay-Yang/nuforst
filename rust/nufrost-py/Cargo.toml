@@ -11,6 +11,9 @@ crate-type = ["cdylib"]
 [dependencies]
 nufrost-core = { path = "../nufrost-core" }
 pyo3.workspace = true
+numpy.workspace = true
+rayon.workspace = true
+serde_json.workspace = true
 
 [build-dependencies]
 maturin.workspace = true
