@@ -306,3 +306,33 @@ All 3 synthetic fixture parity tests pass:
   simple_harmonic: Python=0.78301321, Rust matches
   gaps_outliers:   Python=-0.33037508, Rust matches
   step_break:      Python=0.80624326, Rust matches
+
+## 2026-06-01 T9: Rust CLI (nufrost-cli)
+
+### What was done
+- Implemented full `clap` derive CLI with subcommands: `nufrost`, `hants`, `zhu2015`
+- Shared args: `--data` (fixture NPZ), `--target-time` (days), `--output` (file), `--threads`
+- Algorithm-specific args: `--config` (JSON config file, optional — uses built-in defaults)
+- Fixture loading via `ndarray-npy` with keys: `timestamps_days`, `observations`, `target_time_day`
+- Config loading: supports both standalone per-algorithm JSON and unified `ReconstructionConfig` JSON
+- 23 tests: 10 unit (arg parsing), 6 error handling, 3 integration (all algorithms run on synthetic fixture), 3 config loading, 1 help text
+- CLI exits non-zero with descriptive errors on missing data, missing files, invalid config
+
+### CLI design decisions
+- Single-pixel NPZ fixture input (not raster) for now — matches task scope and avoids GDAL runtime dependency in tests
+- `nufrost-gdal` dependency declared for future raster I/O
+- `SharedArgs` struct with `#[clap(flatten)]` avoids arg duplication across algorithm subcommands
+- `after_help` with usage examples in `--help` output
+- `--target-time` overrides fixture-embedded value when explicitly passed
+- Results print to stdout by default; `--output` writes to file
+
+### Dependency notes
+- Added `ndarray-npy` and `serde_json` as regular deps (not dev-only) since `load_fixture_npz` and config loading are used in production code path
+- `clap` version 4 with derive feature from workspace
+
+### Fixture format
+- NPZ keys: `timestamps_days` (1-d f64), `observations` (1-d f64), `target_time_day` (0-d f64)
+- Fixture resolution: `tests/fixtures/rust_parity/synthetic/<name>/data.npz`
+- Config fixture embedded as default (avoids `include_str!` path issues)
+- `hants_pixel` and `nufrost_pixel` use days directly (time unit converted internally)
+- `fit_predict_pixel` expects days as input

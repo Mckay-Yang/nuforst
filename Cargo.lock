@@ -2014,7 +2014,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "ndarray",
+ "ndarray-npy",
  "nufrost-core",
+ "nufrost-gdal",
+ "serde_json",
 ]
 
 [[package]]
