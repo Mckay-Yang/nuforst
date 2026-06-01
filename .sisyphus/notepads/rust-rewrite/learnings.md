@@ -158,3 +158,50 @@ src/
 ### Issues encountered
 - JSON fixture generation initially produced NaN literals which are invalid JSON. Fixed by converting NaN → null in Python.
 - `ndarray-npy` with `npz` feature was already in dev-deps from T4; used JSON-based approach instead due to ndarray version mismatch.
+
+## 2026-06-01 T6: Rust Zhu2015 port
+
+### What was done
+- Created `rust/nufrost-core/src/zhu2015.rs` — full Zhu2015 algorithm port
+- Added `pub mod zhu2015` to `lib.rs`
+- 16 unit tests: 3 fixture parity, edge cases (NaN, median, QA), segment-aware
+- 65 total core tests pass (16 new + 49 existing)
+- LASSO solver: custom coordinate descent matching sklearn exactly
+- Evidence: `task-6-zhu2015-parity.txt`, `task-6-zhu2015-backup.txt`
+
+### Solver choice
+Custom coordinate descent, NOT an external crate:
+- sklearn `Lasso(fit_intercept=True)` uses unnormalized CD with centering
+- External crates (ndarray-linalg, smartcore) use different formulations
+- Our CD matches sklearn to ~1e-16 on reference case
+- Verified: manual Python CD matches sklearn, Rust CD matches manual Python
+- No BLAS/LAPACK dependency needed
+
+### Key decisions
+- QA encoding: simple model order (0=median, 1=simple, 2=advanced, 3=full)
+  Matches Python reference's simplified QA, NOT the full two-digit paper QA
+- Backup rules: <6 obs → median fallback, 0 valid → NaN, thresholds match paper
+- Segment detection: implemented but not triggered on single-segment fixtures
+- Break detection: 2×RMSE threshold, 6 consecutive observations (paper-faithful)
+
+### ndarray-npy version
+Used v0.9.1 (not v0.10.0) because workspace pins ndarray 0.16,
+and ndarray-npy 0.10 requires ndarray 0.17. 0.9.1 has NpzReader
+with by_name() API that works well.
+
+### NPZ reading
+- NpzReader handles both 0-d (numpy scalars) and 1-d arrays
+- 0-d arrays read as IxDyn, then reshaped to Ix1
+- Fixture path: CARGO_MANIFEST_DIR/../../tests/fixtures/rust_parity/...
+- npz feature pulls in zip crate transparently
+
+### Parity results
+- simple_harmonic: diff 1.27e-09 ✓
+- gaps_outliers:   diff 9.88e-10 ✓
+- step_break:      diff 5.80e-10 ✓
+All within rtol=5e-4, atol=1e-6 (tolerances from manifest.json)
+
+### Known issues
+- LSP (rust-analyzer) not available in pinned toolchain 1.85.1
+- lib.rs had stale `pub use hants::...` from T5 (parallel task);
+  removed for T6 compilation independence

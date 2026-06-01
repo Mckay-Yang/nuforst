@@ -1,0 +1,57 @@
+===========================================================================
+Task 6: Rust Zhu2015 Backup Rules Evidence
+===========================================================================
+Generated: 2026-06-01
+
+=== Backup Rule Triggers ===
+
+1. All-NaN input → NaN prediction, QA=0
+   Test: test_all_nan_returns_nan_qa0
+   Result: PASS ✓
+
+2. <6 valid obs → median fallback, QA=0
+   Test: test_median_fallback_qa0 (4 valid: [1,5,3,2] → median=2.5)
+   Result: PASS ✓
+
+3. Single valid obs → median fallback, QA=0
+   Test: test_single_valid_median_qa0 (1 valid: [42] → median=42)
+   Result: PASS ✓
+
+4. 6-17 valid → order=1 (simple), QA=1
+   Test: test_qa_encodes_model_order (12 valid → QA=1)
+   Result: PASS ✓
+
+5. 18-23 valid → order=2 (advanced), QA=2
+   Test: test_qa_encodes_model_order (20 valid → QA=2)
+   Result: PASS ✓
+
+6. >=24 valid → order=3 (full), QA=3
+   Test: test_qa_encodes_model_order (30 valid → QA=3)
+   Result: PASS ✓
+
+=== Parity with Python fixtures ===
+
+All three synthetic fixtures trigger order=3 (full model):
+  simple_harmonic: 50 valid → order=3, QA=3 ✓
+  gaps_outliers:   64 valid → order=3, QA=3 ✓
+  step_break:      95 valid → order=3, QA=3 ✓
+
+=== Segment-aware backup ===
+
+fit_segment() returns None when:
+  - Fewer than 6 valid observations in slice
+  Test: test_fit_segment_too_short → None ✓
+
+=== Break detection ===
+
+detect_breaks() returns empty on clean harmonic signal:
+  Test: test_detect_breaks_no_break → [] ✓
+
+=== Python backup rule comparison ===
+
+Python fit_predict_pixel():
+  n_obs == 0  → NaN           (matches Rust)
+  n_obs < 6   → np.median(y)  (matches Rust ✓)
+  6-17         → order=1       (matches Rust ✓)
+  18-23        → order=2       (matches Rust ✓)
+  >=24         → order=3       (matches Rust ✓)

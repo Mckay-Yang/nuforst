@@ -9,6 +9,7 @@ pub mod error;
 pub mod hants;
 pub mod time;
 pub mod types;
+pub mod zhu2015;
 
 pub use config::{NufrostConfig, HantsConfig, Zhu2015Config, ReconstructionConfig};
 pub use error::NufrostError;

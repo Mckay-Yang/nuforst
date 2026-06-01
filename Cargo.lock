@@ -1968,32 +1968,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "ndarray"
-version = "0.17.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "520080814a7a6b4a6e9070823bb24b4531daac8c4627e08ba5de8c5ef2f2752d"
-dependencies = [
- "matrixmultiply",
- "num-complex",
- "num-integer",
- "num-traits",
- "portable-atomic",
- "portable-atomic-util",
- "rawpointer",
-]
-
-[[package]]
 name = "ndarray-npy"
-version = "0.10.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "58e8a348bca0075000d999d750420d74434fd0d3e0993b456554f885e7657a11"
+checksum = "7b313788c468c49141a9d9b6131fc15f403e6ef4e8446a0b2e18f664ddb278a9"
 dependencies = [
  "byteorder",
- "ndarray 0.17.2",
+ "ndarray",
  "num-complex",
  "num-traits",
  "py_literal",
- "zip 6.0.0",
+ "zip 2.4.2",
 ]
 
 [[package]]
@@ -2039,7 +2024,7 @@ dependencies = [
  "approx",
  "chrono",
  "criterion",
- "ndarray 0.16.1",
+ "ndarray",
  "ndarray-npy",
  "rayon",
  "serde",
@@ -2054,7 +2039,7 @@ dependencies = [
  "anyhow",
  "approx",
  "gdal",
- "ndarray 0.16.1",
+ "ndarray",
  "nufrost-core",
  "thiserror 2.0.18",
 ]
@@ -4514,15 +4499,18 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "6.0.0"
+version = "2.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb2a05c7c36fde6c09b08576c9f7fb4cda705990f73b58fe011abf7dfb24168b"
+checksum = "fabe6324e908f85a1c52063ce7aa26b68dcb7eb6dbc83a2d148403c9bc3eba50"
 dependencies = [
  "arbitrary",
  "crc32fast",
+ "crossbeam-utils",
+ "displaydoc",
  "flate2",
  "indexmap",
  "memchr",
+ "thiserror 2.0.18",
  "zopfli",
 ]
 
