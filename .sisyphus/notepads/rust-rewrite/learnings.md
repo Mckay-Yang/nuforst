@@ -205,3 +205,52 @@ All within rtol=5e-4, atol=1e-6 (tolerances from manifest.json)
 - LSP (rust-analyzer) not available in pinned toolchain 1.85.1
 - lib.rs had stale `pub use hants::...` from T5 (parallel task);
   removed for T6 compilation independence
+
+## 2026-06-01 T8: GDAL raster I/O implementation
+
+### What was done
+- Replaced placeholder `lib.rs` with full `RasterReader`, `RasterWriter`, and `write_zhu2015_output` implementation
+- 10 tests pass (8 core + 2 evidence generators)
+- Python rasterio cross-verification confirms metadata and data roundtrip
+
+### Key decisions
+- **Pixel type**: Write `Float32` (f32) to match Python pipeline convention (np.float32).
+  Read as f64 for internal computation precision.
+- **Shape convention**: GDAL uses (cols, rows), ndarray uses (rows, cols).
+  `RasterReader::shape()` returns (rows, cols) for natural use with ndarray.
+- **Buffer conversion**: GDAL `Buffer<T>` fields are private; use `into_shape_and_vec()`
+  to extract data. Buffer shape is (cols, rows), data is row-major (scanline order) —
+  compatible with ndarray's default C-order layout.
+- **Imports**: `Buffer` exported as `gdal::raster::Buffer` (not `gdal::raster::buffer::Buffer`).
+  `GeoTransform` is `gdal::GeoTransform` = `[f64; 6]`.
+- **Valid mask**: `(0.0 < val < 10000.0)` matching Python's `_mask_invalid_reflectance_values()`.
+  Uses `is_valid_reflectance` from nufrost-core.
+- **Zhu2015 output**: 2-band GeoTIFF via `write_zhu2015_output()` helper.
+- **Nodata handling**: `RasterBand::no_data_value()` returns `Option<f64>` (not Result).
+  `set_no_data_value(Option<f64>)` to set or clear.
+- **CRS roundtrip**: `SpatialRef::from_wkt()` and `SpatialRef::to_wkt()` for WKT CRS.
+  `Dataset::spatial_ref()` returns Result<SpatialRef>; returns Err if no CRS set.
+
+### API surface
+```
+RasterReader::open(path) → Result<Self>
+RasterReader::shape() → (rows, cols)
+RasterReader::raster_size() → (cols, rows)
+RasterReader::band_count() → usize
+RasterReader::geo_transform() → Option<GeoTransform>
+RasterReader::crs_wkt() → Option<String>
+RasterReader::nodata(band_idx) → Option<f64>
+RasterReader::read_band(band_idx) → Result<Array2<f64>>
+RasterReader::read_valid_mask(band_idx) → Result<Array2<bool>>
+RasterReader::read_valid_mask_custom(band_idx, min, max) → Result<Array2<bool>>
+
+RasterWriter::create(path, rows, cols, bands, geo, crs_wkt, nodata) → Result<Self>
+RasterWriter::write_band(band_idx, &Array2<f64>) → Result<()>
+RasterWriter::flush() → Result<()>
+
+write_zhu2015_output(path, prediction, qa, metadata) → Result<()>
+```
+
+### Pre-existing issues
+- 5 nufrost-core tests fail (ridge_solve, insufficient_data, 3 parity tests);
+  these are unrelated to GDAL I/O and pre-date this task.
