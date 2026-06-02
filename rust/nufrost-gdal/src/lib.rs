@@ -625,8 +625,33 @@ pub fn reconstruct_zhu2015_geotiff<P: AsRef<Path>>(
     Ok(())
 }
 
-// Read all bands from a reader into a 3D cube `(bands, rows, cols)`.
-fn read_all_bands(reader: &RasterReader) -> Result<ndarray::Array3<f64>> {
+/// Extract the raw timestamp substrings from GDAL band descriptions.
+///
+/// For each band (1-indexed), the description is scanned for a timestamp
+/// substring (YYYYmmddTHHMMSS or ISO‑8601) using
+/// [`nufrost_core::find_timestamp_substring`].  Non‑timestamp descriptions
+/// are returned as empty strings so that the caller can decide on fallback
+/// behaviour.
+///
+/// Returns `Vec<String>` with one entry per band, in band order.
+pub fn extract_raw_band_descriptions(reader: &RasterReader) -> Result<Vec<String>> {
+    use nufrost_core::find_timestamp_substring;
+    let n = reader.band_count();
+    let mut descs = Vec::with_capacity(n);
+    for b in 1..=n {
+        let band = reader
+            .dataset
+            .rasterband(b)
+            .with_context(|| format!("Cannot access band {b}"))?;
+        let desc = band.description().unwrap_or_default();
+        let ts = find_timestamp_substring(desc.trim());
+        descs.push(ts.unwrap_or("").to_string());
+    }
+    Ok(descs)
+}
+
+/// Read all bands from a reader into a 3D cube `(bands, rows, cols)`.
+pub fn read_all_bands(reader: &RasterReader) -> Result<ndarray::Array3<f64>> {
     let n_bands = reader.band_count();
     let (rows, cols) = reader.shape();
     if n_bands == 0 {
@@ -639,6 +664,30 @@ fn read_all_bands(reader: &RasterReader) -> Result<ndarray::Array3<f64>> {
     let mut cube = ndarray::Array3::<f64>::zeros((n_bands, rows, cols));
     for b in 0..n_bands {
         let band_data = reader.read_band(b + 1)?;
+        cube.slice_mut(ndarray::s![b, .., ..]).assign(&band_data);
+    }
+    Ok(cube)
+}
+
+/// Read a top-left window from all bands into a 3D cube.
+pub fn read_all_bands_window(
+    reader: &RasterReader,
+    window_rows: usize,
+    window_cols: usize,
+) -> Result<ndarray::Array3<f64>> {
+    let n_bands = reader.band_count();
+    if n_bands == 0 {
+        anyhow::bail!("raster has no bands");
+    }
+    let (rows, cols) = reader.shape();
+    let r = window_rows.min(rows);
+    let c = window_cols.min(cols);
+    if r == 0 || c == 0 {
+        anyhow::bail!("window has zero dimensions ({r}r × {c}c)");
+    }
+    let mut cube = ndarray::Array3::<f64>::zeros((n_bands, r, c));
+    for b in 0..n_bands {
+        let band_data = reader.read_band_window(b + 1, r, c)?;
         cube.slice_mut(ndarray::s![b, .., ..]).assign(&band_data);
     }
     Ok(cube)

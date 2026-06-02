@@ -13,3 +13,5 @@ anyhow.workspace = true
 ndarray.workspace = true
 ndarray-npy = { version = "0.9", features = ["npz"] }
 serde_json.workspace = true
+rayon.workspace = true
+chrono.workspace = true
