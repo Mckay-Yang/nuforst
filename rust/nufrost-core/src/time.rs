@@ -10,9 +10,30 @@ const PARSE_FORMATS: &[&str] = &[
     "%Y-%m-%dT%H:%M:%S",
     "%Y-%m-%d %H:%M:%S",
     "%Y-%m-%d",
+    "%Y-%m-%dT%H:%M:%SZ",
     "%Y%m%dT%H%M%S",
     "%Y%m%d",
 ];
+
+/// Scan `desc` for the first run of 8 digits, 'T', and 6 digits,
+/// returning that substring. Matches Python `_parse_band_timestamp()` in
+/// `data_loader.py` which uses `re.search(r'(\d{8}T\d{6})', name)`.
+pub fn find_timestamp_substring(desc: &str) -> Option<&str> {
+    let bytes = desc.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i + 14 < len {
+        // Check for 8 digits
+        if bytes[i..i + 8].iter().all(u8::is_ascii_digit)
+            && bytes[i + 8] == b'T'
+            && bytes[i + 9..i + 15].iter().all(u8::is_ascii_digit)
+        {
+            return Some(&desc[i..i + 15]);
+        }
+        i += 1;
+    }
+    None
+}
 
 /// Parse a timestamp string into **seconds since the Unix epoch**.
 ///
@@ -27,8 +48,6 @@ pub fn parse_iso8601_to_epoch_seconds(ts: &str) -> Option<f64> {
     }
     for fmt in PARSE_FORMATS {
         if let Ok(dt) = NaiveDateTime::parse_from_str(ts, fmt) {
-            // chrono::NaiveDateTime::and_utc() returns DateTime<Utc>
-            // .timestamp() is seconds since Unix epoch.
             return Some(dt.and_utc().timestamp() as f64);
         }
     }
