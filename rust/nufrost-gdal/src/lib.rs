@@ -1,3 +1,5 @@
+pub mod full_scene;
+
 // nufrost-gdal — raster I/O via the GDAL crate.
 // Requires libgdal system library (e.g. `brew install gdal` or conda).
 //

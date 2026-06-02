@@ -2048,6 +2048,7 @@ dependencies = [
  "ndarray",
  "nufrost-core",
  "rayon",
+ "regex",
  "thiserror 2.0.18",
 ]
 

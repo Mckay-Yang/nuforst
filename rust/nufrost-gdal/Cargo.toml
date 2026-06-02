@@ -13,6 +13,7 @@ chrono.workspace = true
 gdal.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
+regex.workspace = true
 
 [dev-dependencies]
 approx.workspace = true
