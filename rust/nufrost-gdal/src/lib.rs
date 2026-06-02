@@ -201,6 +201,15 @@ impl RasterWriter {
         Ok(())
     }
 
+    /// Set the description for a band (1-indexed).
+    ///
+    /// Mirrors rasterio's `dst.set_band_description(idx, name)`.
+    pub fn set_band_description(&mut self, band_idx: usize, description: &str) -> Result<()> {
+        let mut band = self.dataset.rasterband(band_idx)?;
+        band.set_description(description)?;
+        Ok(())
+    }
+
     /// Finish writing and flush/closing. The file is finalized when `writer` is dropped,
     /// but you can call this explicitly for clarity.
     pub fn flush(&mut self) -> Result<()> {
@@ -261,10 +270,10 @@ impl std::error::Error for RasterInputError {}
 
 /// Extract relative-day timestamps from multi-band GeoTIFF band descriptions.
 ///
-/// For Sentinel-2 convention, each band stores a timestamp in its description
-/// (e.g. `"2020-01-01T04:58:59Z"`).  This function parses band descriptions
-/// as ISO-8601, converts to epoch seconds, then returns days relative to the
-/// first valid timestamp.
+/// Mirrors Python `_parse_band_timestamp()` → ISO → epoch → days since first.
+/// Sentinel‑2 band descriptions like `20151227T035152_..._T48RVV_B2` are
+/// scanned for a `YYYYMMDDTHHMMSS` substring; other formats (`2020-01-01T04:58:59Z`,
+/// `2020-01-01T04:58:59`) are parsed directly. All timestamps are treated as UTC.
 ///
 /// Returns `(timestamps_days, target_time_day)` where `target_time_day` is
 /// the last timestamp (matching the Python "hold out last scene" convention).
@@ -285,34 +294,104 @@ pub fn extract_timestamps_from_band_descriptions(
                 band_idx: b,
                 description: String::from("<unavailable>"),
             })?;
-        let desc = band
-            .description()
-            .unwrap_or_default();
+        let desc = band.description().unwrap_or_default();
         let desc = desc.trim();
-        // Try ISO-8601 via nufrost-core helper first, then RFC 3339 fallback
-        let epoch = nufrost_core::time::parse_iso8601_to_epoch_seconds(desc)
-            .or_else(|| {
-                chrono::DateTime::parse_from_rfc3339(desc)
-                    .ok()
-                    .map(|dt| dt.timestamp() as f64)
-            })
-            .ok_or_else(|| RasterInputError::InvalidBandTimestamp {
-                band_idx: b,
-                description: desc.to_string(),
-            })?;
+
+        let epoch = if let Some(sub) = nufrost_core::find_timestamp_substring(desc) {
+            nufrost_core::parse_iso8601_to_epoch_seconds(sub)
+        } else {
+            nufrost_core::parse_iso8601_to_epoch_seconds(desc)
+        }
+        .or_else(|| {
+            chrono::DateTime::parse_from_rfc3339(desc)
+                .ok()
+                .map(|dt| dt.timestamp() as f64)
+        })
+        .ok_or_else(|| RasterInputError::InvalidBandTimestamp {
+            band_idx: b,
+            description: desc.to_string(),
+        })?;
         epoch_secs.push(epoch);
     }
 
     let t0 = epoch_secs[0];
     let days: Vec<f64> = epoch_secs.iter().map(|&s| (s - t0) / 86400.0).collect();
-    let target = days[days.len() - 1]; // hold out last scene
+    let target = days[days.len() - 1];
     Ok((days, target))
+}
+
+/// Collapse duplicate timestamps in a time-series cube by taking the
+/// per-pixel nanmean of bands that share the same timestamp string.
+///
+/// Matches Python `collapse_duplicate_timestamps()` in
+/// `full_scene_reconstruction/pipeline.py:335`.
+///
+/// Returns `(deduped_cube, deduped_timestamps)` where each timestamp appears
+/// exactly once.
+pub fn collapse_duplicate_timestamps(
+    cube: &ndarray::Array3<f64>,
+    timestamps: &[String],
+) -> (ndarray::Array3<f64>, Vec<String>) {
+    let n_bands = cube.shape()[0];
+    assert_eq!(n_bands, timestamps.len(), "cube bands != timestamps");
+
+    // Group band indices by timestamp string
+    let mut group_map: std::collections::BTreeMap<&str, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (i, ts) in timestamps.iter().enumerate() {
+        group_map.entry(ts.as_str()).or_default().push(i);
+    }
+
+    let m = group_map.len();
+    let rows = cube.shape()[1];
+    let cols = cube.shape()[2];
+    let mut deduped = ndarray::Array3::<f64>::zeros((m, rows, cols));
+    let mut deduped_ts: Vec<String> = Vec::with_capacity(m);
+
+    for (j, (ts, indices)) in group_map.iter().enumerate() {
+        deduped_ts.push(ts.to_string());
+        if indices.len() == 1 {
+            deduped
+                .index_axis_mut(ndarray::Axis(0), j)
+                .assign(&cube.index_axis(ndarray::Axis(0), indices[0]));
+        } else {
+            let mut sum = ndarray::Array2::<f64>::zeros((rows, cols));
+            let mut counts = ndarray::Array2::<usize>::zeros((rows, cols));
+            for &idx in indices {
+                let band = cube.index_axis(ndarray::Axis(0), idx);
+                for r in 0..rows {
+                    for c in 0..cols {
+                        let v = band[[r, c]];
+                        if v.is_finite() {
+                            sum[[r, c]] += v;
+                            counts[[r, c]] += 1;
+                        }
+                    }
+                }
+            }
+            let mut avg = deduped.index_axis_mut(ndarray::Axis(0), j);
+            for r in 0..rows {
+                for c in 0..cols {
+                    avg[[r, c]] = if counts[[r, c]] > 0 {
+                        sum[[r, c]] / counts[[r, c]] as f64
+                    } else {
+                        f64::NAN
+                    };
+                }
+            }
+        }
+    }
+
+    (deduped, deduped_ts)
 }
 
 /// Build synthetic timestamps from band indices (1 day per band).
 ///
-/// Used when band descriptions are not timestamp-formatted (e.g. synthetic
-/// test data).  Band 0 → day 0, Band 1 → day 1, etc.
+/// **Test-only.** Full-scene code paths must use
+/// [`extract_timestamps_from_band_descriptions`] to parse real GDAL band
+/// descriptions.
+#[doc(hidden)]
+#[deprecated(note = "use extract_timestamps_from_band_descriptions for full-scene; this is test-only")]
 pub fn synthetic_timestamps_from_bands(n_bands: usize) -> (Vec<f64>, f64) {
     let days: Vec<f64> = (0..n_bands).map(|i| i as f64).collect();
     let target = days[days.len() - 1];
