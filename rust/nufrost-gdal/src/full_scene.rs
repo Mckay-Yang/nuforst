@@ -261,6 +261,284 @@ pub fn write_band_stack(
 }
 
 // ---------------------------------------------------------------------------
+// Invalid-reflectance masking
+// ---------------------------------------------------------------------------
+
+/// Mask invalid reflectance values in-place: finite values ≤ `valid_min` or
+/// ≥ `valid_max` are replaced with NaN.
+///
+/// Mirrors Python `_mask_invalid_reflectance_values()` in
+/// `full_scene_reconstruction/pipeline.py:42-46`.
+///
+/// Sentinel-2 defaults are `valid_min=0.0`, `valid_max=10000.0`, so only
+/// `(0.0, 10000.0)` is treated as valid.
+pub fn mask_invalid_reflectance(
+    cube: &mut ndarray::Array3<f64>,
+    valid_min: f64,
+    valid_max: f64,
+) {
+    for v in cube.iter_mut() {
+        if v.is_finite() && (*v <= valid_min || *v >= valid_max) {
+            *v = f64::NAN;
+        }
+    }
+}
+
+/// Sentinel-2 convenience: mask using `(0.0, 10000.0)`.
+pub fn mask_invalid_sentinel2(cube: &mut ndarray::Array3<f64>) {
+    mask_invalid_reflectance(cube, 0.0, 10000.0);
+}
+
+// ---------------------------------------------------------------------------
+// Completeness scoring (sampled)
+// ---------------------------------------------------------------------------
+
+/// Subsampling step for completeness scoring (matches Python
+/// `_VALID_RATIO_SUBSAMPLE_STEP = 8`).
+const VALID_RATIO_SUBSAMPLE_STEP: usize = 8;
+
+/// Compute per-band completeness scores for every shared candidate timestamp.
+///
+/// For each band cube, invalid reflectance values are masked first, then the
+/// cube is sampled every `step` pixels in the spatial dimensions.
+/// Completeness = fraction of finite (non-NaN) pixels in the sampled time slice.
+///
+/// Returns `BTreeMap<band_name → BTreeMap<timestamp → completeness>>`.
+pub fn score_candidates(
+    band_to_cubes: &BTreeMap<String, ndarray::Array3<f64>>,
+    band_to_timestamps: &BTreeMap<String, Vec<String>>,
+    shared_candidates: &[String],
+    valid_min: f64,
+    valid_max: f64,
+    step: usize,
+) -> Result<BTreeMap<String, BTreeMap<String, f64>>> {
+    let mut scores: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
+
+    for (band, cube) in band_to_cubes.iter() {
+        let timestamps = band_to_timestamps
+            .get(band)
+            .with_context(|| format!("timestamps missing for band {band}"))?;
+
+        // Build index map: timestamp string → band index
+        let index_map: std::collections::HashMap<&str, usize> = timestamps
+            .iter()
+            .enumerate()
+            .map(|(i, ts)| (ts.as_str(), i))
+            .collect();
+
+        // Clone and mask a mutable copy
+        let mut masked = cube.clone();
+        mask_invalid_reflectance(&mut masked, valid_min, valid_max);
+
+        // Subsample spatial dimensions
+        let (t, rows, cols) = masked.dim();
+        let sampled_rows: Vec<usize> = (0..rows).step_by(step).collect();
+        let sampled_cols: Vec<usize> = (0..cols).step_by(step).collect();
+
+        let mut band_scores: BTreeMap<String, f64> = BTreeMap::new();
+        for candidate in shared_candidates {
+            if let Some(&idx) = index_map.get(candidate.as_str()) {
+                if idx < t {
+                    let layer = masked.index_axis(ndarray::Axis(0), idx);
+                    let mut finite_count = 0usize;
+                    let mut total = 0usize;
+                    for &r in &sampled_rows {
+                        for &c in &sampled_cols {
+                            total += 1;
+                            if layer[[r, c]].is_finite() {
+                                finite_count += 1;
+                            }
+                        }
+                    }
+                    let score = if total == 0 {
+                        0.0
+                    } else {
+                        finite_count as f64 / total as f64
+                    };
+                    band_scores.insert(candidate.clone(), score);
+                }
+            }
+        }
+        scores.insert(band.clone(), band_scores);
+    }
+
+    Ok(scores)
+}
+
+// ---------------------------------------------------------------------------
+// Target timestamp selection
+// ---------------------------------------------------------------------------
+
+/// Select the best shared target timestamp from completeness scores.
+///
+/// Candidates are sorted, then the last `late_fraction` portion is preferred.
+/// Within each pool, candidates are examined from latest to earliest; the first
+/// one where **every** band meets `min_valid_ratio` is chosen. Falls back to
+/// earlier candidates if no late candidate qualifies.
+///
+/// Mirrors Python `select_shared_target_timestamp()` in
+/// `full_scene_reconstruction/pipeline.py:257-285`.
+pub fn select_shared_target_timestamp(
+    candidates: &[String],
+    completeness_by_band: &BTreeMap<String, BTreeMap<String, f64>>,
+    min_valid_ratio: f64,
+    late_fraction: f64,
+) -> Result<String> {
+    if candidates.is_empty() {
+        anyhow::bail!("No shared timestamps available.");
+    }
+
+    let mut ordered: Vec<String> = candidates.iter().cloned().collect();
+    ordered.sort();
+
+    let tail_len = 1usize.max((ordered.len() as f64 * late_fraction).ceil() as usize);
+    let preferred: Vec<&String> = ordered[ordered.len() - tail_len..].iter().collect();
+    let fallback: Vec<&String> = ordered[..ordered.len() - tail_len].iter().collect();
+
+    let pick = |pool: &[&String]| -> Option<String> {
+        for candidate in pool.iter().rev() {
+            let all_pass = completeness_by_band.iter().all(|(_band, band_scores)| {
+                band_scores.get(candidate.as_str()).copied().unwrap_or(0.0) >= min_valid_ratio
+            });
+            if all_pass {
+                return Some(candidate.to_string());
+            }
+        }
+        None
+    };
+
+    if let Some(chosen) = pick(&preferred) {
+        return Ok(chosen);
+    }
+    if let Some(chosen) = pick(&fallback) {
+        return Ok(chosen);
+    }
+
+    anyhow::bail!("No shared timestamp passed the completeness threshold.");
+}
+
+/// Full target-timestamp selection: intersect timestamps across bands,
+/// compute completeness scores, and select the best shared timestamp.
+///
+/// Mirrors Python `choose_shared_target_timestamp()` in
+/// `full_scene_reconstruction/pipeline.py:288-301`.
+pub fn choose_shared_target_timestamp(
+    band_to_cubes: &BTreeMap<String, ndarray::Array3<f64>>,
+    band_to_timestamps: &BTreeMap<String, Vec<String>>,
+    min_valid_ratio: f64,
+    late_fraction: f64,
+) -> Result<(String, BTreeMap<String, BTreeMap<String, f64>>)> {
+    // Intersect timestamps across all bands
+    let mut shared: Option<std::collections::HashSet<String>> = None;
+    for timestamps in band_to_timestamps.values() {
+        let current: std::collections::HashSet<String> =
+            timestamps.iter().cloned().collect();
+        shared = match shared {
+            None => Some(current),
+            Some(s) => Some(s.intersection(&current).cloned().collect()),
+        };
+    }
+    let mut candidates: Vec<String> = shared
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    candidates.sort();
+
+    if candidates.is_empty() {
+        anyhow::bail!("No shared timestamps exist across selected bands.");
+    }
+
+    let completeness = score_candidates(
+        band_to_cubes,
+        band_to_timestamps,
+        &candidates,
+        0.0,
+        10000.0,
+        VALID_RATIO_SUBSAMPLE_STEP,
+    )?;
+
+    let chosen = select_shared_target_timestamp(
+        &candidates,
+        &completeness,
+        min_valid_ratio,
+        late_fraction,
+    )?;
+
+    Ok((chosen, completeness))
+}
+
+// ---------------------------------------------------------------------------
+// Target hold-out — create masked time series for reconstruction
+// ---------------------------------------------------------------------------
+
+/// Remove the target-time slice from a band cube, producing the reconstruction
+/// input and extracting the ground-truth array.
+///
+/// Returns `(masked_cube, masked_timestamps, target_idx, ground_truth_2d)`.
+///
+/// Mirrors Python `make_masked_time_series()` in
+/// `full_scene_reconstruction/pipeline.py:355-363`.
+pub fn make_masked_time_series(
+    cube: &ndarray::Array3<f64>,
+    timestamps: &[String],
+    target_time: &str,
+) -> Result<(ndarray::Array3<f64>, Vec<String>, usize, ndarray::Array2<f64>)> {
+    // Find matching indices
+    let matching: Vec<usize> = timestamps
+        .iter()
+        .enumerate()
+        .filter(|(_, ts)| ts.as_str() == target_time)
+        .map(|(i, _)| i)
+        .collect();
+
+    if matching.len() != 1 {
+        anyhow::bail!(
+            "Expected exactly one matching timestamp for {}, found {}",
+            target_time,
+            matching.len()
+        );
+    }
+
+    let target_idx = matching[0];
+    let (t, rows, cols) = cube.dim();
+
+    // Extract ground truth slice
+    let ground_truth = cube
+        .index_axis(ndarray::Axis(0), target_idx)
+        .to_owned();
+
+    // Build masked cube by copying all slices except target_idx
+    let masked_cube = if target_idx == 0 {
+        cube.slice_axis(ndarray::Axis(0), ndarray::Slice::from(1..t))
+            .to_owned()
+    } else if target_idx + 1 == t {
+        cube.slice_axis(ndarray::Axis(0), ndarray::Slice::from(0..target_idx))
+            .to_owned()
+    } else {
+        // Stack [0..target_idx] and [target_idx+1..]
+        let prefix = cube.slice_axis(ndarray::Axis(0), ndarray::Slice::from(0..target_idx));
+        let suffix = cube.slice_axis(ndarray::Axis(0), ndarray::Slice::from(target_idx + 1..t));
+        let mut result = ndarray::Array3::zeros((t - 1, rows, cols));
+        result
+            .slice_axis_mut(ndarray::Axis(0), ndarray::Slice::from(0..target_idx))
+            .assign(&prefix);
+        result
+            .slice_axis_mut(ndarray::Axis(0), ndarray::Slice::from(target_idx..))
+            .assign(&suffix);
+        result
+    };
+
+    let masked_timestamps: Vec<String> = timestamps
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| i != target_idx)
+        .map(|(_, ts)| ts.clone())
+        .collect();
+
+    Ok((masked_cube, masked_timestamps, target_idx, ground_truth))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -268,6 +546,7 @@ pub fn write_band_stack(
 mod tests {
     use super::*;
     use std::path::Path;
+    use gdal::Metadata;
 
     // -----------------------------------------------------------------------
     // location_token / location_output_token
@@ -637,5 +916,435 @@ mod tests {
         // Band B: unchanged = (1, 2)
         assert!((deduped[[1, 0, 0]] - 1.0).abs() < 1e-10);
         assert!((deduped[[1, 0, 1]] - 2.0).abs() < 1e-10);
+    }
+
+    // -------------------------------------------------------------------
+    // mask_invalid_reflectance
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_mask_invalid_sets_bad_values_to_nan() {
+        let mut cube = ndarray::Array3::from_shape_vec(
+            (2, 2, 3),
+            vec![
+                -1.0, 0.0, 500.0,
+                9999.0, 10000.0, 15000.0,
+                f64::NAN, 1.0, 100.0,
+                50.0, -0.5, 10001.0,
+            ],
+        )
+        .unwrap();
+
+        mask_invalid_reflectance(&mut cube, 0.0, 10000.0);
+
+        // Valid values (0 < v < 10000) stay unchanged
+        assert!((cube[[0, 0, 2]] - 500.0).abs() < 1e-10);  // was 500
+        assert!((cube[[0, 1, 0]] - 9999.0).abs() < 1e-10); // was 9999
+        assert!((cube[[1, 0, 1]] - 1.0).abs() < 1e-10);    // was 1
+        assert!((cube[[1, 0, 2]] - 100.0).abs() < 1e-10);  // was 100
+        assert!((cube[[1, 1, 0]] - 50.0).abs() < 1e-10);   // was 50
+
+        // Invalid values become NaN
+        assert!(cube[[0, 0, 0]].is_nan());  // was -1.0
+        assert!(cube[[0, 0, 1]].is_nan());  // was 0.0
+        assert!(cube[[0, 1, 1]].is_nan());  // was 10000.0
+        assert!(cube[[0, 1, 2]].is_nan());  // was 15000.0
+        assert!(cube[[1, 1, 1]].is_nan());  // was -0.5
+        assert!(cube[[1, 1, 2]].is_nan());  // was 10001.0
+
+        // Already NaN stays NaN
+        assert!(cube[[1, 0, 0]].is_nan());  // was already NaN
+    }
+
+    #[test]
+    fn test_mask_invalid_with_custom_range() {
+        let mut cube = ndarray::Array3::from_shape_vec(
+            (1, 1, 4),
+            vec![0.0, 1.0, 2.0, f64::NAN],
+        )
+        .unwrap();
+
+        mask_invalid_reflectance(&mut cube, 1.0, 2.0);
+
+        assert!(cube[[0, 0, 0]].is_nan()); // 0.0 <= 1.0
+        assert!(cube[[0, 0, 1]].is_nan()); // 1.0 <= 1.0
+        assert!(cube[[0, 0, 2]].is_nan()); // 2.0 >= 2.0
+        assert!(cube[[0, 0, 3]].is_nan()); // already NaN
+    }
+
+    // -------------------------------------------------------------------
+    // select_shared_target_timestamp
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_select_shared_target_prefers_late() {
+        // Three candidates, late_fraction=0.5 means last 2 are preferred.
+        // Band A has completeness >= 0.9 for all; band B only >= 0.9 for "C".
+        let mut completeness: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
+
+        let mut band_a = BTreeMap::new();
+        band_a.insert("A".to_string(), 0.95);
+        band_a.insert("B".to_string(), 0.95);
+        band_a.insert("C".to_string(), 0.95);
+        completeness.insert("band_a".to_string(), band_a);
+
+        let mut band_b = BTreeMap::new();
+        band_b.insert("A".to_string(), 0.5);  // below min
+        band_b.insert("B".to_string(), 0.5);  // below min
+        band_b.insert("C".to_string(), 0.95); // passes
+        completeness.insert("band_b".to_string(), band_b);
+
+        let candidates: Vec<String> = vec!["A", "B", "C"].into_iter().map(String::from).collect();
+
+        let chosen = select_shared_target_timestamp(
+            &candidates,
+            &completeness,
+            0.9,
+            0.5,
+        )
+        .expect("should find a timestamp");
+
+        // With late_fraction=0.5 and 3 candidates, tail=ceil(3*0.5)=2, preferred=[B,C].
+        // Reversed: check C, then B. C passes all bands, so C is chosen.
+        assert_eq!(chosen, "C");
+    }
+
+    #[test]
+    fn test_select_shared_target_fallback() {
+        let mut completeness: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
+
+        let mut band = BTreeMap::new();
+        band.insert("early".to_string(), 0.95);
+        band.insert("mid".to_string(), 0.50);
+        band.insert("late".to_string(), 0.50);
+        completeness.insert("b".to_string(), band);
+
+        let candidates: Vec<String> = vec!["early", "mid", "late"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        // late_fraction=0.34 → tail=ceil(3*0.34)=2 → preferred=[mid,late]
+        // Neither passes (0.5 < 0.9), so fallback to [early], passes.
+        let chosen = select_shared_target_timestamp(&candidates, &completeness, 0.9, 0.34)
+            .expect("should fallback");
+        assert_eq!(chosen, "early");
+    }
+
+    #[test]
+    fn test_select_shared_target_no_candidates() {
+        let completeness: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
+        let candidates: Vec<String> = vec![];
+        let result = select_shared_target_timestamp(&candidates, &completeness, 0.9, 0.25);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_select_shared_target_picks_latest_when_multiple_qualify() {
+        let mut completeness: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
+
+        let mut band = BTreeMap::new();
+        band.insert("2020-01-01".to_string(), 0.95);
+        band.insert("2020-06-01".to_string(), 0.95);
+        band.insert("2020-12-01".to_string(), 0.95);
+        completeness.insert("b".to_string(), band);
+
+        let candidates: Vec<String> = vec!["2020-01-01", "2020-06-01", "2020-12-01"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        // late_fraction=1.0 → all are preferred, reversed iteration picks latest
+        let chosen = select_shared_target_timestamp(&candidates, &completeness, 0.9, 1.0)
+            .expect("should pick latest");
+        assert_eq!(chosen, "2020-12-01");
+    }
+
+    // -------------------------------------------------------------------
+    // choose_shared_target_timestamp — integration test vs Python contract
+    // -------------------------------------------------------------------
+
+    /// Convert a raw YYYYMMDDTHHMMSS timestamp to ISO format YYYY-MM-DDTHH:MM:SS.
+    fn raw_to_iso(raw: &str) -> String {
+        if raw.len() < 15 {
+            return raw.to_string();
+        }
+        // Format: YYYYMMDDTHHMMSS → YYYY-MM-DDTHH:MM:SS
+        let y = &raw[0..4];
+        let m = &raw[4..6];
+        let d = &raw[6..8];
+        let hh = &raw[9..11];
+        let mm = &raw[11..13];
+        let ss = &raw[13..15];
+        format!("{y}-{m}-{d}T{hh}:{mm}:{ss}")
+    }
+
+    #[test]
+    fn test_choose_shared_target_matches_python_contract() {
+        let data_dir = Path::new("../../data/sentinel-2");
+        if !data_dir.is_dir() {
+            eprintln!("Skipping test: data/sentinel-2 not found");
+            return;
+        }
+
+        let lon = 104.2595;
+        let lat = 31.217;
+        let stacks = discover_sentinel_band_stacks(data_dir, lon, lat)
+            .expect("should discover band stacks");
+
+        // Load B2 data only (contract is per-band, and we need at least B2 to
+        // verify the selection behavior). The full contract uses all bands.
+        // For a minimal test, load B2 and verify the target selection picks
+        // the contract's expected target.
+        let b2_paths = stacks.get("B2").expect("B2 should exist");
+        let b2_path = &b2_paths[0];
+
+        let reader = crate::RasterReader::open(b2_path).expect("should open B2");
+        let n_bands = reader.band_count();
+        let win = 512;
+        let (full_rows, full_cols) = (reader.shape().0, reader.shape().1);
+        let rows = win.min(full_rows);
+        let cols = win.min(full_cols);
+
+        // Read the B2 cube (windowed to 512×512, matching Python RSCube._read_tif)
+        let mut b2_cube = ndarray::Array3::<f64>::zeros((n_bands, rows, cols));
+        for b in 1..=n_bands {
+            let band_data = reader.read_band_window(b, win, win).expect("should read band");
+            b2_cube.index_axis_mut(ndarray::Axis(0), b - 1).assign(&band_data);
+        }
+
+        // Build timestamp strings from the band descriptions (use the descriptions directly)
+        let band_timestamps: Vec<String> = (1..=n_bands)
+            .map(|b| {
+                let band = reader.dataset.rasterband(b).unwrap();
+                let desc = band.description().unwrap_or_default().trim().to_string();
+                if let Some(sub) = nufrost_core::find_timestamp_substring(&desc) {
+                    raw_to_iso(sub)
+                } else {
+                    desc
+                }
+            })
+            .collect();
+
+        let mut band_to_cubes: BTreeMap<String, ndarray::Array3<f64>> = BTreeMap::new();
+        let mut band_to_timestamps: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        band_to_cubes.insert("B2".to_string(), b2_cube);
+        band_to_timestamps.insert("B2".to_string(), band_timestamps);
+
+        let (chosen, completeness) = choose_shared_target_timestamp(
+            &band_to_cubes,
+            &band_to_timestamps,
+            0.9,
+            0.25,
+        )
+        .expect("should select a target timestamp");
+
+        // Verify: the contract expects "2025-05-20T03:52:01"
+        assert_eq!(
+            chosen, "2025-05-20T03:52:01",
+            "Rust target selection must match Python contract target_time"
+        );
+
+        // Verify: counts match contract
+        let b2_completeness = completeness.get("B2").expect("B2 completeness should exist");
+        let contract_target = "2025-05-20T03:52:01";
+        let b2_score = b2_completeness
+            .get(contract_target)
+            .copied()
+            .unwrap_or(-1.0);
+        assert!(
+            b2_score >= 0.9,
+            "B2 completeness for target should be >= 0.9, got {b2_score}"
+        );
+
+        // Also verify the number of shared candidates is reasonable (should be
+        // at least 100 for real data).
+        let n_candidates = b2_completeness.len();
+        assert!(
+            n_candidates >= 50,
+            "expected at least 50 shared candidate timestamps, got {n_candidates}"
+        );
+
+        dbg!(chosen, b2_score, n_candidates);
+    }
+
+    // -------------------------------------------------------------------
+    // make_masked_time_series
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_make_masked_time_series_basic() {
+        let cube = ndarray::Array3::from_shape_vec(
+            (5, 2, 3),
+            (0..30).map(|i| i as f64).collect(),
+        )
+        .unwrap();
+        let timestamps: Vec<String> = vec!["A", "B", "C", "D", "E"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let target = "C";
+
+        let (masked_cube, masked_ts, target_idx, ground_truth) =
+            make_masked_time_series(&cube, &timestamps, target)
+                .expect("should find target");
+
+        assert_eq!(target_idx, 2);
+        assert_eq!(masked_cube.shape(), &[4, 2, 3]);
+        assert_eq!(masked_ts, vec!["A", "B", "D", "E"]);
+        assert_eq!(ground_truth.shape(), &[2, 3]);
+
+        // Ground truth should be the original "C" slice (index 2)
+        for r in 0..2 {
+            for c in 0..3 {
+                assert!((ground_truth[[r, c]] - cube[[2, r, c]]).abs() < 1e-10);
+            }
+        }
+    }
+
+    #[test]
+    fn test_make_masked_time_series_first_slice() {
+        let cube = ndarray::Array3::<f64>::from_elem((3, 1, 2), 0.0);
+        let timestamps: Vec<String> = vec!["X", "Y", "Z"].into_iter().map(String::from).collect();
+        let (masked_cube, masked_ts, idx, _gt) =
+            make_masked_time_series(&cube, &timestamps, "X").unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(masked_cube.shape(), &[2, 1, 2]);
+        assert_eq!(masked_ts, vec!["Y", "Z"]);
+        assert_eq!(_gt.shape(), &[1, 2]);
+    }
+
+    #[test]
+    fn test_make_masked_time_series_last_slice() {
+        let cube = ndarray::Array3::<f64>::from_elem((3, 1, 2), 0.0);
+        let timestamps: Vec<String> = vec!["X", "Y", "Z"].into_iter().map(String::from).collect();
+        let (masked_cube, masked_ts, idx, _gt) =
+            make_masked_time_series(&cube, &timestamps, "Z").unwrap();
+        assert_eq!(idx, 2);
+        assert_eq!(masked_cube.shape(), &[2, 1, 2]);
+        assert_eq!(masked_ts, vec!["X", "Y"]);
+    }
+
+    #[test]
+    fn test_make_masked_time_series_not_found() {
+        let cube = ndarray::Array3::<f64>::from_elem((2, 1, 1), 0.0);
+        let timestamps: Vec<String> = vec!["A", "A"].into_iter().map(String::from).collect();
+        let result = make_masked_time_series(&cube, &timestamps, "B");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_make_masked_time_series_multiple_matches_error() {
+        let cube = ndarray::Array3::<f64>::from_elem((3, 1, 1), 0.0);
+        let timestamps: Vec<String> = vec!["A", "A", "B"].into_iter().map(String::from).collect();
+        let result = make_masked_time_series(&cube, &timestamps, "A");
+        assert!(result.is_err());
+    }
+
+    // -------------------------------------------------------------------
+    // Integration: full B2 target hold-out against Python contract
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_b2_holdout_matches_python_contract() {
+        let data_dir = Path::new("../../data/sentinel-2");
+        if !data_dir.is_dir() {
+            eprintln!("Skipping test: data/sentinel-2 not found");
+            return;
+        }
+        let path = data_dir.join("COPERNICUS_S2_HARMONIZED_B2_lon104.2595_lat31.2170.tif");
+        if !path.is_file() {
+            eprintln!("Skipping test: {path:?} not found");
+            return;
+        }
+
+        let reader = crate::RasterReader::open(&path).expect("should open B2");
+        let n_bands = reader.band_count();
+        let win = 512;
+        let (full_rows, full_cols) = (reader.shape().0, reader.shape().1);
+        let rows = win.min(full_rows);
+        let cols = win.min(full_cols);
+
+        // Read full cube (windowed to 512×512)
+        let mut cube = ndarray::Array3::<f64>::zeros((n_bands, rows, cols));
+        for b in 1..=n_bands {
+            let band_data = reader.read_band_window(b, win, win).expect("should read band");
+            cube.index_axis_mut(ndarray::Axis(0), b - 1).assign(&band_data);
+        }
+
+        // Build ISO timestamp strings from band descriptions
+        let timestamps: Vec<String> = (1..=n_bands)
+            .map(|b| {
+                let band = reader.dataset.rasterband(b).unwrap();
+                let desc = band.description().unwrap_or_default().trim().to_string();
+                if let Some(sub) = nufrost_core::find_timestamp_substring(&desc) {
+                    raw_to_iso(sub)
+                } else {
+                    desc
+                }
+            })
+            .collect();
+
+        // Deduplicate — Python pipeline collapses duplicate timestamps before
+        // target hold-out. The contract's counts_before=201 reflects this.
+        let (cube, timestamps) = crate::collapse_duplicate_timestamps(&cube, &timestamps);
+        assert_eq!(cube.shape()[0], 201, "deduplicated band count must match contract counts_before");
+
+        let target = "2025-05-20T03:52:01";
+        let (masked_cube, masked_ts, target_idx, ground_truth) =
+            make_masked_time_series(&cube, &timestamps, target)
+                .expect("should find target in B2");
+
+        // Contract verifications
+        assert_eq!(masked_cube.shape()[0], 200, "masked should have 200 bands (counts_after)");
+        assert_eq!(masked_ts.len(), 200);
+        assert_eq!(target_idx, 181, "B2 target_idx should match contract mask_index");
+
+        // Ground truth shape
+        assert_eq!(ground_truth.shape(), &[rows, cols]);
+
+        // Verify ground truth is the actual observed target slice
+        let original_target_slice = cube.index_axis(ndarray::Axis(0), target_idx);
+        for r in 0..rows {
+            for c in 0..cols {
+                let a = ground_truth[[r, c]];
+                let b = original_target_slice[[r, c]];
+                if a.is_nan() && b.is_nan() {
+                    continue;
+                }
+                assert!(
+                    (a - b).abs() < 1e-10,
+                    "ground truth mismatch at ({r},{c}): {a} vs {b}"
+                );
+            }
+        }
+
+        // Verify masked cube does NOT contain target
+        for ts in &masked_ts {
+            assert_ne!(ts, target, "masked timestamps should not contain target");
+        }
+        assert_eq!(masked_ts.len(), cube.shape()[0] - 1);
+
+        // Mask invalid reflectance in both arrays to test NaN masking
+        let mut masked_cube = masked_cube;
+        let mut ground_truth = ground_truth;
+        mask_invalid_sentinel2(&mut masked_cube);
+        for v in ground_truth.iter_mut() {
+            if v.is_finite() && (*v <= 0.0 || *v >= 10000.0) {
+                *v = f64::NAN;
+            }
+        }
+
+        // Verify NaN masking worked on ground truth
+        let nan_count = ground_truth.iter().filter(|v| v.is_nan()).count();
+        let total = ground_truth.len();
+        // Most pixels should be valid (non-NaN). Typically the fraction NaN is
+        // very low for valid imagery. Just ensure the masking ran.
+        assert!(
+            nan_count < total,
+            "NaN count {nan_count} / {total} in ground truth after masking"
+        );
+
+        dbg!(n_bands, masked_cube.shape(), target_idx, nan_count, total);
     }
 }

@@ -104,6 +104,32 @@ impl RasterReader {
             .map_err(|e| anyhow::anyhow!("Shape mismatch reading band {band_idx}: {e}"))
     }
 
+    /// Read a window `(window_rows, window_cols)` from the top-left of a band.
+    ///
+    /// Returns an [`Array2<f64>`] with shape `(window_rows, window_cols)`.
+    /// Matches the Python behaviour of `RSCube._read_tif()` which only reads
+    /// the top-left 512×512 window for memory safety.
+    pub fn read_band_window(
+        &self,
+        band_idx: usize,
+        window_rows: usize,
+        window_cols: usize,
+    ) -> Result<Array2<f64>> {
+        let (full_cols, full_rows) = self.raster_size;
+        let cols = window_cols.min(full_cols);
+        let rows = window_rows.min(full_rows);
+        let band = self
+            .dataset
+            .rasterband(band_idx)
+            .with_context(|| format!("Band {band_idx} not available"))?;
+        let buf = band
+            .read_as::<f64>((0, 0), (cols, rows), (cols, rows), None)
+            .with_context(|| format!("Failed to read band {band_idx} window"))?;
+        let ((_bcols, _brows), data) = buf.into_shape_and_vec();
+        Array2::from_shape_vec((rows, cols), data)
+            .map_err(|e| anyhow::anyhow!("Shape mismatch reading band {band_idx} window: {e}"))
+    }
+
     /// Build a Sentinel-2 valid-pixel mask for a band.
     ///
     /// Pixels are valid when `value > 0.0 && value < 10000.0` (finite values only).
