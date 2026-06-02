@@ -577,11 +577,12 @@ fn run_full_scene(args: &FullSceneArgs) -> Result<()> {
     let methods: Vec<&str> = args.methods.split(',').map(|s| s.trim()).collect();
 
     // 1. Discover band stacks
-    let band_stacks = discover_sentinel_band_stacks(&args.data_root, args.lon, args.lat)?;
+    let source_dir = args.data_root.join(&args.source_name);
+    let band_stacks = discover_sentinel_band_stacks(&source_dir, args.lon, args.lat)?;
     if band_stacks.is_empty() {
         bail!(
             "No band stacks found for lon={}, lat={} in {}",
-            args.lon, args.lat, args.data_root.display()
+            args.lon, args.lat, source_dir.display()
         );
     }
 
