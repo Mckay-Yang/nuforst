@@ -819,7 +819,7 @@ fn run_full_scene(args: &FullSceneArgs) -> Result<()> {
             args.lon,
             args.lat,
             &target_time_str,
-            "",
+            "prediction",
         );
         write_band_stack(&output_path, &predictions, &ordered_bands, &meta)?;
         eprintln!("  Wrote {}", output_path.display());
