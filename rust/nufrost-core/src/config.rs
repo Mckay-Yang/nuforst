@@ -61,10 +61,10 @@ pub struct NufrostConfig {
     pub admm_tol: f64,
 }
 
-// Default helpers — match Python NufrostArgs dataclass defaults.
-fn default_frequency_selection() -> String { "hybrid".into() }
+// Default helpers — match Python config/nufrost.json defaults.
+fn default_frequency_selection() -> String { "shared_spectral".into() }
 fn default_empty_string() -> String { String::new() }
-fn default_spectral_top_k() -> u32 { 4 }
+fn default_spectral_top_k() -> u32 { 8 }
 fn default_spectral_merge_tol() -> f64 { 0.15 }
 fn default_outlier_sigma() -> f64 { 2.5 }
 fn default_lambda_step() -> f64 { 1e30 }
@@ -272,7 +272,8 @@ mod tests {
         assert!((cfg.ridge_lam - 0.005).abs() < 1e-20);
         assert_eq!(cfg.min_obs, 12);
         // Defaults kick in for omitted fields
-        assert_eq!(cfg.frequency_selection, "hybrid");
+        assert_eq!(cfg.frequency_selection, "shared_spectral");
+        assert_eq!(cfg.spectral_top_k, 8);
         assert_eq!(cfg.outlier_sigma, 2.5);
     }
 

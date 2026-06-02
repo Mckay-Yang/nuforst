@@ -7,7 +7,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use ndarray::Array2;
+use ndarray::{Array2, Array3};
+use nufrost_core::{compute_spectrum_direct, select_peaks_adaptive, refine_parabolic};
 use regex::Regex;
 
 use crate::{RasterMetadata, RasterWriter, RasterReader};
@@ -536,6 +537,162 @@ pub fn make_masked_time_series(
         .collect();
 
     Ok((masked_cube, masked_timestamps, target_idx, ground_truth))
+}
+
+// ---------------------------------------------------------------------------
+// Shared spectral frequency pool
+// ---------------------------------------------------------------------------
+
+/// Build a scene-level shared frequency pool by sampling pixels across all
+/// bands, stacking their power spectra, and selecting the top peaks.
+///
+/// Matches Python `build_shared_frequency_pool()` in
+/// `src/full_scene_reconstruction/pipeline.py:49-107`.
+///
+/// Returns non-negative frequencies (Hz) sorted ascending.
+pub fn build_shared_frequency_pool(
+    band_cubes: &BTreeMap<String, Array3<f64>>,
+    timestamps_sec: &[f64],
+    top_k: usize,
+    nufft_modes: usize,
+    power_cum: f64,
+    ignore_dc_hz: f64,
+    max_pixels_per_band: usize,
+) -> Vec<f64> {
+    let y_scale = 10000.0;
+
+    let valid_t: Vec<f64> = timestamps_sec
+        .iter()
+        .copied()
+        .filter(|&t| t.is_finite())
+        .collect();
+    if valid_t.len() < 3 || top_k == 0 {
+        return Vec::new();
+    }
+
+    let t_min = valid_t.iter().copied().fold(f64::INFINITY, f64::min);
+    let t_rel: Vec<f64> = valid_t.iter().map(|&t| t - t_min).collect();
+    let span = t_rel.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+        - t_rel.iter().copied().fold(f64::INFINITY, f64::min);
+    if !span.is_finite() || span <= 0.0 {
+        return Vec::new();
+    }
+
+    let ms = nufrost_core::next_even(nufft_modes);
+
+    let mut all_powers: Vec<Vec<f64>> = Vec::new();
+
+    for cube in band_cubes.values() {
+        let (nt, height, width) = cube.dim();
+        if nt != valid_t.len() {
+            continue;
+        }
+
+        let valid_mask: Vec<(usize, usize)> = {
+            let mut candidates = Vec::new();
+            for row in 0..height {
+                for col in 0..width {
+                    let finite_count = (0..nt).filter(|&t| cube[[t, row, col]].is_finite()).count();
+                    if finite_count >= 3 {
+                        candidates.push((row, col));
+                    }
+                }
+            }
+            candidates
+        };
+
+        if valid_mask.is_empty() {
+            continue;
+        }
+
+        let step = (valid_mask.len() / max_pixels_per_band).max(1);
+        let sample_indices: Vec<(usize, usize)> = valid_mask
+            .iter()
+            .step_by(step)
+            .take(max_pixels_per_band)
+            .copied()
+            .collect();
+
+        for (row, col) in &sample_indices {
+            let mut y: Vec<f64> = (0..nt).map(|t| cube[[t, *row, *col]]).collect();
+            let mask: Vec<bool> = y.iter().map(|&v| v.is_finite()).collect();
+            let n_valid = mask.iter().filter(|&&m| m).count();
+            if n_valid < 3 {
+                continue;
+            }
+            let mean_val = y.iter()
+                .filter(|&&v| v.is_finite())
+                .sum::<f64>()
+                / n_valid as f64;
+            for v in y.iter_mut() {
+                if !v.is_finite() {
+                    *v = mean_val;
+                }
+            }
+            // Compute spectrum (centering not needed — power at non-DC freqs is invariant)
+            let (_f_pos, p_pos) =
+                compute_spectrum_direct(&t_rel, &y, ms, y_scale);
+            all_powers.push(p_pos);
+        }
+    }
+
+    if all_powers.is_empty() {
+        return Vec::new();
+    }
+
+    // Stack powers and take nanmedian
+    let n_freqs = all_powers[0].len();
+    let mut stacked: Vec<f64> = vec![0.0; n_freqs];
+    for j in 0..n_freqs {
+        let mut col_vals: Vec<f64> = all_powers.iter().map(|row| row[j]).collect();
+        col_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let finite: Vec<f64> = col_vals.into_iter().filter(|v| v.is_finite()).collect();
+        stacked[j] = if finite.is_empty() {
+            f64::NAN
+        } else if finite.len() % 2 == 1 {
+            finite[finite.len() / 2]
+        } else {
+            (finite[finite.len() / 2 - 1] + finite[finite.len() / 2]) / 2.0
+        };
+    }
+
+    // Build positive frequency grid matching compute_spectrum_direct
+    let n_pos = (ms / 2) + 1;
+    if stacked.len() != n_pos {
+        return Vec::new();
+    }
+    let f_pos: Vec<f64> = (0..n_pos).map(|k| k as f64 / span).collect();
+
+    // Compute fmax from dt_med
+    let mut dt_sorted: Vec<f64> = t_rel.clone();
+    dt_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let dt_pos: Vec<f64> = dt_sorted
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .filter(|&d| d > 0.0)
+        .collect();
+    let dt_med = if dt_pos.is_empty() {
+        span / valid_t.len() as f64
+    } else if dt_pos.len() % 2 == 1 {
+        dt_pos[dt_pos.len() / 2]
+    } else {
+        (dt_pos[dt_pos.len() / 2 - 1] + dt_pos[dt_pos.len() / 2]) / 2.0
+    };
+    let fmax = 0.5 / dt_med.max(1e-12);
+
+    let peak_idx = select_peaks_adaptive(&f_pos, &stacked, top_k, power_cum, ignore_dc_hz, fmax);
+    if peak_idx.is_empty() {
+        return Vec::new();
+    }
+
+    let mut selected: Vec<f64> = peak_idx
+        .iter()
+        .map(|&i| refine_parabolic(&f_pos, &stacked, i))
+        .filter(|&f| f.is_finite() && f > ignore_dc_hz && f <= fmax)
+        .collect();
+
+    selected.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    selected
 }
 
 // ---------------------------------------------------------------------------
@@ -1346,5 +1503,59 @@ mod tests {
         );
 
         dbg!(n_bands, masked_cube.shape(), target_idx, nan_count, total);
+    }
+
+    #[test]
+    fn build_shared_frequency_pool_synthetic_returns_frequencies() {
+        use ndarray::Array3;
+        use std::collections::BTreeMap;
+        use super::build_shared_frequency_pool;
+
+        // Create synthetic 3-band cubes with a clear annual signal
+        let nt = 50usize;
+        let rows = 4usize;
+        let cols = 4usize;
+        let timestamps_sec: Vec<f64> = (0..nt).map(|i| i as f64 * 86400.0 * 7.3).collect();
+
+        // Annual period: 365.25 days → freq ≈ 3.17e-8 Hz
+        let freq = 1.0 / (365.25 * 86400.0);
+
+        let make_cube = || -> Array3<f64> {
+            let mut arr = Array3::<f64>::zeros((nt, rows, cols));
+            for t in 0..nt {
+                let signal = 1000.0 + 500.0 * (2.0 * std::f64::consts::PI * freq * timestamps_sec[t]).sin();
+                for r in 0..rows {
+                    for c in 0..cols {
+                        arr[[t, r, c]] = signal + (r as f64 + c as f64) * 10.0;
+                    }
+                }
+            }
+            arr
+        };
+
+        let mut band_cubes: BTreeMap<String, Array3<f64>> = BTreeMap::new();
+        band_cubes.insert("B2".into(), make_cube());
+        band_cubes.insert("B3".into(), make_cube());
+        band_cubes.insert("B4".into(), make_cube());
+
+        let freqs = build_shared_frequency_pool(
+            &band_cubes,
+            &timestamps_sec,
+            8,      // top_k
+            4096,   // nufft_modes
+            0.7,    // power_cum
+            1e-10,  // ignore_dc_hz
+            1024,   // max_pixels_per_band
+        );
+
+        assert!(!freqs.is_empty(), "should find at least one frequency");
+        // Verify frequencies are in physically reasonable range
+        // (periods between 30 days and 10 years)
+        let min_freq = 1.0 / (10.0 * 365.25 * 86400.0); // ~3.17e-9 Hz
+        let max_freq = 1.0 / (30.0 * 86400.0);            // ~3.86e-7 Hz
+        assert!(
+            freqs.iter().all(|&f| f >= min_freq && f <= max_freq),
+            "frequencies {freqs:?} should be in [{min_freq:e}, {max_freq:e}]"
+        );
     }
 }

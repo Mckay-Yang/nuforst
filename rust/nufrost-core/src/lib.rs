@@ -15,7 +15,9 @@ pub mod zhu2015;
 pub use config::{NufrostConfig, HantsConfig, Zhu2015Config, ReconstructionConfig};
 pub use error::NufrostError;
 pub use hants::{HantsResult, hants_fit, hants_predict, hants_predict_curve, hants_pixel, make_design_matrix};
-pub use nufrost::{NufrostResult, nufrost_fit_pixel, nufrost_predict, nufrost_predict_curve, nufrost_pixel};
+pub use nufrost::{NufrostResult, nufrost_fit_pixel, nufrost_predict, nufrost_predict_curve, nufrost_pixel,
+    nufrost_pixel_with_shared, compute_spectrum_direct, select_peaks_adaptive,
+    refine_parabolic, next_even, select_frequencies};
 pub use time::{find_timestamp_substring, parse_iso8601_to_epoch_seconds, to_seconds_since_start, parse_timestamps_to_epoch_seconds, parse_to_relative_days};
 pub use types::{Algorithm, TimeSeries, BandMetadata};
 

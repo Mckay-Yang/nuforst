@@ -396,7 +396,7 @@ fn huber_weights(residuals: &[f64], delta: f64) -> Vec<f64> {
 /// # Returns
 /// `(frequencies_hz, power_spectrum)` where `frequencies_hz = k / Tspan`
 /// (only non-negative frequencies) and `power = |F_k|²`.
-fn compute_spectrum_direct(
+pub fn compute_spectrum_direct(
     t_rel: &[f64],
     yy: &[f64],
     modes: usize,
@@ -473,7 +473,7 @@ fn compute_spectrum_direct(
 
 /// Parabolic refinement: fit a parabola to three consecutive spectral points
 /// and return the interpolated peak frequency.
-fn refine_parabolic(f: &[f64], p: &[f64], i: usize) -> f64 {
+pub fn refine_parabolic(f: &[f64], p: &[f64], i: usize) -> f64 {
     if i == 0 || i >= p.len() - 1 {
         return f[i];
     }
@@ -491,7 +491,7 @@ fn refine_parabolic(f: &[f64], p: &[f64], i: usize) -> f64 {
 /// Select top-k peaks from the power spectrum, cumulative power capped.
 ///
 /// Returns indices into the full frequency/power arrays.
-fn select_peaks_adaptive(
+pub fn select_peaks_adaptive(
     f_pos: &[f64],
     p_pos: &[f64],
     k_max: usize,
@@ -599,8 +599,8 @@ fn snap_frequency_to_spectrum(
 /// Select harmonic frequencies for NUFROST fitting.
 ///
 /// Selection modes: "spectral", "preferred", "hybrid".
-/// "shared_spectral" falls back to "hybrid" (scene-level shared freqs are
-/// computed elsewhere).
+/// "shared_spectral" falls back to "spectral" (scene-level shared freqs
+/// must be provided by the caller via `nufrost_pixel_with_shared`).
 pub fn select_frequencies(
     f_pos: &[f64],
     p_pos: &[f64],
@@ -615,7 +615,7 @@ pub fn select_frequencies(
     refine_peaks: bool,
 ) -> Vec<f64> {
     let mode = match selection_mode {
-        "shared_spectral" => "hybrid",
+        "shared_spectral" => "spectral",
         other => other,
     };
 
@@ -966,44 +966,30 @@ pub fn nufrost_fit_pixel(
 
     // ── Frequency selection ───────────────────────────────────────────────
     let freqs_sel: Vec<f64> = if let Some(sf) = shared_freqs {
-        // Use shared frequencies directly (filtered to valid range)
         sf.iter()
             .copied()
             .filter(|&f| f.is_finite() && f > config.ignore_dc_hz && f <= fmax)
             .collect()
     } else {
-        if config.frequency_selection == "shared_spectral" {
-            // Fall back to hybrid
-            let pref_freqs = parse_preferred_frequencies(&config.preferred_periods_days);
-            select_frequencies(
-                &f_pos,
-                &p_pos,
-                fmax,
-                "hybrid",
-                &pref_freqs,
-                config.preferred_top_k as usize,
-                config.spectral_top_k as usize,
-                config.spectral_merge_tol,
-                config.power_cum,
-                config.ignore_dc_hz,
-                config.refine_peaks,
-            )
+        let mode = if config.frequency_selection == "shared_spectral" {
+            "spectral"
         } else {
-            let pref_freqs = parse_preferred_frequencies(&config.preferred_periods_days);
-            select_frequencies(
-                &f_pos,
-                &p_pos,
-                fmax,
-                &config.frequency_selection,
-                &pref_freqs,
-                config.preferred_top_k as usize,
-                config.spectral_top_k as usize,
-                config.spectral_merge_tol,
-                config.power_cum,
-                config.ignore_dc_hz,
-                config.refine_peaks,
-            )
-        }
+            &config.frequency_selection
+        };
+        let pref_freqs = parse_preferred_frequencies(&config.preferred_periods_days);
+        select_frequencies(
+            &f_pos,
+            &p_pos,
+            fmax,
+            mode,
+            &pref_freqs,
+            config.preferred_top_k as usize,
+            config.spectral_top_k as usize,
+            config.spectral_merge_tol,
+            config.power_cum,
+            config.ignore_dc_hz,
+            config.refine_peaks,
+        )
     };
 
     let n_freqs_used = freqs_sel.len();
