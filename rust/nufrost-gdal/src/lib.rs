@@ -130,6 +130,49 @@ impl RasterReader {
             .map_err(|e| anyhow::anyhow!("Shape mismatch reading band {band_idx} window: {e}"))
     }
 
+    /// Read a window `(window_rows, window_cols)` from a band at an arbitrary offset.
+    ///
+    /// `(row_offset, col_offset)` specifies the top-left corner in pixel coordinates
+    /// (row-major for ease of use with `shape()`). Offsets are clamped to the raster
+    /// bounds so callers don't need to pre-validate.
+    ///
+    /// Returns an [`Array2<f64>`] with shape `(window_rows, window_cols)`.
+    pub fn read_band_window_offset(
+        &self,
+        band_idx: usize,
+        row_offset: usize,
+        col_offset: usize,
+        window_rows: usize,
+        window_cols: usize,
+    ) -> Result<Array2<f64>> {
+        let (full_cols, full_rows) = self.raster_size;
+        let r_off = row_offset.min(full_rows.saturating_sub(1));
+        let c_off = col_offset.min(full_cols.saturating_sub(1));
+        let cols = window_cols.min(full_cols.saturating_sub(c_off));
+        let rows = window_rows.min(full_rows.saturating_sub(r_off));
+        if rows == 0 || cols == 0 {
+            anyhow::bail!(
+                "read_band_window_offset band {band_idx}: zero-size window after clamping \
+                 (offset ({row_offset},{col_offset}), window ({window_rows},{window_cols}), raster ({full_rows},{full_cols}))"
+            );
+        }
+        let band = self
+            .dataset
+            .rasterband(band_idx)
+            .with_context(|| format!("Band {band_idx} not available"))?;
+        let buf = band
+            .read_as::<f64>(
+                (c_off as isize, r_off as isize),
+                (cols, rows),
+                (cols, rows),
+                None,
+            )
+            .with_context(|| format!("Failed to read band {band_idx} window at offset ({r_off},{c_off})"))?;
+        let ((_bcols, _brows), data) = buf.into_shape_and_vec();
+        Array2::from_shape_vec((rows, cols), data)
+            .map_err(|e| anyhow::anyhow!("Shape mismatch reading band {band_idx} window offset: {e}"))
+    }
+
     /// Build a Sentinel-2 valid-pixel mask for a band.
     ///
     /// Pixels are valid when `value > 0.0 && value < 10000.0` (finite values only).
@@ -661,12 +704,50 @@ pub fn read_all_bands(reader: &RasterReader) -> Result<ndarray::Array3<f64>> {
         anyhow::bail!("raster has zero spatial dimensions ({rows}r × {cols}c)");
     }
 
-    let mut cube = ndarray::Array3::<f64>::zeros((n_bands, rows, cols));
-    for b in 0..n_bands {
-        let band_data = reader.read_band(b + 1)?;
-        cube.slice_mut(ndarray::s![b, .., ..]).assign(&band_data);
+    // Read all bands in one GDALDatasetRasterIOEx call.  This is essential
+    // for BIP-interleaved files: per-band reads would re-read every tile for
+    // every band, reading the entire dataset n_bands times.
+    let pixels = n_bands * rows * cols;
+    let mut data: Vec<f64> = Vec::with_capacity(pixels);
+    let band_map: Vec<i32> = (1..=n_bands as i32).collect();
+
+    // Safety: GDALDatasetRasterIOEx writes exactly `pixels` f64 values into
+    // the Vec's spare capacity.  We set_len afterwards.  Buffer layout is
+    // (bands, rows, cols) in C order:
+    //   nPixelSpace = sizeof(f64)
+    //   nLineSpace  = cols * sizeof(f64)
+    //   nBandSpace  = rows * cols * sizeof(f64)
+    let rv = unsafe {
+        data.set_len(pixels);
+
+        gdal_sys::GDALDatasetRasterIOEx(
+            reader.dataset.c_dataset(),
+            gdal_sys::GDALRWFlag::GF_Read,
+            0, // nDSXOff
+            0, // nDSYOff
+            cols as i32,
+            rows as i32,
+            data.as_mut_ptr() as *mut std::ffi::c_void,
+            cols as i32,      // nBXSize — pixels per scanline in buffer
+            rows as i32,      // nBYSize — number of scanlines per band in buffer
+            gdal_sys::GDALDataType::GDT_Float64,
+            n_bands as i32,
+            band_map.as_ptr(),
+            std::mem::size_of::<f64>() as gdal_sys::GSpacing,           // nPixelSpace
+            (cols * std::mem::size_of::<f64>()) as gdal_sys::GSpacing,  // nLineSpace
+            (rows * cols * std::mem::size_of::<f64>()) as gdal_sys::GSpacing, // nBandSpace
+            std::ptr::null_mut(),
+        )
+    };
+    if rv != gdal_sys::CPLErr::CE_None {
+        // Don't leak: forget the set_len allocation
+        unsafe { data.set_len(0); }
+        anyhow::bail!("GDALDatasetRasterIOEx failed");
     }
-    Ok(cube)
+    // data already has correct length from set_len
+
+    ndarray::Array3::from_shape_vec((n_bands, rows, cols), data)
+        .map_err(|e| anyhow::anyhow!("Shape mismatch after GDAL read: {e}"))
 }
 
 /// Read a top-left window from all bands into a 3D cube.
@@ -688,6 +769,38 @@ pub fn read_all_bands_window(
     let mut cube = ndarray::Array3::<f64>::zeros((n_bands, r, c));
     for b in 0..n_bands {
         let band_data = reader.read_band_window(b + 1, r, c)?;
+        cube.slice_mut(ndarray::s![b, .., ..]).assign(&band_data);
+    }
+    Ok(cube)
+}
+
+/// Read a window from all bands at an arbitrary offset into a 3D cube.
+///
+/// `(row_offset, col_offset)` is the top-left corner in pixel coordinates.
+/// Offsets are clamped; the window is clamped to what remains from the offset
+/// to the raster edge.
+pub fn read_all_bands_window_offset(
+    reader: &RasterReader,
+    row_offset: usize,
+    col_offset: usize,
+    window_rows: usize,
+    window_cols: usize,
+) -> Result<ndarray::Array3<f64>> {
+    let n_bands = reader.band_count();
+    if n_bands == 0 {
+        anyhow::bail!("raster has no bands");
+    }
+    let (rows, cols) = reader.shape();
+    let r_off = row_offset.min(rows.saturating_sub(1));
+    let c_off = col_offset.min(cols.saturating_sub(1));
+    let r = window_rows.min(rows.saturating_sub(r_off));
+    let c = window_cols.min(cols.saturating_sub(c_off));
+    if r == 0 || c == 0 {
+        anyhow::bail!("window has zero dimensions ({r}r × {c}c) at offset ({row_offset},{col_offset})");
+    }
+    let mut cube = ndarray::Array3::<f64>::zeros((n_bands, r, c));
+    for b in 0..n_bands {
+        let band_data = reader.read_band_window_offset(b + 1, r_off, c_off, r, c)?;
         cube.slice_mut(ndarray::s![b, .., ..]).assign(&band_data);
     }
     Ok(cube)
@@ -958,7 +1071,7 @@ mod tests {
             ignore_dc_hz: 1e-10,
             frequency_selection: "hybrid".into(),
             preferred_periods_days: String::new(),
-            preferred_top_k: 0,
+            preferred_top_k: 4,
             spectral_top_k: 2,
             spectral_merge_tol: 0.15,
             refine_peaks: false,
@@ -980,6 +1093,8 @@ mod tests {
             admm_rho: 1.0,
             admm_max_iter: 10,
             admm_tol: 1e-3,
+            private_top_k_per_band: 2,
+            private_freq_penalty_mult: 1.5,
         };
 
         reconstruct_nufrost_geotiff(&reader, &t_days, target_t, &config, output, &meta).unwrap();
@@ -1075,13 +1190,16 @@ mod tests {
         let config = NufrostConfig {
             modes: 256, eps: 1e-12, num_peaks: 2, power_cum: 0.7, ignore_dc_hz: 1e-10,
             frequency_selection: "hybrid".into(), preferred_periods_days: String::new(),
-            preferred_top_k: 0, spectral_top_k: 2, spectral_merge_tol: 0.15,
+            preferred_top_k: 4, spectral_top_k: 2,
+            spectral_merge_tol: 0.15,
             refine_peaks: false, include_trend: true, ridge_lam: 0.01, freq_weight: 1.0,
             huber_iters: 3, huber_delta: 0.05, min_obs: 3, outlier_sigma: 2.5,
             lambda_step: 1e30, lambda_high: 0.005, low_freq_period_days: 0.0,
             step_dt_weighting: false, max_outer_iter: 3, outer_tol: 1e-3,
             joint_outlier: false, joint_outlier_sigma: 2.5,
             admm_rho: 1.0, admm_max_iter: 10, admm_tol: 1e-3,
+            private_top_k_per_band: 2,
+            private_freq_penalty_mult: 1.5,
         };
 
         let result = reconstruct_nufrost_geotiff(&reader, &t_days, target_t, &config, output, &meta);
@@ -1094,5 +1212,50 @@ mod tests {
 
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(output);
+    }
+
+    #[test]
+    fn read_band_window_offset_centered() {
+        let path = Path::new("test_window_offset.tif");
+        let rows = 7;
+        let cols = 9;
+        // Write a single band where each pixel's value encodes its (row, col).
+        {
+            let mut writer = RasterWriter::create(path, rows, cols, 1, &DEFAULT_GEO, None, None).unwrap();
+            let mut data = Array2::<f64>::zeros((rows, cols));
+            for r in 0..rows {
+                for c in 0..cols {
+                    data[[r, c]] = (r * 100 + c) as f64;
+                }
+            }
+            writer.write_band(1, &data).unwrap();
+            writer.flush().unwrap();
+        }
+
+        let reader = RasterReader::open(path).unwrap();
+
+        // Center window 3×3 in 7×9 → offset (2, 3)
+        let ws = 3;
+        let (full_rows, full_cols) = reader.shape();
+        let row_off = (full_rows - ws) / 2;
+        let col_off = (full_cols - ws) / 2;
+        assert_eq!((row_off, col_off), (2, 3));
+
+        let cube = read_all_bands_window_offset(&reader, row_off, col_off, ws, ws).unwrap();
+        assert_eq!(cube.shape(), &[1, ws, ws]);
+
+        // Verify the centered window has the expected pixel values
+        let band = cube.slice(ndarray::s![0, .., ..]);
+        for wr in 0..ws {
+            for wc in 0..ws {
+                let expected = ((row_off + wr) * 100 + (col_off + wc)) as f64;
+                assert_eq!(
+                    band[[wr, wc]], expected,
+                    "centered window mismatch at window ({wr},{wc})"
+                );
+            }
+        }
+
+        let _ = fs::remove_file(path);
     }
 }

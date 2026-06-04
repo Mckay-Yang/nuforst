@@ -20,12 +20,20 @@ pub struct NufrostConfig {
     pub frequency_selection: String,
     #[serde(default = "default_empty_string")]
     pub preferred_periods_days: String,
-    #[serde(default)]
+    #[serde(default = "default_preferred_top_k")]
     pub preferred_top_k: u32,
     #[serde(default = "default_spectral_top_k")]
     pub spectral_top_k: u32,
     #[serde(default = "default_spectral_merge_tol")]
     pub spectral_merge_tol: f64,
+    /// Max private frequencies per band (in addition to shared).
+    /// Private frequencies are band-specific peaks not present in shared.
+    #[serde(default = "default_private_top_k_per_band")]
+    pub private_top_k_per_band: usize,
+    /// Ridge penalty multiplier for private (band-specific) frequency columns.
+    /// Values > 1.0 increase regularization on private frequencies.
+    #[serde(default = "default_private_freq_penalty_mult")]
+    pub private_freq_penalty_mult: f64,
     pub refine_peaks: bool,
     pub include_trend: bool,
     /// Rust field name is `ridge_lam`; JSON key is `ridge` (matching Python config).
@@ -41,15 +49,15 @@ pub struct NufrostConfig {
     pub lambda_step: f64,
     #[serde(default = "default_lambda_high")]
     pub lambda_high: f64,
-    #[serde(default)]
+    #[serde(default = "default_low_freq_period_days")]
     pub low_freq_period_days: f64,
-    #[serde(default)]
+    #[serde(default = "default_step_dt_weighting")]
     pub step_dt_weighting: bool,
     #[serde(default = "default_max_outer_iter")]
     pub max_outer_iter: u32,
     #[serde(default = "default_outer_tol")]
     pub outer_tol: f64,
-    #[serde(default)]
+    #[serde(default = "default_joint_outlier")]
     pub joint_outlier: bool,
     #[serde(default = "default_outlier_sigma")]
     pub joint_outlier_sigma: f64,
@@ -62,10 +70,14 @@ pub struct NufrostConfig {
 }
 
 // Default helpers — match Python config/nufrost.json defaults.
-fn default_frequency_selection() -> String { "shared_spectral".into() }
+fn default_frequency_selection() -> String { "spectral".into() }
+
 fn default_empty_string() -> String { String::new() }
+fn default_preferred_top_k() -> u32 { 4 }
 fn default_spectral_top_k() -> u32 { 8 }
 fn default_spectral_merge_tol() -> f64 { 0.15 }
+fn default_private_top_k_per_band() -> usize { 2 }
+fn default_private_freq_penalty_mult() -> f64 { 1.5 }
 fn default_outlier_sigma() -> f64 { 2.5 }
 fn default_lambda_step() -> f64 { 1e30 }
 fn default_lambda_high() -> f64 { 0.005 }
@@ -74,6 +86,9 @@ fn default_outer_tol() -> f64 { 1e-3 }
 fn default_admm_rho() -> f64 { 1.0 }
 fn default_admm_max_iter() -> u32 { 80 }
 fn default_admm_tol() -> f64 { 1e-4 }
+fn default_low_freq_period_days() -> f64 { 60.0 }
+fn default_step_dt_weighting() -> bool { true }
+fn default_joint_outlier() -> bool { true }
 
 /// HANTS reconstruction parameters.
 ///
@@ -272,8 +287,7 @@ mod tests {
         assert!((cfg.ridge_lam - 0.005).abs() < 1e-20);
         assert_eq!(cfg.min_obs, 12);
         // Defaults kick in for omitted fields
-        assert_eq!(cfg.frequency_selection, "shared_spectral");
-        assert_eq!(cfg.spectral_top_k, 8);
+        assert_eq!(cfg.frequency_selection, "spectral");
         assert_eq!(cfg.outlier_sigma, 2.5);
     }
 

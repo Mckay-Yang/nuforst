@@ -12,18 +12,20 @@ use ndarray::Array3;
 use rayon::prelude::*;
 
 use nufrost_core::{
-    hants_pixel, nufrost_pixel, nufrost_pixel_with_shared, zhu2015::fit_predict_pixel,
-    parse_iso8601_to_epoch_seconds, to_seconds_since_start, HantsConfig, NufrostConfig,
+    hants_pixel, nufrost_pixel, zhu2015::fit_predict_pixel,
+    parse_iso8601_to_epoch_seconds, HantsConfig, NufrostConfig,
     Zhu2015Config,
 };
 use nufrost_gdal::{
     full_scene::{
         self, build_ground_truth_output_path, build_scene_stack_output_path,
-        build_shared_frequency_pool, choose_shared_target_timestamp,
-        discover_sentinel_band_stacks, make_masked_time_series, mask_invalid_sentinel2,
+        choose_shared_target_timestamp, discover_sentinel_band_stacks,
+        make_masked_time_series, mask_invalid_sentinel2,
         sorted_band_names, write_band_stack,
     },
-    extract_raw_band_descriptions, read_all_bands, read_all_bands_window,
+    collapse_duplicate_timestamps,
+    extract_raw_band_descriptions, read_all_bands,
+    read_all_bands_window_offset,
     RasterMetadata, RasterReader,
     reconstruct_nufrost_geotiff, reconstruct_hants_geotiff, reconstruct_zhu2015_geotiff,
     synthetic_timestamps_from_bands,
@@ -132,14 +134,6 @@ struct FullSceneArgs {
     /// Frequency selection mode override for NUFROST config.
     #[arg(long)]
     frequency_selection: Option<String>,
-
-    /// Spectral top-k override for NUFROST config.
-    #[arg(long)]
-    spectral_top_k: Option<usize>,
-
-    /// Preferred top-k override for NUFROST config.
-    #[arg(long)]
-    preferred_top_k: Option<usize>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -267,7 +261,7 @@ fn load_fixture_npz(path: &std::path::Path) -> Result<FixtureData> {
 /// Default NUFROST config matching Python `config/nufrost.json`.
 fn default_nufrost_config() -> NufrostConfig {
     let full_json = r#"{
-        "nufrost":{"modes":4096,"eps":1e-12,"num_peaks":10,"power_cum":0.7,"ignore_dc_hz":1e-10,"refine_peaks":true,"include_trend":true,"ridge_lam":0.005,"freq_weight":2.0,"huber_iters":3,"huber_delta":0.05,"min_obs":12},
+        "nufrost":{"modes":4096,"eps":1e-12,"num_peaks":10,"power_cum":0.7,"ignore_dc_hz":1e-10,"frequency_selection":"shared_spectral","preferred_periods_days":"365.25,182.625,91.3125,30.4375","preferred_top_k":4,"spectral_top_k":8,"spectral_merge_tol":0.15,"refine_peaks":true,"include_trend":true,"ridge_lam":0.005,"freq_weight":2.0,"huber_iters":3,"huber_delta":0.05,"min_obs":12,"outlier_sigma":2.5,"lambda_step":0.05,"lambda_high":0.005,"low_freq_period_days":60.0,"step_dt_weighting":true,"max_outer_iter":5,"outer_tol":0.001,"joint_outlier":true,"joint_outlier_sigma":2.5,"admm_rho":1.0,"admm_max_iter":80,"admm_tol":0.0001,"private_top_k_per_band":2,"private_freq_penalty_mult":1.5},
         "hants":{"nof":3,"sf":"high","fet":500.0,"dod":5,"period":365.25,"valid_min":null,"valid_max":null},
         "zhu2015":{"lasso_alpha":0.1}
     }"#;
@@ -597,7 +591,10 @@ fn run_full_scene(args: &FullSceneArgs) -> Result<()> {
         for chunk_path in chunk_paths {
             let reader = RasterReader::open(chunk_path)?;
             let cube = if let Some(ws) = args.window_size {
-                read_all_bands_window(&reader, ws, ws)?
+                let (rows, cols) = reader.shape();
+                let row_off = if rows > ws { (rows - ws) / 2 } else { 0 };
+                let col_off = if cols > ws { (cols - ws) / 2 } else { 0 };
+                read_all_bands_window_offset(&reader, row_off, col_off, ws, ws)?
             } else {
                 read_all_bands(&reader)?
             };
@@ -649,7 +646,15 @@ fn run_full_scene(args: &FullSceneArgs) -> Result<()> {
             .get(band_name)
             .with_context(|| format!("Timestamps missing for band {band_name}"))?;
 
-        let (mc, mts, _target_idx, gt) = make_masked_time_series(cube, ts, &target_time_str)?;
+        let ts_before = ts.len();
+        let (cube, ts) = collapse_duplicate_timestamps(cube, ts);
+        eprintln!(
+            "Band {band_name}: collapsed {} timestamp slices to {}",
+            ts_before,
+            ts.len(),
+        );
+
+        let (mc, mts, _target_idx, gt) = make_masked_time_series(&cube, &ts, &target_time_str)?;
         masked_cubes.insert(band_name.clone(), mc);
         masked_ts.insert(band_name.clone(), mts);
         ground_truths.insert(band_name.clone(), gt);
@@ -664,45 +669,13 @@ fn run_full_scene(args: &FullSceneArgs) -> Result<()> {
         nodata: first_reader.nodata(1),
     };
 
-    // 8. Build shared frequency pool (NUFROST, if spectral top-k requested)
-    let shared_freqs: Option<Vec<f64>> = if methods.contains(&"nufrost")
-        && (args.spectral_top_k.is_some() || args.preferred_top_k.is_some())
-    {
-        let top_k = args.spectral_top_k.unwrap_or(10);
-        let nufrost_conf = default_nufrost_config();
-
-        let all_epochs: Vec<f64> = band_timestamps
-            .values()
-            .flatten()
-            .filter_map(|s| parse_iso8601_to_epoch_seconds(s))
-            .collect();
-        let ts_sec = to_seconds_since_start(&all_epochs);
-
-        let pool = build_shared_frequency_pool(
-            &band_cubes,
-            &ts_sec,
-            top_k,
-            nufrost_conf.modes as usize,
-            nufrost_conf.power_cum,
-            nufrost_conf.ignore_dc_hz,
-            500,
-        );
-        if !pool.is_empty() {
-            eprintln!("Shared frequency pool: {} frequencies", pool.len());
-            Some(pool)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    // 9. Target time as epoch
+    // 8. Target time as epoch
     let target_epoch = parse_iso8601_to_epoch_seconds(&target_time_str)
         .context("Failed to parse target timestamp")?;
 
     // 10. Load configs
-    let nufrost_conf = default_nufrost_config();
+    let nufrost_conf = load_nufrost_config(Some(std::path::Path::new("config/nufrost.json")))
+        .unwrap_or_else(|_| default_nufrost_config());
     let hants_conf = default_hants_config();
     let zhu2015_conf = default_zhu2015_config();
 
@@ -715,101 +688,92 @@ fn run_full_scene(args: &FullSceneArgs) -> Result<()> {
         let method_str = *method;
         eprintln!("Reconstructing with {method_str}...");
 
-        let predictions: BTreeMap<String, ndarray::Array2<f64>> = ordered_bands
-            .par_iter()
-            .map(|band_name| {
-                let cube = masked_cubes.get(band_name).unwrap();
-                let ts_strs = masked_ts.get(band_name).unwrap();
+        let predictions: BTreeMap<String, ndarray::Array2<f64>> =
+            // Per-band independent reconstruction for NUFROST, HANTS, and Zhu2015.
+            ordered_bands
+                .par_iter()
+                .map(|band_name| {
+                    let cube = masked_cubes.get(band_name).unwrap();
+                    let ts_strs = masked_ts.get(band_name).unwrap();
 
-                // Convert string timestamps to epoch seconds
-                let mut epochs: Vec<f64> = ts_strs
-                    .iter()
-                    .filter_map(|s| parse_iso8601_to_epoch_seconds(s))
-                    .collect();
-                // Include target epoch for reference
-                epochs.push(target_epoch);
-                epochs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    // Convert string timestamps to epoch seconds
+                    let mut epochs: Vec<f64> = ts_strs
+                        .iter()
+                        .filter_map(|s| parse_iso8601_to_epoch_seconds(s))
+                        .collect();
+                    // Include target epoch for reference
+                    epochs.push(target_epoch);
+                    epochs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-                // Relative days from earliest epoch of this band+target set
-                let ts_days: Vec<f64> = epochs
-                    .iter()
-                    .map(|&e| (e - epochs[0]) / 86400.0)
-                    .collect();
-                let target_day = (target_epoch - epochs[0]) / 86400.0;
+                    // Relative days from earliest epoch of this band+target set
+                    let ts_days: Vec<f64> = epochs
+                        .iter()
+                        .map(|&e| (e - epochs[0]) / 86400.0)
+                        .collect();
+                    let target_day = (target_epoch - epochs[0]) / 86400.0;
 
-                // The masked ts_days are all except the target
-                let masked_days: Vec<f64> = ts_days
-                    .iter()
-                    .copied()
-                    .filter(|&d| (d - target_day).abs() > 1e-9)
-                    .collect();
+                    // The masked ts_days are all except the target
+                    let masked_days: Vec<f64> = ts_days
+                        .iter()
+                        .copied()
+                        .filter(|&d| (d - target_day).abs() > 1e-9)
+                        .collect();
 
-                let (n_bands, rows, cols) = cube.dim();
-                let mut pred = ndarray::Array2::<f64>::from_elem((rows, cols), f64::NAN);
+                    let (n_bands, rows, cols) = cube.dim();
+                    let mut pred = ndarray::Array2::<f64>::from_elem((rows, cols), f64::NAN);
 
-                // Parallel per-row reconstruction
-                pred.axis_iter_mut(ndarray::Axis(0))
-                    .into_par_iter()
-                    .enumerate()
-                    .for_each(|(r, mut row_out)| {
-                        let mut ts_buf = Vec::with_capacity(n_bands);
-                        let mut obs_buf = Vec::with_capacity(n_bands);
-                        for c in 0..cols {
-                            ts_buf.clear();
-                            obs_buf.clear();
-                            for b in 0..n_bands {
-                                let v = cube[[b, r, c]];
-                                if v.is_finite() {
-                                    ts_buf.push(masked_days[b]);
-                                    obs_buf.push(v);
+                    // Parallel per-row reconstruction
+                    pred.axis_iter_mut(ndarray::Axis(0))
+                        .into_par_iter()
+                        .enumerate()
+                        .for_each(|(r, mut row_out)| {
+                            let mut ts_buf = Vec::with_capacity(n_bands);
+                            let mut obs_buf = Vec::with_capacity(n_bands);
+                            for c in 0..cols {
+                                ts_buf.clear();
+                                obs_buf.clear();
+                                for b in 0..n_bands {
+                                    let v = cube[[b, r, c]];
+                                    if v.is_finite() {
+                                        ts_buf.push(masked_days[b]);
+                                        obs_buf.push(v);
+                                    }
+                                }
+                                if !ts_buf.is_empty() {
+                                    match method_str {
+                                        "nufrost" => {
+                                            let val = nufrost_pixel(&ts_buf, &obs_buf, target_day, &nufrost_conf).0;
+                                            row_out[c] = if val.is_finite() { val } else { f64::NAN };
+                                        }
+                                        "hants" => {
+                                            let val = hants_pixel(
+                                                &ts_buf, &obs_buf, target_day,
+                                                hants_conf.nof, &hants_conf.sf,
+                                                hants_conf.valid_min, hants_conf.valid_max,
+                                                hants_conf.fet, hants_conf.dod, hants_conf.period,
+                                            );
+                                            row_out[c] = if val.is_finite() { val } else { f64::NAN };
+                                        }
+                                        "zhu2015" => {
+                                            let result = fit_predict_pixel(
+                                                &ts_buf, &obs_buf, target_day,
+                                                zhu2015_conf.lasso_alpha,
+                                            );
+                                            row_out[c] = if result.prediction.is_finite() {
+                                                result.prediction
+                                            } else {
+                                                f64::NAN
+                                            };
+                                        }
+                                        _ => {}
+                                    }
                                 }
                             }
-                            if !ts_buf.is_empty() {
-                                match method_str {
-                                    "nufrost" => {
-                                        let (val, _) = if let Some(ref freqs) = shared_freqs
-                                        {
-                                            nufrost_pixel_with_shared(
-                                                &ts_buf, &obs_buf, target_day,
-                                                &nufrost_conf, freqs,
-                                            )
-                                        } else {
-                                            nufrost_pixel(
-                                                &ts_buf, &obs_buf, target_day,
-                                                &nufrost_conf,
-                                            )
-                                        };
-                                        row_out[c] = if val.is_finite() { val } else { f64::NAN };
-                                    }
-                                    "hants" => {
-                                        let val = hants_pixel(
-                                            &ts_buf, &obs_buf, target_day,
-                                            hants_conf.nof, &hants_conf.sf,
-                                            hants_conf.valid_min, hants_conf.valid_max,
-                                            hants_conf.fet, hants_conf.dod, hants_conf.period,
-                                        );
-                                        row_out[c] = if val.is_finite() { val } else { f64::NAN };
-                                    }
-                                    "zhu2015" => {
-                                        let result = fit_predict_pixel(
-                                            &ts_buf, &obs_buf, target_day,
-                                            zhu2015_conf.lasso_alpha,
-                                        );
-                                        row_out[c] = if result.prediction.is_finite() {
-                                            result.prediction
-                                        } else {
-                                            f64::NAN
-                                        };
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    });
+                        });
 
-                (band_name.clone(), pred)
-            })
-            .collect();
+                    (band_name.clone(), pred)
+                })
+                .collect();
 
         // Write merged band stack
         let output_path = build_scene_stack_output_path(
@@ -1061,5 +1025,78 @@ mod tests {
             }
             _ => panic!("expected Nufrost"),
         }
+    }
+
+    // ── Contract: shared pool flags must be removed ──────────────────────
+
+    /// Contract test: `--spectral-top-k` must NOT be accepted by `full-scene`.
+    ///
+    /// FAILS now (flag exists) → will PASS after T6 removes it from
+    /// `FullSceneArgs`.
+    #[test]
+    fn full_scene_rejects_spectral_top_k() {
+        let err = parse_fails(&[
+            "full-scene",
+            "--source-name", "sentinel-2",
+            "--lon", "100.0",
+            "--lat", "25.0",
+            "--spectral-top-k", "4",
+        ]);
+        assert!(
+            err.contains("spectral-top-k")
+                || err.contains("unrecognized")
+                || err.contains("unexpected")
+                || err.contains("error")
+                || err.contains("invalid"),
+            "expected '--spectral-top-k' to be rejected, got: {err}"
+        );
+    }
+
+    /// Contract test: `--preferred-top-k` must NOT be accepted by `full-scene`.
+    ///
+    /// FAILS now (flag exists) → will PASS after T6 removes it from
+    /// `FullSceneArgs`.
+    #[test]
+    fn full_scene_rejects_preferred_top_k() {
+        let err = parse_fails(&[
+            "full-scene",
+            "--source-name", "sentinel-2",
+            "--lon", "100.0",
+            "--lat", "25.0",
+            "--preferred-top-k", "4",
+        ]);
+        assert!(
+            err.contains("preferred-top-k")
+                || err.contains("unrecognized")
+                || err.contains("unexpected")
+                || err.contains("error")
+                || err.contains("invalid"),
+            "expected '--preferred-top-k' to be rejected, got: {err}"
+        );
+    }
+
+    /// Contract test: `full-scene --help` must NOT mention shared-pool flags.
+    ///
+    /// FAILS now (help text includes them) → will PASS after T6 removes them.
+    #[test]
+    fn full_scene_help_omits_shared_pool_flags() {
+        use clap::CommandFactory;
+        // Build the top-level command then find the `full-scene` subcommand.
+        let mut cmd = Cli::command();
+        let full_scene_cmd = cmd
+            .find_subcommand_mut("full-scene")
+            .expect("full-scene subcommand must exist");
+        let mut buf: Vec<u8> = Vec::new();
+        full_scene_cmd.write_help(&mut buf).unwrap();
+        let help = String::from_utf8(buf).unwrap();
+
+        assert!(
+            !help.contains("spectral-top-k"),
+            "help must NOT mention --spectral-top-k (shared pool flag to be removed)\nHelp:\n{help}"
+        );
+        assert!(
+            !help.contains("preferred-top-k"),
+            "help must NOT mention --preferred-top-k (shared pool flag to be removed)\nHelp:\n{help}"
+        );
     }
 }

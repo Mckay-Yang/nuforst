@@ -15,16 +15,17 @@ fn default_nufrost_config() -> NufrostConfig {
     serde_json::from_str(
         r#"{
             "modes": 4096, "eps": 1e-12, "num_peaks": 10, "power_cum": 0.7,
-            "ignore_dc_hz": 1e-10, "frequency_selection": "spectral",
+            "ignore_dc_hz": 1e-10, "frequency_selection": "shared_spectral",
             "preferred_periods_days": "365.25,182.625,91.3125,30.4375",
-            "preferred_top_k": 4, "spectral_top_k": 4, "spectral_merge_tol": 0.15,
+            "preferred_top_k": 4, "spectral_top_k": 8, "spectral_merge_tol": 0.15,
             "refine_peaks": true, "include_trend": true, "ridge_lam": 0.005,
             "freq_weight": 2.0, "huber_iters": 3, "huber_delta": 0.05,
-            "min_obs": 12, "outlier_sigma": 2.0, "lambda_step": 1e30,
-            "lambda_high": 0.005, "low_freq_period_days": 0.0,
-            "step_dt_weighting": false, "max_outer_iter": 5, "outer_tol": 1e-3,
-            "joint_outlier": false, "joint_outlier_sigma": 2.5,
-            "admm_rho": 1.0, "admm_max_iter": 80, "admm_tol": 1e-4
+            "min_obs": 12, "outlier_sigma": 2.5, "lambda_step": 0.05,
+            "lambda_high": 0.005, "low_freq_period_days": 60.0,
+            "step_dt_weighting": true, "max_outer_iter": 5, "outer_tol": 1e-3,
+            "joint_outlier": true, "joint_outlier_sigma": 2.5,
+            "admm_rho": 1.0, "admm_max_iter": 80, "admm_tol": 1e-4,
+            "private_top_k_per_band": 2, "private_freq_penalty_mult": 1.5
         }"#,
     ).expect("hardcoded default config must be valid")
 }
@@ -46,25 +47,29 @@ fn merge_nufrost_config(json_str: &str) -> Result<NufrostConfig, String> {
         set_num!(modes, "modes", u32, 4096);
         set_num!(eps, "eps", f64, 1e-12);
         set_num!(num_peaks, "num_peaks", u32, 10);
+        set_num!(preferred_top_k, "preferred_top_k", u32, 4);
+        set_num!(spectral_top_k, "spectral_top_k", u32, 8);
         set_num!(power_cum, "power_cum", f64, 0.7);
         set_num!(ignore_dc_hz, "ignore_dc_hz", f64, 1e-10);
         set_num!(ridge_lam, "ridge_lam", f64, 0.005);
+        set_num!(ridge_lam, "ridge", f64, 0.005);
         set_num!(freq_weight, "freq_weight", f64, 2.0);
         set_num!(huber_iters, "huber_iters", u32, 3);
         set_num!(huber_delta, "huber_delta", f64, 0.05);
         set_num!(min_obs, "min_obs", u32, 12);
-        set_num!(preferred_top_k, "preferred_top_k", u32, 4);
-        set_num!(spectral_top_k, "spectral_top_k", u32, 4);
         set_num!(spectral_merge_tol, "spectral_merge_tol", f64, 0.15);
-        set_num!(outlier_sigma, "outlier_sigma", f64, 2.0);
-        set_num!(lambda_step, "lambda_step", f64, 1e30);
+        set_num!(outlier_sigma, "outlier_sigma", f64, 2.5);
+        set_num!(lambda_step, "lambda_step", f64, 0.05);
         set_num!(lambda_high, "lambda_high", f64, 0.005);
-        set_num!(low_freq_period_days, "low_freq_period_days", f64, 0.0);
+        set_num!(low_freq_period_days, "low_freq_period_days", f64, 60.0);
         set_num!(max_outer_iter, "max_outer_iter", u32, 5);
         set_num!(outer_tol, "outer_tol", f64, 1e-3);
         set_num!(admm_rho, "admm_rho", f64, 1.0);
         set_num!(admm_max_iter, "admm_max_iter", u32, 80);
         set_num!(admm_tol, "admm_tol", f64, 1e-4);
+        set_num!(joint_outlier_sigma, "joint_outlier_sigma", f64, 2.5);
+        set_num!(private_top_k_per_band, "private_top_k_per_band", usize, 2);
+        set_num!(private_freq_penalty_mult, "private_freq_penalty_mult", f64, 1.5);
         set_bool!(refine_peaks, "refine_peaks");
         set_bool!(include_trend, "include_trend");
         set_bool!(step_dt_weighting, "step_dt_weighting");

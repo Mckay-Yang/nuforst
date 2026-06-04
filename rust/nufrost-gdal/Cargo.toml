@@ -11,6 +11,7 @@ ndarray.workspace = true
 rayon.workspace = true
 chrono.workspace = true
 gdal.workspace = true
+gdal-sys = "0.12"
 thiserror.workspace = true
 anyhow.workspace = true
 regex.workspace = true

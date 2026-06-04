@@ -93,6 +93,28 @@ at the top level for cdylib builds.
   CLI timing (with process overhead) to give complete picture
 
 ### Key findings
+## Task 1: Contract tests for shared frequency pool removal (2026-06-03)
+
+### What was done
+- Added 4 contract tests that lock the desired post-T6 behavior:
+  1. `full_scene_rejects_spectral_top_k` — asserts `--spectral-top-k` is rejected by clap
+  2. `full_scene_rejects_preferred_top_k` — asserts `--preferred-top-k` is rejected by clap
+  3. `full_scene_help_omits_shared_pool_flags` — asserts help output doesn't mention these flags
+  4. `nufrost_pixel_with_shared` `compile_fail` doc test — asserts symbol absent from public API
+- All 4 tests FAIL now (correctly detecting current pre-removal state)
+- Tests will PASS after T6 removes `spectral_top_k`/`preferred_top_k` from `FullSceneArgs`,
+  the shared pool logic from `run_full_scene()`, and `nufrost_pixel_with_shared` from `lib.rs` exports
+
+### Key decisions
+- Used clap's `try_parse_from` for CLI rejection tests — cleanest way to assert unknown args
+- Used `compile_fail` doc test for API symbol absence — only Rust mechanism without extra deps
+- Used `find_subcommand_mut("full-scene")` for subcommand-specific help rendering
+- Evidence saved to `.sisyphus/evidence/task-1-shared-flag-rejected.txt`
+
+### Files modified
+- `rust/nufrost-cli/src/main.rs` — 3 contract tests in tests module
+- `rust/nufrost-core/src/nufrost.rs` — 1 `compile_fail` doc test on `nufrost_pixel_with_shared`
+
 - NUFROST `predict_single_pixel` works with any consistent time unit (days or seconds);
   it calls `_to_seconds_since_start()` which just subtracts min(t), so the internal math
   is unitless as long as target_t uses the same unit.
@@ -486,3 +508,17 @@ Key verification results:
 - Zhu2015's `fit_predict_pixel` still computes and returns `qa` internally — only the output layer changed
 - QA is still used for model order selection inside the algorithm (order 0-3 decision)
 - All three algorithms now produce single-band GeoTIFF output (NUFROST, HANTS, Zhu2015)
+
+---
+
+# Learnings — F4 Scope Fidelity Check (2026-06-03)
+
+## Verdict: REJECT — 3 scope violations
+
+### F4 findings
+- **HANTS changed significantly (408 lines)**: Outlier rejection logic changed from paper-specified `sf/idrt` to `valid_min/valid_max`. New params-based API added.
+- **Zhu2015 changed significantly (754 lines)**: QA band removed (`_select_unit_qa` deleted), `make_design_matrix` signature changed, segment prediction rewritten.
+- **config.yaml deleted**: Replaced by JSON configs. `Args` restructured to `NufrostArgs` with alias.
+- All 3 plans (`rust-rewrite.md`, `rust-multiband-joint-fitting.md`, `rust-full-scene-parity-fix.md`) say HANTS/Zhu2015 should remain baselines with only NUFROST internals changing.
+- Clean checks: no spectral-ratio, no spatial smoothing, output naming preserved, single-band NUFROST path intact, summary JSON contract preserved, all tests pass.
+- Recommendation: revert hants.py/zhu2015.py to original behavior; restore config.yaml; keep additive changes only.

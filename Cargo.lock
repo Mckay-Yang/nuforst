@@ -2047,6 +2047,7 @@ dependencies = [
  "approx",
  "chrono",
  "gdal",
+ "gdal-sys",
  "ndarray",
  "nufrost-core",
  "rayon",
