@@ -1,12 +1,13 @@
 [package]
-name = "zhu2015"
+name = "hants-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-nufrost-core = { path = "../nufrost-core" }
+gdal = { path = "../gdal" }
+anyhow.workspace = true
 ndarray.workspace = true
 rayon.workspace = true
 serde.workspace = true

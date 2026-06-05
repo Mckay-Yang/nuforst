@@ -21,7 +21,7 @@ use crate::{RasterMetadata, RasterWriter, RasterReader};
 ///
 /// Examples:
 /// ```
-/// assert_eq!(nufrost_gdal::full_scene::location_token(104.2595, 31.2170),
+/// assert_eq!(gdal::full_scene::location_token(104.2595, 31.2170),
 ///            "lon104.2595_lat31.2170");
 /// ```
 pub fn location_token(lon: f64, lat: f64) -> String {
@@ -545,7 +545,7 @@ pub fn make_masked_time_series(
 mod tests {
     use super::*;
     use std::path::Path;
-    use gdal::Metadata;
+    use gdal_rs::Metadata;
 
     // -----------------------------------------------------------------------
     // location_token / location_output_token
@@ -736,8 +736,8 @@ mod tests {
             .expect("write_band_stack should succeed");
 
         // Verify with GDAL.
-        use gdal::Metadata;
-        let ds = gdal::Dataset::open(&tmp).expect("re-open should succeed");
+        use gdal_rs::Metadata;
+        let ds = gdal_rs::Dataset::open(&tmp).expect("re-open should succeed");
         assert_eq!(ds.raster_count(), 3, "band count");
 
         // Check band descriptions.
@@ -774,19 +774,19 @@ mod tests {
     #[test]
     fn test_find_timestamp_substring_sentinel2() {
         assert_eq!(
-            nufrost_core::find_timestamp_substring("20151227T035152_20151227T035506_T48RVV_B2"),
+            crate::find_timestamp_substring("20151227T035152_20151227T035506_T48RVV_B2"),
             Some("20151227T035152")
         );
         assert_eq!(
-            nufrost_core::find_timestamp_substring("20200101T045859_20200101T045859_T48RVV_B2"),
+            crate::find_timestamp_substring("20200101T045859_20200101T045859_T48RVV_B2"),
             Some("20200101T045859")
         );
     }
 
     #[test]
     fn test_find_timestamp_substring_no_match() {
-        assert_eq!(nufrost_core::find_timestamp_substring("no_timestamp_here"), None);
-        assert_eq!(nufrost_core::find_timestamp_substring(""), None);
+        assert_eq!(crate::find_timestamp_substring("no_timestamp_here"), None);
+        assert_eq!(crate::find_timestamp_substring(""), None);
     }
 
     #[test]
@@ -1117,7 +1117,7 @@ mod tests {
             .map(|b| {
                 let band = reader.dataset.rasterband(b).unwrap();
                 let desc = band.description().unwrap_or_default().trim().to_string();
-                if let Some(sub) = nufrost_core::find_timestamp_substring(&desc) {
+                if let Some(sub) = crate::find_timestamp_substring(&desc) {
                     raw_to_iso(sub)
                 } else {
                     desc
@@ -1300,7 +1300,7 @@ mod tests {
             .map(|b| {
                 let band = reader.dataset.rasterband(b).unwrap();
                 let desc = band.description().unwrap_or_default().trim().to_string();
-                if let Some(sub) = nufrost_core::find_timestamp_substring(&desc) {
+                if let Some(sub) = crate::find_timestamp_substring(&desc) {
                     raw_to_iso(sub)
                 } else {
                     desc
@@ -1386,7 +1386,7 @@ mod tests {
         write_band_stack(&tmp, &arrays, &ordered, &meta)
             .expect("write_band_stack with 6 Sentinel-2 bands should succeed");
 
-        let ds = gdal::Dataset::open(&tmp).expect("re-open should succeed");
+        let ds = gdal_rs::Dataset::open(&tmp).expect("re-open should succeed");
         assert_eq!(ds.raster_count(), 6);
         for (i, &expected_name) in sentinel_bands.iter().enumerate() {
             let band = ds.rasterband(i + 1).unwrap();

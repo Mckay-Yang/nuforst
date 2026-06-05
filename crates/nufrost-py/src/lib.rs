@@ -2,8 +2,8 @@ use numpy::PyArray1;
 use pyo3::prelude::*;
 
 use nufrost_core::{nufrost_pixel, NufrostConfig};
-use hants::{hants_pixel, HantsConfig};
-use zhu2015::{fit_predict_pixel, Zhu2015Config};
+use hants_core::{hants_pixel, HantsConfig};
+use zhu2015_core::{fit_predict_pixel, Zhu2015Config};
 
 // ── Config merge helpers ─────────────────────────────────────────────────
 // Fixture configs contain only a subset of fields.  We start from library

@@ -1750,6 +1750,32 @@ pub fn nufrost_pixel(
     (pred * y_scale, n_freqs)
 }
 
+/// Reconstruct a full raster using NUFROST.
+///
+/// The GDAL crate supplies raster I/O and the shared per-pixel traversal;
+/// this crate supplies only the NUFROST pixel model.
+pub fn reconstruct_nufrost_geotiff<P: AsRef<std::path::Path>>(
+    reader: &gdal::RasterReader,
+    timestamps_days: &[f64],
+    target_t_day: f64,
+    config: &NufrostConfig,
+    output_path: P,
+    metadata: &gdal::RasterMetadata,
+) -> anyhow::Result<()> {
+    let cube = gdal::read_all_bands(reader)?;
+    gdal::reconstruct_single_band(
+        &cube,
+        timestamps_days,
+        target_t_day,
+        output_path,
+        metadata,
+        |ts, obs, targ| {
+            let (pred, _n_freqs) = nufrost_pixel(ts, obs, targ, config);
+            if pred.is_finite() { pred } else { f64::NAN }
+        },
+    )
+}
+
 // ── Multi-band NUFROST ────────────────────────────────────────────────────
 
 /// Fit NUFROST independently to each band and predict at a shared target day.

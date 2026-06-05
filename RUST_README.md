@@ -6,18 +6,18 @@ layout where each crate keeps its Rust sources under its own `src/` directory:
 
 | Crate            | Type        | Purpose                                      |
 |------------------|-------------|----------------------------------------------|
+| `gdal`           | lib         | Raster I/O via GDAL (requires system libgdal) |
 | `nufrost-core`   | lib         | NUFROST algorithm, NUFFT, shared time/types   |
-| `hants`          | lib         | HANTS baseline algorithm                      |
-| `zhu2015`        | lib         | Zhu2015 baseline algorithm                    |
-| `nufrost-gdal`   | lib         | Raster I/O via GDAL (requires system libgdal) |
-| `nufrost-cli`    | binary      | CLI entrypoint for reconstruction            |
+| `hants-core`     | lib         | HANTS baseline algorithm                      |
+| `zhu2015-core`   | lib         | Zhu2015 baseline algorithm                    |
+| `cli`            | binary      | CLI entrypoint for reconstruction            |
 | `nufrost-py`     | cdylib      | Python bindings via PyO3 + maturin           |
 
 ## System Dependencies
 
 ### GDAL
 
-`nufrost-gdal` depends on the system GDAL library (`libgdal`).
+`gdal` depends on the system GDAL library (`libgdal`).
 You must have GDAL installed before building the workspace.
 
 **macOS (Homebrew):**

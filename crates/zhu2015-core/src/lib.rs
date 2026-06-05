@@ -57,8 +57,26 @@
 //! Matches the Python reference's simplified model-order encoding.
 
 use ndarray::{Array1, Array2, Axis};
-use nufrost_core::NufrostError;
 use serde::{Deserialize, Serialize};
+
+#[derive(Debug)]
+pub enum Zhu2015ConfigError {
+    Json(serde_json::Error),
+    InvalidConfigValue { field: String, reason: String },
+}
+
+impl std::fmt::Display for Zhu2015ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Json(err) => write!(f, "json parse error: {err}"),
+            Self::InvalidConfigValue { field, reason } => {
+                write!(f, "invalid config value for '{field}': {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for Zhu2015ConfigError {}
 
 /// Zhu2015 reconstruction parameters.
 ///
@@ -71,14 +89,14 @@ pub struct Zhu2015Config {
 
 impl Zhu2015Config {
     /// Load from a JSON byte slice.
-    pub fn from_json(data: &[u8]) -> Result<Self, NufrostError> {
-        serde_json::from_slice(data).map_err(NufrostError::Json)
+    pub fn from_json(data: &[u8]) -> Result<Self, Zhu2015ConfigError> {
+        serde_json::from_slice(data).map_err(Zhu2015ConfigError::Json)
     }
 
     /// Validate required fields.
-    pub fn validate(&self) -> Result<(), NufrostError> {
+    pub fn validate(&self) -> Result<(), Zhu2015ConfigError> {
         if self.lasso_alpha < 0.0 {
-            return Err(NufrostError::InvalidConfigValue {
+            return Err(Zhu2015ConfigError::InvalidConfigValue {
                 field: "lasso_alpha".into(),
                 reason: "must be >= 0".into(),
             });
@@ -293,6 +311,32 @@ pub fn fit_predict_pixel(
         prediction: pred,
         qa: order,
     }
+}
+
+/// Reconstruct a full raster using Zhu2015.
+///
+/// GDAL handles raster I/O and per-pixel traversal; this crate supplies the
+/// Zhu2015 pixel model.
+pub fn reconstruct_zhu2015_geotiff<P: AsRef<std::path::Path>>(
+    reader: &gdal::RasterReader,
+    timestamps_days: &[f64],
+    target_t_day: f64,
+    lasso_alpha: f64,
+    output_path: P,
+    metadata: &gdal::RasterMetadata,
+) -> anyhow::Result<()> {
+    let cube = gdal::read_all_bands(reader)?;
+    gdal::reconstruct_single_band(
+        &cube,
+        timestamps_days,
+        target_t_day,
+        output_path,
+        metadata,
+        |ts, obs, targ| {
+            let result = fit_predict_pixel(ts, obs, targ, lasso_alpha);
+            if result.prediction.is_finite() { result.prediction } else { f64::NAN }
+        },
+    )
 }
 
 // ── Segment-aware fitting ──────────────────────────────────────────────────

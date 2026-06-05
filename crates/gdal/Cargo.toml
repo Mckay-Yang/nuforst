@@ -1,18 +1,15 @@
 [package]
-name = "nufrost-gdal"
+name = "gdal"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-nufrost-core = { path = "../nufrost-core" }
-hants = { path = "../hants" }
-zhu2015 = { path = "../zhu2015" }
 ndarray.workspace = true
 rayon.workspace = true
 chrono.workspace = true
-gdal.workspace = true
+gdal-rs.workspace = true
 gdal-sys = "0.12"
 thiserror.workspace = true
 anyhow.workspace = true

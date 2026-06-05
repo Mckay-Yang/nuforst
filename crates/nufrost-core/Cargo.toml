@@ -6,6 +6,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+gdal = { path = "../gdal" }
+anyhow.workspace = true
 ndarray.workspace = true
 rayon.workspace = true
 chrono.workspace = true

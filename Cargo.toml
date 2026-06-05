@@ -1,11 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/gdal",
     "crates/nufrost-core",
-    "crates/hants",
-    "crates/zhu2015",
-    "crates/nufrost-gdal",
-    "crates/nufrost-cli",
+    "crates/hants-core",
+    "crates/zhu2015-core",
+    "crates/cli",
     "crates/nufrost-py",
 ]
 
@@ -23,7 +23,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 pyo3 = { version = "0.24", features = ["extension-module", "abi3-py38"] }
 numpy = "0.24"
 maturin = "1"
-gdal = "0.19"
+gdal-rs = { package = "gdal", version = "0.19" }
 regex = "1"
 
 [workspace.package]

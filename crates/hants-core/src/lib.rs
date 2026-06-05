@@ -13,8 +13,26 @@
 //   DOD  : degree of overdeterminedness — keep at least (2*nof-1 + dod) points
 
 use ndarray::{Array1, Array2};
-use nufrost_core::NufrostError;
 use serde::{Deserialize, Serialize};
+
+#[derive(Debug)]
+pub enum HantsConfigError {
+    Json(serde_json::Error),
+    InvalidConfigValue { field: String, reason: String },
+}
+
+impl std::fmt::Display for HantsConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Json(err) => write!(f, "json parse error: {err}"),
+            Self::InvalidConfigValue { field, reason } => {
+                write!(f, "invalid config value for '{field}': {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HantsConfigError {}
 
 /// HANTS reconstruction parameters.
 ///
@@ -34,20 +52,20 @@ pub struct HantsConfig {
 
 impl HantsConfig {
     /// Load from a JSON byte slice.
-    pub fn from_json(data: &[u8]) -> Result<Self, NufrostError> {
-        serde_json::from_slice(data).map_err(NufrostError::Json)
+    pub fn from_json(data: &[u8]) -> Result<Self, HantsConfigError> {
+        serde_json::from_slice(data).map_err(HantsConfigError::Json)
     }
 
     /// Validate required fields.
-    pub fn validate(&self) -> Result<(), NufrostError> {
+    pub fn validate(&self) -> Result<(), HantsConfigError> {
         if self.nof == 0 {
-            return Err(NufrostError::InvalidConfigValue {
+            return Err(HantsConfigError::InvalidConfigValue {
                 field: "nof".into(),
                 reason: "number of frequencies must be > 0".into(),
             });
         }
         if self.dod == 0 {
-            return Err(NufrostError::InvalidConfigValue {
+            return Err(HantsConfigError::InvalidConfigValue {
                 field: "dod".into(),
                 reason: "degree of over-determination must be > 0".into(),
             });
@@ -421,6 +439,38 @@ pub fn hants_pixel(
 ) -> f64 {
     let result = hants_fit(t, y, nof, sf, valid_min, valid_max, fet, dod, period);
     hants_predict(&result, target_t)
+}
+
+/// Reconstruct a full raster using HANTS.
+///
+/// GDAL handles raster I/O and per-pixel traversal; this crate supplies the
+/// HANTS pixel model.
+pub fn reconstruct_hants_geotiff<P: AsRef<std::path::Path>>(
+    reader: &gdal::RasterReader,
+    timestamps_days: &[f64],
+    target_t_day: f64,
+    nof: u32,
+    sf: &str,
+    valid_min: Option<f64>,
+    valid_max: Option<f64>,
+    fet: f64,
+    dod: u32,
+    period: f64,
+    output_path: P,
+    metadata: &gdal::RasterMetadata,
+) -> anyhow::Result<()> {
+    let cube = gdal::read_all_bands(reader)?;
+    gdal::reconstruct_single_band(
+        &cube,
+        timestamps_days,
+        target_t_day,
+        output_path,
+        metadata,
+        |ts, obs, targ| {
+            let pred = hants_pixel(ts, obs, targ, nof, sf, valid_min, valid_max, fet, dod, period);
+            if pred.is_finite() { pred } else { f64::NAN }
+        },
+    )
 }
 
 /// Convenience: fit + predict curve in one call.

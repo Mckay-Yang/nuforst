@@ -1,6 +1,6 @@
-// nufrost-cli — command-line entrypoint for NUFROST, HANTS, and Zhu2015
+// cli — command-line entrypoint for NUFROST, HANTS, and Zhu2015
 // reconstruction algorithms.  Supports single-pixel fixture NPZ input and
-// raster GeoTIFF input via nufrost-gdal.
+// raster GeoTIFF input via gdal.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -14,11 +14,11 @@ use rayon::prelude::*;
 use serde::de::DeserializeOwned;
 
 use nufrost_core::{
-    nufrost_pixel, parse_iso8601_to_epoch_seconds, NufrostConfig,
+    nufrost_pixel, parse_iso8601_to_epoch_seconds, reconstruct_nufrost_geotiff, NufrostConfig,
 };
-use hants::{hants_pixel, HantsConfig};
-use zhu2015::{fit_predict_pixel, Zhu2015Config};
-use nufrost_gdal::{
+use hants_core::{hants_pixel, reconstruct_hants_geotiff, HantsConfig};
+use zhu2015_core::{fit_predict_pixel, reconstruct_zhu2015_geotiff, Zhu2015Config};
+use gdal::{
     full_scene::{
         self, build_ground_truth_output_path, build_scene_stack_output_path,
         choose_shared_target_timestamp, discover_sentinel_band_stacks,
@@ -29,7 +29,6 @@ use nufrost_gdal::{
     extract_raw_band_descriptions, read_all_bands,
     read_all_bands_window_offset,
     RasterMetadata, RasterReader,
-    reconstruct_nufrost_geotiff, reconstruct_hants_geotiff, reconstruct_zhu2015_geotiff,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -139,17 +138,17 @@ impl Cli {
     }
 
     fn command() -> Command {
-        Command::new("nufrost-cli")
+        Command::new("cli")
             .version(env!("CARGO_PKG_VERSION"))
             .about("NUFROST / HANTS / Zhu2015 time-series reconstruction CLI")
             .after_help(
                 "Examples:\n  \
-                 nufrost-cli nufrost --data fixture.npz --target-time 372.7\n  \
-                 nufrost-cli hants --config hants.json --data fixture.npz\n  \
-                 nufrost-cli zhu2015 --data fixture.npz -t 372.7 -o pred.txt\n  \
-                 nufrost-cli nufrost --input-geotiff input.tif --output pred.tif\n  \
-                 nufrost-cli hants --input-geotiff input.tif -o pred.tif\n  \
-                 nufrost-cli zhu2015 --input-geotiff input.tif -o pred.tif",
+                 cli nufrost --data fixture.npz --target-time 372.7\n  \
+                 cli hants --config hants.json --data fixture.npz\n  \
+                 cli zhu2015 --data fixture.npz -t 372.7 -o pred.txt\n  \
+                 cli nufrost --input-geotiff input.tif --output pred.tif\n  \
+                 cli hants --input-geotiff input.tif -o pred.tif\n  \
+                 cli zhu2015 --input-geotiff input.tif -o pred.tif",
             )
             .subcommand_required(true)
             .arg_required_else_help(true)
@@ -375,7 +374,7 @@ fn parse_grouped_config_section<T: DeserializeOwned>(
 
 #[allow(deprecated)]
 fn synthetic_geotiff_timestamps(n_bands: usize) -> (Vec<f64>, f64) {
-    nufrost_gdal::synthetic_timestamps_from_bands(n_bands)
+    gdal::synthetic_timestamps_from_bands(n_bands)
 }
 
 fn load_nufrost_config(path: Option<&std::path::Path>) -> Result<NufrostConfig> {
@@ -966,13 +965,13 @@ mod tests {
 
     /// Parse args and return the CLI struct.
     fn parse(args: &[&str]) -> Cli {
-        Cli::try_parse_from(std::iter::once("nufrost-cli").chain(args.iter().copied()))
+        Cli::try_parse_from(std::iter::once("cli").chain(args.iter().copied()))
             .expect("valid args should parse")
     }
 
     /// Parse args and expect failure.
     fn parse_fails(args: &[&str]) -> String {
-        Cli::try_parse_from(std::iter::once("nufrost-cli").chain(args.iter().copied()))
+        Cli::try_parse_from(std::iter::once("cli").chain(args.iter().copied()))
             .unwrap_err()
             .to_string()
     }

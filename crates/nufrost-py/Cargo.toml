@@ -10,8 +10,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 nufrost-core = { path = "../nufrost-core" }
-hants = { path = "../hants" }
-zhu2015 = { path = "../zhu2015" }
+hants-core = { path = "../hants-core" }
+zhu2015-core = { path = "../zhu2015-core" }
 pyo3.workspace = true
 numpy.workspace = true
 rayon.workspace = true
