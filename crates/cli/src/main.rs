@@ -14,7 +14,8 @@ use rayon::prelude::*;
 use serde::de::DeserializeOwned;
 
 use nufrost_core::{
-    nufrost_pixel, parse_iso8601_to_epoch_seconds, reconstruct_nufrost_geotiff, NufrostConfig,
+    nufrost_pixel, nufrost_pixel_vector, parse_iso8601_to_epoch_seconds,
+    reconstruct_nufrost_geotiff, NufrostConfig,
 };
 use hants_core::{hants_pixel, reconstruct_hants_geotiff, HantsConfig};
 use zhu2015_core::{fit_predict_pixel, reconstruct_zhu2015_geotiff, Zhu2015Config};
@@ -58,6 +59,8 @@ struct FullSceneArgs {
     methods: String,
     n_jobs: Option<usize>,
     window_size: Option<usize>,
+    window_lon: Option<f64>,
+    window_lat: Option<f64>,
     min_valid_ratio: f64,
     late_fraction: f64,
     #[allow(dead_code)]
@@ -128,6 +131,8 @@ impl Cli {
                 methods: sub.get_one::<String>("methods").cloned().unwrap(),
                 n_jobs: sub.get_one::<usize>("n_jobs").copied(),
                 window_size: sub.get_one::<usize>("window_size").copied(),
+                window_lon: sub.get_one::<f64>("window_lon").copied(),
+                window_lat: sub.get_one::<f64>("window_lat").copied(),
                 min_valid_ratio: *sub.get_one::<f64>("min_valid_ratio").unwrap(),
                 late_fraction: *sub.get_one::<f64>("late_fraction").unwrap(),
                 frequency_selection: sub.get_one::<String>("frequency_selection").cloned(),
@@ -267,6 +272,18 @@ fn full_scene_command() -> Command {
                 .long("window-size")
                 .value_name("PX")
                 .value_parser(clap::value_parser!(usize)),
+        )
+        .arg(
+            Arg::new("window_lon")
+                .long("window-lon")
+                .value_name("LON")
+                .value_parser(clap::value_parser!(f64)),
+        )
+        .arg(
+            Arg::new("window_lat")
+                .long("window-lat")
+                .value_name("LAT")
+                .value_parser(clap::value_parser!(f64)),
         )
         .arg(
             Arg::new("min_valid_ratio")
@@ -652,6 +669,140 @@ fn run_zhu2015_geotiff(
 //  Full-scene reconstruction handler
 // ═══════════════════════════════════════════════════════════════════════════
 
+fn full_scene_window_offset(
+    reader: &RasterReader,
+    window_size: usize,
+    window_lon: Option<f64>,
+    window_lat: Option<f64>,
+) -> Result<(usize, usize)> {
+    let (rows, cols) = reader.shape();
+    let ws = window_size.min(rows).min(cols);
+    if let (Some(lon), Some(lat)) = (window_lon, window_lat) {
+        let gt = reader
+            .geo_transform()
+            .context("--window-lon/--window-lat require a georeferenced raster")?;
+        let det = gt[1] * gt[5] - gt[2] * gt[4];
+        if det.abs() <= 1e-15 {
+            bail!("Cannot invert raster geotransform for --window-lon/--window-lat");
+        }
+        let dx = lon - gt[0];
+        let dy = lat - gt[3];
+        let col = (gt[5] * dx - gt[2] * dy) / det;
+        let row = (-gt[4] * dx + gt[1] * dy) / det;
+        let center_col = col.floor() as isize;
+        let center_row = row.floor() as isize;
+        let half = (ws / 2) as isize;
+        let max_row_off = rows.saturating_sub(ws) as isize;
+        let max_col_off = cols.saturating_sub(ws) as isize;
+        let row_off = (center_row - half).clamp(0, max_row_off) as usize;
+        let col_off = (center_col - half).clamp(0, max_col_off) as usize;
+        Ok((row_off, col_off))
+    } else {
+        let row_off = if rows > ws { (rows - ws) / 2 } else { 0 };
+        let col_off = if cols > ws { (cols - ws) / 2 } else { 0 };
+        Ok((row_off, col_off))
+    }
+}
+
+fn reconstruct_nufrost_vector_scene(
+    ordered_bands: &[String],
+    masked_cubes: &BTreeMap<String, Array3<f64>>,
+    masked_ts: &BTreeMap<String, Vec<String>>,
+    target_epoch: f64,
+    config: &NufrostConfig,
+) -> Result<BTreeMap<String, ndarray::Array2<f64>>> {
+    let first_band = ordered_bands
+        .first()
+        .context("NUFROST vector reconstruction requires at least one band")?;
+    let ref_ts = masked_ts
+        .get(first_band)
+        .with_context(|| format!("Timestamps missing for band {first_band}"))?;
+    let first_cube = masked_cubes
+        .get(first_band)
+        .with_context(|| format!("Cube missing for band {first_band}"))?;
+    let (n_times, rows, cols) = first_cube.dim();
+
+    let cube_refs: Vec<&Array3<f64>> = ordered_bands
+        .iter()
+        .map(|band_name| {
+            let cube = masked_cubes
+                .get(band_name)
+                .with_context(|| format!("Cube missing for band {band_name}"))?;
+            let ts = masked_ts
+                .get(band_name)
+                .with_context(|| format!("Timestamps missing for band {band_name}"))?;
+            if ts != ref_ts {
+                bail!("NUFROST vector reconstruction requires aligned timestamps; band {band_name} differs from {first_band}");
+            }
+            if cube.dim() != (n_times, rows, cols) {
+                bail!("NUFROST vector reconstruction requires aligned cube shapes; band {band_name} has {:?}, expected {:?}", cube.dim(), (n_times, rows, cols));
+            }
+            Ok(cube)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut epochs: Vec<f64> = ref_ts
+        .iter()
+        .filter_map(|s| parse_iso8601_to_epoch_seconds(s))
+        .collect();
+    epochs.push(target_epoch);
+    epochs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let ts_days: Vec<f64> = epochs
+        .iter()
+        .map(|&e| (e - epochs[0]) / 86400.0)
+        .collect();
+    let target_day = (target_epoch - epochs[0]) / 86400.0;
+    let masked_days: Vec<f64> = ts_days
+        .iter()
+        .copied()
+        .filter(|&d| (d - target_day).abs() > 1e-9)
+        .collect();
+    if masked_days.len() != n_times {
+        bail!(
+            "NUFROST vector reconstruction timestamp count mismatch: {} masked days for {} cube slices",
+            masked_days.len(),
+            n_times
+        );
+    }
+
+    let n_bands = ordered_bands.len();
+    let mut pred_cube = Array3::<f64>::from_elem((n_bands, rows, cols), f64::NAN);
+    pred_cube
+        .axis_iter_mut(ndarray::Axis(1))
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(r, mut row_out)| {
+            let mut obs_by_band: Vec<Vec<f64>> = (0..n_bands)
+                .map(|_| Vec::with_capacity(n_times))
+                .collect();
+            for c in 0..cols {
+                for obs in obs_by_band.iter_mut() {
+                    obs.clear();
+                }
+                for (bi, cube) in cube_refs.iter().enumerate() {
+                    for ti in 0..n_times {
+                        obs_by_band[bi].push(cube[[ti, r, c]]);
+                    }
+                }
+                let pred = nufrost_pixel_vector(&masked_days, &obs_by_band, target_day, config);
+                for (bi, &val) in pred.iter().enumerate() {
+                    row_out[[bi, c]] = if val.is_finite() { val } else { f64::NAN };
+                }
+            }
+        });
+
+    Ok(ordered_bands
+        .iter()
+        .enumerate()
+        .map(|(bi, band_name)| {
+            (
+                band_name.clone(),
+                pred_cube.index_axis(ndarray::Axis(0), bi).to_owned(),
+            )
+        })
+        .collect())
+}
+
 fn run_full_scene(args: &FullSceneArgs) -> Result<()> {
     if let Some(n) = args.n_jobs {
         rayon::ThreadPoolBuilder::new()
@@ -683,9 +834,8 @@ fn run_full_scene(args: &FullSceneArgs) -> Result<()> {
         for chunk_path in chunk_paths {
             let reader = RasterReader::open(chunk_path)?;
             let cube = if let Some(ws) = args.window_size {
-                let (rows, cols) = reader.shape();
-                let row_off = if rows > ws { (rows - ws) / 2 } else { 0 };
-                let col_off = if cols > ws { (cols - ws) / 2 } else { 0 };
+                let (row_off, col_off) =
+                    full_scene_window_offset(&reader, ws, args.window_lon, args.window_lat)?;
                 read_all_bands_window_offset(&reader, row_off, col_off, ws, ws)?
             } else {
                 read_all_bands(&reader)?
@@ -780,8 +930,16 @@ fn run_full_scene(args: &FullSceneArgs) -> Result<()> {
         let method_str = *method;
         eprintln!("Reconstructing with {method_str}...");
 
-        let predictions: BTreeMap<String, ndarray::Array2<f64>> =
-            // Per-band independent reconstruction for NUFROST, HANTS, and Zhu2015.
+        let predictions: BTreeMap<String, ndarray::Array2<f64>> = if method_str == "nufrost" {
+            reconstruct_nufrost_vector_scene(
+                &ordered_bands,
+                &masked_cubes,
+                &masked_ts,
+                target_epoch,
+                &nufrost_conf,
+            )?
+        } else {
+            // Per-band independent reconstruction for HANTS and Zhu2015 baselines.
             ordered_bands
                 .par_iter()
                 .map(|band_name| {
@@ -865,7 +1023,8 @@ fn run_full_scene(args: &FullSceneArgs) -> Result<()> {
 
                     (band_name.clone(), pred)
                 })
-                .collect();
+                .collect()
+        };
 
         // Write merged band stack
         let output_path = build_scene_stack_output_path(
@@ -906,6 +1065,8 @@ fn run_full_scene(args: &FullSceneArgs) -> Result<()> {
         "min_valid_ratio": args.min_valid_ratio,
         "late_fraction": args.late_fraction,
         "window_size": args.window_size,
+        "window_lon": args.window_lon,
+        "window_lat": args.window_lat,
         "generated_at": now_iso,
     });
 

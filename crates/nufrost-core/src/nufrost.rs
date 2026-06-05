@@ -1750,6 +1750,281 @@ pub fn nufrost_pixel(
     (pred * y_scale, n_freqs)
 }
 
+/// Fit one vector-valued NUFROST model to a multi-band pixel trajectory.
+///
+/// `observations[b][i]` is the value of band `b` at timestamp `ts_days[i]`.
+/// All bands share one timestamp grid, one vector NUFFT frequency set, one
+/// design matrix, and one group fused-lasso step trajectory. The returned
+/// vector has one prediction per input band.
+pub fn nufrost_pixel_vector(
+    ts_days: &[f64],
+    observations: &[Vec<f64>],
+    target_day: f64,
+    config: &NufrostConfig,
+) -> Vec<f64> {
+    let n_times = ts_days.len();
+    let n_bands = observations.len();
+    let mut result = vec![f64::NAN; n_bands];
+
+    if n_times == 0 || n_bands == 0 {
+        return result;
+    }
+    for obs in observations {
+        if obs.len() != n_times {
+            return result;
+        }
+    }
+
+    let (ts_sec, target_sec) = maybe_days_to_seconds(ts_days, target_day);
+    let min_obs = config.min_obs as usize;
+    let y_scale = 10000.0;
+
+    let base_mask: Vec<bool> = (0..n_times)
+        .map(|i| {
+            ts_sec[i].is_finite()
+                && observations.iter().all(|band| band[i].is_finite())
+        })
+        .collect();
+    let n_use = base_mask.iter().filter(|&&m| m).count();
+    if n_use < min_obs.max(3) {
+        return result;
+    }
+
+    let t_use: Vec<f64> = ts_sec
+        .iter()
+        .zip(base_mask.iter())
+        .filter(|(_, &m)| m)
+        .map(|(&t, _)| t)
+        .collect();
+    let t_min = t_use.iter().copied().fold(f64::INFINITY, f64::min);
+    let t_rel: Vec<f64> = t_use.iter().map(|&t| t - t_min).collect();
+    let t_rel_mean = nanmean(&t_rel);
+    let tspan = t_rel.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+        - t_rel.iter().copied().fold(f64::INFINITY, f64::min);
+    if !tspan.is_finite() || tspan <= 0.0 {
+        return result;
+    }
+
+    let mut y_mat = Array2::<f64>::zeros((n_use, n_bands));
+    for b in 0..n_bands {
+        let mut row = 0;
+        for i in 0..n_times {
+            if base_mask[i] {
+                y_mat[[row, b]] = observations[b][i] / y_scale;
+                row += 1;
+            }
+        }
+    }
+
+    let mut t_sorted = t_rel.clone();
+    t_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let dt_pos: Vec<f64> = t_sorted
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .filter(|&d| d > 0.0)
+        .collect();
+    let dt_med = if dt_pos.is_empty() {
+        tspan / n_use as f64
+    } else {
+        nanmedian(&dt_pos)
+    };
+    let fmax = 0.5 / dt_med.max(1e-12);
+
+    // Vector-valued spectrum: standardize each band, compute its type-1
+    // spectrum on the shared timestamps, then sum powers across bands.
+    let mut vector_freqs: Vec<f64> = Vec::new();
+    let mut vector_power: Vec<f64> = Vec::new();
+    for b in 0..n_bands {
+        let col: Vec<f64> = y_mat.column(b).iter().map(|&v| v * y_scale).collect();
+        let mu = nanmean(&col);
+        let var = col
+            .iter()
+            .filter(|v| v.is_finite())
+            .map(|&v| {
+                let d = v - mu;
+                d * d
+            })
+            .sum::<f64>()
+            / (n_use as f64).max(1.0);
+        let sigma = var.sqrt().max(1e-6);
+        let z: Vec<f64> = col.iter().map(|&v| (v - mu) / sigma).collect();
+        let (freqs, power) = compute_spectrum_direct(&t_rel, &z, config.modes as usize, 1.0);
+        if vector_freqs.is_empty() {
+            vector_freqs = freqs;
+            vector_power = vec![0.0; power.len()];
+        }
+        for (dst, p) in vector_power.iter_mut().zip(power.iter()) {
+            if p.is_finite() {
+                *dst += *p;
+            }
+        }
+    }
+
+    if vector_freqs.is_empty() || vector_power.is_empty() {
+        return result;
+    }
+
+    let selection_mode = match config.frequency_selection.as_str() {
+        "preferred" => "preferred",
+        "hybrid" | "shared_spectral" => "hybrid",
+        _ => "spectral",
+    };
+    let preferred_freqs = parse_preferred_frequencies(&config.preferred_periods_days);
+    let freqs_sel = select_frequencies(
+        &vector_freqs,
+        &vector_power,
+        fmax,
+        selection_mode,
+        &preferred_freqs,
+        config.preferred_top_k as usize,
+        config.num_peaks as usize,
+        config.spectral_top_k as usize,
+        config.spectral_merge_tol,
+        config.power_cum,
+        config.ignore_dc_hz,
+        config.refine_peaks,
+    );
+    if freqs_sel.is_empty() {
+        return result;
+    }
+
+    let x = make_design_matrix(&t_rel, &freqs_sel, config.include_trend, true);
+    if x.ncols() == 0 {
+        return result;
+    }
+
+    let weights = difference_weights(&t_use, config.step_dt_weighting);
+    let mut theta = Array2::<f64>::zeros((x.ncols(), n_bands));
+    for b in 0..n_bands {
+        let y_b = y_mat.column(b).to_owned();
+        if let Some(beta) = tiered_ridge_solve(
+            &x,
+            &y_b,
+            &freqs_sel,
+            config.ridge_lam,
+            config.lambda_high,
+            config.low_freq_period_days,
+            config.freq_weight,
+            true,
+            config.include_trend,
+            None,
+            None,
+        ) {
+            for j in 0..x.ncols() {
+                theta[[j, b]] = beta[j];
+            }
+        }
+    }
+
+    let mut u_mat = Array2::<f64>::zeros((n_use, n_bands));
+    for _ in 0..(config.max_outer_iter as usize) {
+        let theta_old = theta.clone();
+        let u_old = u_mat.clone();
+
+        let y_hat = x.dot(&theta);
+        let residual = &y_mat - &y_hat;
+        u_mat = group_fused_lasso_admm(
+            &residual,
+            config.lambda_step,
+            &weights,
+            config.admm_rho,
+            config.admm_max_iter as usize,
+            config.admm_tol,
+        );
+        for b in 0..n_bands {
+            let mean = u_mat.column(b).sum() / n_use as f64;
+            if mean.is_finite() {
+                for i in 0..n_use {
+                    u_mat[[i, b]] -= mean;
+                }
+            }
+        }
+
+        let y_minus_u = &y_mat - &u_mat;
+        for b in 0..n_bands {
+            let y_b = y_minus_u.column(b).to_owned();
+            if let Some(beta) = tiered_ridge_solve(
+                &x,
+                &y_b,
+                &freqs_sel,
+                config.ridge_lam,
+                config.lambda_high,
+                config.low_freq_period_days,
+                config.freq_weight,
+                true,
+                config.include_trend,
+                None,
+                None,
+            ) {
+                for j in 0..x.ncols() {
+                    theta[[j, b]] = beta[j];
+                }
+            }
+        }
+
+        let delta_theta: f64 = theta
+            .iter()
+            .zip(theta_old.iter())
+            .map(|(&a, &b)| {
+                let d = a - b;
+                d * d
+            })
+            .sum();
+        let delta_u: f64 = u_mat
+            .iter()
+            .zip(u_old.iter())
+            .map(|(&a, &b)| {
+                let d = a - b;
+                d * d
+            })
+            .sum();
+        let denom = theta_old.iter().map(|&v| v * v).sum::<f64>().sqrt()
+            + u_old.iter().map(|&v| v * v).sum::<f64>().sqrt();
+        if (delta_theta + delta_u).sqrt() / denom.max(1e-12) < config.outer_tol {
+            break;
+        }
+    }
+
+    let t_star_rel = target_sec - t_min;
+    let mut basis = Array1::<f64>::zeros(x.ncols());
+    basis[0] = 1.0;
+    let mut idx = 1usize;
+    if config.include_trend {
+        if idx < basis.len() {
+            basis[idx] = t_star_rel - t_rel_mean;
+        }
+        idx += 1;
+    }
+    for &f in &freqs_sel {
+        let omega = 2.0 * PI * f;
+        if idx < basis.len() {
+            basis[idx] = (omega * t_star_rel).cos();
+        }
+        if idx + 1 < basis.len() {
+            basis[idx + 1] = (omega * t_star_rel).sin();
+        }
+        idx += 2;
+    }
+
+    let harmonic = basis.dot(&theta);
+    let seg_idx = match t_use.binary_search_by(|&t| {
+        t.partial_cmp(&target_sec)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }) {
+        Ok(i) => i,
+        Err(i) => {
+            if i == 0 { 0 } else { i - 1 }
+        }
+    }
+    .min(n_use.saturating_sub(1));
+
+    for b in 0..n_bands {
+        result[b] = (harmonic[b] + u_mat[[seg_idx, b]]) * y_scale;
+    }
+
+    result
+}
+
 /// Reconstruct a full raster using NUFROST.
 ///
 /// The GDAL crate supplies raster I/O and the shared per-pixel traversal;
@@ -3019,6 +3294,31 @@ mod tests {
 
         assert!(pred.is_finite());
         assert!(n_freqs >= 1);
+    }
+
+    #[test]
+    fn test_nufrost_pixel_vector_returns_finite_multiband_prediction() {
+        let mut config = default_nufrost_config();
+        config.frequency_selection = "shared_spectral".to_string();
+        config.lambda_step = 1e30;
+        config.min_obs = 8;
+
+        let n = 36;
+        let t_days: Vec<f64> = (0..n).map(|i| i as f64 * 10.0).collect();
+        let target_day = 180.0;
+        let mut observations = vec![Vec::with_capacity(n); 3];
+        for &t in &t_days {
+            let seasonal = (2.0 * PI * t / 120.0).sin();
+            observations[0].push(1000.0 + 100.0 * seasonal);
+            observations[1].push(1500.0 + 150.0 * seasonal);
+            observations[2].push(2200.0 + 220.0 * seasonal);
+        }
+
+        let pred = nufrost_pixel_vector(&t_days, &observations, target_day, &config);
+
+        assert_eq!(pred.len(), 3);
+        assert!(pred.iter().all(|v| v.is_finite()));
+        assert!(pred[0] < pred[1] && pred[1] < pred[2]);
     }
 
     #[test]
