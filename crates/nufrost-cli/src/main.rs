@@ -3,11 +3,12 @@
 // raster GeoTIFF input via nufrost-gdal.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Arg, ArgAction, Command};
 use ndarray::Array3;
 use rayon::prelude::*;
 use serde::de::DeserializeOwned;
@@ -32,180 +33,262 @@ use nufrost_gdal::{
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  CLI definition (clap derive)
+//  CLI definition
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// NUFROST time-series reconstruction CLI.
-///
-/// Runs one of three algorithms on input time-series data.
-/// Supports single-pixel NPZ fixtures and raster GeoTIFF input.
-#[derive(Parser, Debug)]
-#[command(
-    name = "nufrost-cli",
-    version = env!("CARGO_PKG_VERSION"),
-    about = "NUFROST / HANTS / Zhu2015 time-series reconstruction CLI",
-    long_about = None,
-    after_help = "Examples:\n  \
-                  nufrost-cli nufrost --data fixture.npz --target-time 372.7\n  \
-                  nufrost-cli hants --config hants.json --data fixture.npz\n  \
-                  nufrost-cli zhu2015 --data fixture.npz -t 372.7 -o pred.txt\n  \
-                  nufrost-cli nufrost --input-geotiff input.tif --output pred.tif\n  \
-                  nufrost-cli hants --input-geotiff input.tif -o pred.tif\n  \
-                  nufrost-cli zhu2015 --input-geotiff input.tif -o pred.tif",
-)]
+#[derive(Debug)]
 struct Cli {
-    #[command(subcommand)]
     algorithm: Algorithm,
 }
 
-/// Available reconstruction algorithms.
-#[derive(Subcommand, Debug)]
+#[derive(Debug)]
 enum Algorithm {
-    /// Run NUFROST (Non-Uniform FFT-based) reconstruction.
-    ///
-    /// Uses NUFFT frequency discovery + Huber-ridge IRLS fitting.
     Nufrost(NufrostArgs),
-
-    /// Run HANTS (Harmonic ANalysis of Time Series) reconstruction.
-    ///
-    /// Iterative harmonic fitting with outlier rejection.
     Hants(HantsArgs),
-
-    /// Run Zhu2015 (Lasso-based synthetic Landsat) reconstruction.
-    ///
-    /// Piecewise harmonic fitting with L1-regularised LASSO.
-    #[command(name = "zhu2015")]
     Zhu2015(Zhu2015Args),
-
-    /// Run full-scene reconstruction for a location with all three algorithms.
-    ///
-    /// Discovers band stacks, selects a shared target timestamp, and runs
-    /// NUFROST / HANTS / Zhu2015 per-band in parallel.  Writes merged
-    /// multi-band prediction stacks, ground truth, and a summary JSON.
-    #[command(name = "full-scene")]
     FullScene(FullSceneArgs),
 }
 
-/// Full-scene reconstruction args — runs all three algorithms for one
-/// (lon, lat) location, discovering band stacks and writing merged outputs
-/// in the Python-compatible directory layout.
-#[derive(clap::Args, Debug)]
+#[derive(Debug)]
 struct FullSceneArgs {
-    /// Source name (sentinel-2 or hls).
-    #[arg(long)]
     source_name: String,
-
-    /// Longitude.
-    #[arg(long)]
     lon: f64,
-
-    /// Latitude.
-    #[arg(long)]
     lat: f64,
-
-    /// Output root directory.
-    #[arg(long, default_value = "data/output")]
     output_root: PathBuf,
-
-    /// Data root directory.
-    #[arg(long, default_value = "data")]
     data_root: PathBuf,
-
-    /// Comma-separated list of methods to run.
-    #[arg(long, default_value = "nufrost,hants,zhu2015")]
     methods: String,
-
-    /// Number of threads.
-    #[arg(long)]
     n_jobs: Option<usize>,
-
-    /// Optional crop window size in pixels.
-    #[arg(long)]
     window_size: Option<usize>,
-
-    /// Minimum valid ratio for target selection.
-    #[arg(long, default_value = "0.9")]
     min_valid_ratio: f64,
-
-    /// Late fraction for target selection.
-    #[arg(long, default_value = "0.25")]
     late_fraction: f64,
-
-    /// Frequency selection mode override for NUFROST config.
-    #[arg(long)]
+    #[allow(dead_code)]
     frequency_selection: Option<String>,
 }
 
-#[derive(clap::Args, Debug)]
+#[derive(Debug)]
 struct NufrostArgs {
-    /// Path to NUFROST JSON config file.
-    ///
-    /// If omitted, uses built-in defaults matching Python config/nufrost.json.
-    #[arg(short, long)]
     config: Option<PathBuf>,
-
-    #[clap(flatten)]
     shared: SharedArgs,
 }
 
-#[derive(clap::Args, Debug)]
+#[derive(Debug)]
 struct HantsArgs {
-    /// Path to HANTS JSON config file.
-    ///
-    /// If omitted, uses built-in defaults matching Python config/hants.json.
-    #[arg(short, long)]
     config: Option<PathBuf>,
-
-    #[clap(flatten)]
     shared: SharedArgs,
 }
 
-#[derive(clap::Args, Debug)]
+#[derive(Debug)]
 struct Zhu2015Args {
-    /// Path to Zhu2015 JSON config file.
-    ///
-    /// If omitted, uses built-in defaults matching Python config/zhu2015.json.
-    #[arg(short, long)]
     config: Option<PathBuf>,
-
-    #[clap(flatten)]
     shared: SharedArgs,
 }
 
-/// Shared args for all three algorithm arg structs.
-#[derive(clap::Args, Debug)]
+#[derive(Debug)]
 struct SharedArgs {
-    /// Path to NPZ fixture file (single-pixel mode).
-    ///
-    /// Expected keys: `timestamps_days`, `observations`, `target_time_day`.
-    /// Mutually exclusive with `--input-geotiff`.
-    #[arg(short, long)]
     data: Option<PathBuf>,
-
-    /// Path to input GeoTIFF (raster reconstruction mode).
-    ///
-    /// Multi-band GeoTIFF where each band is a timestamp.
-    /// Mutually exclusive with `--data`.
-    #[arg(long = "input-geotiff")]
     input_geotiff: Option<PathBuf>,
-
-    /// Target time in days since first observation.
-    ///
-    /// Overrides the `target_time_day` value embedded in a fixture NPZ,
-    /// or the auto-detected last-band timestamp in GeoTIFF mode.
-    #[arg(short = 't', long)]
     target_time: Option<f64>,
-
-    /// Output file path.
-    ///
-    /// In NPZ mode: writes scalar prediction as text.
-    /// In GeoTIFF mode: writes a single-band output GeoTIFF.
-    #[arg(short, long)]
     output: Option<PathBuf>,
-
-    /// Number of threads for parallel raster processing.
-    #[arg(long, default_value = "1")]
+    #[allow(dead_code)]
     threads: usize,
+}
+
+impl Cli {
+    fn parse() -> Self {
+        Self::try_parse_from(std::env::args_os()).unwrap_or_else(|err| err.exit())
+    }
+
+    fn try_parse_from<I, T>(args: I) -> std::result::Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString> + Clone,
+    {
+        let matches = Self::command().try_get_matches_from(args)?;
+        let (name, sub) = matches
+            .subcommand()
+            .expect("subcommand_required ensures a subcommand is present");
+        let algorithm = match name {
+            "nufrost" => Algorithm::Nufrost(NufrostArgs {
+                config: sub.get_one::<PathBuf>("config").cloned(),
+                shared: parse_shared_args(sub),
+            }),
+            "hants" => Algorithm::Hants(HantsArgs {
+                config: sub.get_one::<PathBuf>("config").cloned(),
+                shared: parse_shared_args(sub),
+            }),
+            "zhu2015" => Algorithm::Zhu2015(Zhu2015Args {
+                config: sub.get_one::<PathBuf>("config").cloned(),
+                shared: parse_shared_args(sub),
+            }),
+            "full-scene" => Algorithm::FullScene(FullSceneArgs {
+                source_name: sub.get_one::<String>("source_name").cloned().unwrap(),
+                lon: *sub.get_one::<f64>("lon").unwrap(),
+                lat: *sub.get_one::<f64>("lat").unwrap(),
+                output_root: sub.get_one::<PathBuf>("output_root").cloned().unwrap(),
+                data_root: sub.get_one::<PathBuf>("data_root").cloned().unwrap(),
+                methods: sub.get_one::<String>("methods").cloned().unwrap(),
+                n_jobs: sub.get_one::<usize>("n_jobs").copied(),
+                window_size: sub.get_one::<usize>("window_size").copied(),
+                min_valid_ratio: *sub.get_one::<f64>("min_valid_ratio").unwrap(),
+                late_fraction: *sub.get_one::<f64>("late_fraction").unwrap(),
+                frequency_selection: sub.get_one::<String>("frequency_selection").cloned(),
+            }),
+            _ => unreachable!("clap accepted an unknown subcommand: {name}"),
+        };
+        Ok(Self { algorithm })
+    }
+
+    fn command() -> Command {
+        Command::new("nufrost-cli")
+            .version(env!("CARGO_PKG_VERSION"))
+            .about("NUFROST / HANTS / Zhu2015 time-series reconstruction CLI")
+            .after_help(
+                "Examples:\n  \
+                 nufrost-cli nufrost --data fixture.npz --target-time 372.7\n  \
+                 nufrost-cli hants --config hants.json --data fixture.npz\n  \
+                 nufrost-cli zhu2015 --data fixture.npz -t 372.7 -o pred.txt\n  \
+                 nufrost-cli nufrost --input-geotiff input.tif --output pred.tif\n  \
+                 nufrost-cli hants --input-geotiff input.tif -o pred.tif\n  \
+                 nufrost-cli zhu2015 --input-geotiff input.tif -o pred.tif",
+            )
+            .subcommand_required(true)
+            .arg_required_else_help(true)
+            .subcommand(algorithm_command("nufrost", "Run NUFROST reconstruction."))
+            .subcommand(algorithm_command("hants", "Run HANTS reconstruction."))
+            .subcommand(algorithm_command("zhu2015", "Run Zhu2015 reconstruction."))
+            .subcommand(full_scene_command())
+    }
+}
+
+fn parse_shared_args(matches: &clap::ArgMatches) -> SharedArgs {
+    SharedArgs {
+        data: matches.get_one::<PathBuf>("data").cloned(),
+        input_geotiff: matches.get_one::<PathBuf>("input_geotiff").cloned(),
+        target_time: matches.get_one::<f64>("target_time").copied(),
+        output: matches.get_one::<PathBuf>("output").cloned(),
+        threads: matches.get_one::<usize>("threads").copied().unwrap_or(1),
+    }
+}
+
+fn algorithm_command(name: &'static str, about: &'static str) -> Command {
+    Command::new(name)
+        .about(about)
+        .arg(
+            Arg::new("config")
+                .short('c')
+                .long("config")
+                .value_name("PATH")
+                .value_parser(clap::value_parser!(PathBuf)),
+        )
+        .args(shared_cli_args())
+}
+
+fn shared_cli_args() -> Vec<Arg> {
+    vec![
+        Arg::new("data")
+            .short('d')
+            .long("data")
+            .value_name("PATH")
+            .value_parser(clap::value_parser!(PathBuf)),
+        Arg::new("input_geotiff")
+            .long("input-geotiff")
+            .value_name("PATH")
+            .value_parser(clap::value_parser!(PathBuf)),
+        Arg::new("target_time")
+            .short('t')
+            .long("target-time")
+            .value_name("DAYS")
+            .value_parser(clap::value_parser!(f64)),
+        Arg::new("output")
+            .short('o')
+            .long("output")
+            .value_name("PATH")
+            .value_parser(clap::value_parser!(PathBuf)),
+        Arg::new("threads")
+            .long("threads")
+            .value_name("N")
+            .default_value("1")
+            .value_parser(clap::value_parser!(usize)),
+    ]
+}
+
+fn full_scene_command() -> Command {
+    Command::new("full-scene")
+        .about("Run full-scene reconstruction for one location.")
+        .arg(
+            Arg::new("source_name")
+                .long("source-name")
+                .required(true)
+                .value_name("NAME")
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("lon")
+                .long("lon")
+                .required(true)
+                .value_name("LON")
+                .value_parser(clap::value_parser!(f64)),
+        )
+        .arg(
+            Arg::new("lat")
+                .long("lat")
+                .required(true)
+                .value_name("LAT")
+                .value_parser(clap::value_parser!(f64)),
+        )
+        .arg(
+            Arg::new("output_root")
+                .long("output-root")
+                .value_name("PATH")
+                .default_value("data/output")
+                .value_parser(clap::value_parser!(PathBuf)),
+        )
+        .arg(
+            Arg::new("data_root")
+                .long("data-root")
+                .value_name("PATH")
+                .default_value("data")
+                .value_parser(clap::value_parser!(PathBuf)),
+        )
+        .arg(
+            Arg::new("methods")
+                .long("methods")
+                .value_name("LIST")
+                .default_value("nufrost,hants,zhu2015")
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("n_jobs")
+                .long("n-jobs")
+                .value_name("N")
+                .value_parser(clap::value_parser!(usize)),
+        )
+        .arg(
+            Arg::new("window_size")
+                .long("window-size")
+                .value_name("PX")
+                .value_parser(clap::value_parser!(usize)),
+        )
+        .arg(
+            Arg::new("min_valid_ratio")
+                .long("min-valid-ratio")
+                .value_name("RATIO")
+                .default_value("0.9")
+                .value_parser(clap::value_parser!(f64)),
+        )
+        .arg(
+            Arg::new("late_fraction")
+                .long("late-fraction")
+                .value_name("RATIO")
+                .default_value("0.25")
+                .value_parser(clap::value_parser!(f64)),
+        )
+        .arg(
+            Arg::new("frequency_selection")
+                .long("frequency-selection")
+                .value_name("MODE")
+                .action(ArgAction::Set),
+        )
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -878,7 +961,6 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
 
     // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -1090,8 +1172,6 @@ mod tests {
     /// FAILS now (help text includes them) → will PASS after T6 removes them.
     #[test]
     fn full_scene_help_omits_shared_pool_flags() {
-        use clap::CommandFactory;
-        // Build the top-level command then find the `full-scene` subcommand.
         let mut cmd = Cli::command();
         let full_scene_cmd = cmd
             .find_subcommand_mut("full-scene")
