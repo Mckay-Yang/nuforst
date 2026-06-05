@@ -2,26 +2,34 @@
 
 ## Project-Specific Notes
 
-- This is a notebook-first research repo. Real user workflows start in `notebooks/`, not a CLI or packaged app.
-- The public Python entrypoints are re-exported from `src/__init__.py`: `reconstruct_nufrost`, `reconstruct_zhu2015`, `reconstruct_hants`, `RSCube`, and `build_args`.
+- This is now a Rust-first research repo. The active implementation lives under `crates/`.
 - Treat `NUFROST`, `Zhu2015`, and `HANTS` as three separate reconstruction algorithms. `Zhu2015` and `HANTS` are comparison baselines, not sub-parts of NUFROST.
-- In prose and docs, write the algorithm name as `NUFROST`; keep code identifiers lowercase (`src/nufrost.py`, `reconstruct_nufrost`).
+- In prose and docs, write the algorithm name as `NUFROST`; keep Rust crate identifiers lowercase/kebab-case (`nufrost-core`, `hants-core`, `zhu2015-core`).
+
+## Rust Layout
+
+- `crates/gdal`: GeoTIFF/VRT I/O, timestamp parsing, full-scene helpers, generic raster traversal.
+- `crates/nufrost-core`: NUFROST algorithm and NUFFT/fitting logic.
+- `crates/hants-core`: HANTS baseline algorithm.
+- `crates/zhu2015-core`: Zhu2015 baseline algorithm.
+- `crates/cli`: command-line entrypoint.
+- `crates/nufrost-py`: optional PyO3 bindings.
+
+Dependency direction:
+
+- `gdal` is independent and must not depend on algorithm crates.
+- `nufrost-core`, `hants-core`, and `zhu2015-core` may depend on `gdal`.
+- `cli` depends on `gdal` and all three algorithm crates.
 
 ## Config And Data
 
-- Runtime config is centered in `config/config.yaml` and `config/settings.py`.
-- `build_args(overrides=...)` merges Python overrides on top of YAML defaults. CLI parsing uses YAML as parser defaults, so precedence is Python overrides > CLI flags > YAML.
-- If `target_time` is omitted, `build_args()` falls back to `start_time`.
-- `find_image_chunks()` returns a `List[str]`, usually a one-element list containing the final VRT path. Do not treat it as a single string.
-- `find_image_chunks()` writes cached VRTs under `<cache_dir>/vrts/`.
-- `RSCube._read_tif()` only reads the top-left `512x512` window of each source raster for memory safety.
-- Default caches are `data/cache/local` for local runs and `data/cache/colab` for Colab-oriented notebooks.
+- Runtime algorithm defaults are JSON files under `config/`.
+- Rust parity fixtures live under `tests/fixtures/rust_parity/`.
+- Real imagery and generated outputs live under `data/`.
 
 ## Output And Verification
 
-- Output shapes differ by algorithm: `NUFROST` and `HANTS` write single-band GeoTIFFs; `Zhu2015` writes a 2-band GeoTIFF with prediction + QA.
-- `environment.yml` is the full working environment for notebooks and Earth Engine tooling; `requirements.txt` is only the minimal algorithm/runtime set.
-- There is no lint, formatter, typecheck, pre-commit, task runner, or CI config in the repo.
-- The only checked-in test source is `tests/test_data_loader.py`. It hardcodes this machine's absolute `data/test_sample` path and ends with `breakpoint()`, so do not assume `pytest tests/` is a clean unattended smoke test on another machine.
-- `.vscode/settings.json` is configured to run `pytest tests`.
-- `temp_debug/` contains one-off experiments and validation scripts; do not treat it as stable workflow or authoritative test coverage.
+- Use `cargo check --workspace` for compile verification.
+- Use `cargo test -p gdal@0.1.0 --lib` for the local `gdal` crate because the workspace also depends on upstream `gdal`.
+- GDAL-linked tests may need `DYLD_LIBRARY_PATH=/opt/homebrew/Caskroom/miniforge/base/envs/geo-science/lib` on this machine.
+- Python scripts, notebooks, and pytest tests have been removed from the active workflow. Future plotting scripts should be rebuilt around Rust outputs.

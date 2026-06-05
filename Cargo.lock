@@ -609,6 +609,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
+name = "cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "gdal 0.1.0",
+ "hants-core",
+ "ndarray",
+ "ndarray-npy",
+ "nufrost-core",
+ "rayon",
+ "serde",
+ "serde_json",
+ "zhu2015-core",
+]
+
+[[package]]
 name = "cli-table"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1145,6 +1163,21 @@ dependencies = [
 
 [[package]]
 name = "gdal"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "approx",
+ "chrono",
+ "gdal 0.19.0",
+ "gdal-sys",
+ "ndarray",
+ "rayon",
+ "regex",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "gdal"
 version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e26906e99e54000acd7f6328f85d161e6280390b9b596e06dbed0637a6e29717"
@@ -1263,6 +1296,20 @@ dependencies = [
  "cfg-if",
  "crunchy",
  "zerocopy",
+]
+
+[[package]]
+name = "hants-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "approx",
+ "gdal 0.1.0",
+ "ndarray",
+ "ndarray-npy",
+ "rayon",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2010,27 +2057,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "nufrost-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "ndarray",
- "ndarray-npy",
- "nufrost-core",
- "nufrost-gdal",
- "rayon",
- "serde_json",
-]
-
-[[package]]
 name = "nufrost-core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "approx",
  "chrono",
  "criterion",
+ "gdal 0.1.0",
  "ndarray",
  "ndarray-npy",
  "rayon",
@@ -2040,31 +2074,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "nufrost-gdal"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "approx",
- "chrono",
- "gdal",
- "gdal-sys",
- "ndarray",
- "nufrost-core",
- "rayon",
- "regex",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "nufrost-py"
 version = "0.1.0"
 dependencies = [
+ "hants-core",
  "maturin",
  "nufrost-core",
  "numpy",
  "pyo3",
  "rayon",
  "serde_json",
+ "zhu2015-core",
 ]
 
 [[package]]
@@ -4525,6 +4545,20 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "zhu2015-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "approx",
+ "gdal 0.1.0",
+ "ndarray",
+ "ndarray-npy",
+ "rayon",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
