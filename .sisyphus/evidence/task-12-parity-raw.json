@@ -1,0 +1,71 @@
+{
+  "simple_harmonic": {
+    "nufrost": {
+      "expected": 0.783013205623105,
+      "rust": 0.7829850861206389,
+      "abs_error": 2.8119502466061874e-05,
+      "rel_error": 3.59119134442758e-05
+    },
+    "hants": {
+      "expected": 0.9540284232303223,
+      "rust": 0.9540284232303223,
+      "abs_error": 0.0,
+      "rel_error": 0.0
+    },
+    "zhu2015": {
+      "expected": 0.6048247648259377,
+      "rust": 0.6048247648259377,
+      "abs_error": 0.0,
+      "rel_error": 0.0,
+      "qa_match": true,
+      "qa_expected": 3,
+      "qa_rust": 3
+    }
+  },
+  "gaps_outliers": {
+    "nufrost": {
+      "expected": -0.3303750754033314,
+      "rust": -0.3606141021636457,
+      "abs_error": 0.030239026760314314,
+      "rel_error": 0.09152938284886546
+    },
+    "hants": {
+      "expected": -0.14519642941721067,
+      "rust": -0.14519642941721056,
+      "abs_error": 1.1102230246251565e-16,
+      "rel_error": 7.64635211128379e-16
+    },
+    "zhu2015": {
+      "expected": -0.06616195620644721,
+      "rust": -0.06616174213862497,
+      "abs_error": 2.1406782224620002e-07,
+      "rel_error": 3.23551228712521e-06,
+      "qa_match": true,
+      "qa_expected": 3,
+      "qa_rust": 3
+    }
+  },
+  "step_break": {
+    "nufrost": {
+      "expected": 0.8062432647666765,
+      "rust": 0.6385735240041918,
+      "abs_error": 0.16766974076248475,
+      "rel_error": 0.20796420644953567
+    },
+    "hants": {
+      "expected": 0.5468474615406969,
+      "rust": 0.5468474615406969,
+      "abs_error": 0.0,
+      "rel_error": 0.0
+    },
+    "zhu2015": {
+      "expected": 0.5932066628940358,
+      "rust": 0.593206662894036,
+      "abs_error": 2.220446049250313e-16,
+      "rel_error": 3.743123919777938e-16,
+      "qa_match": true,
+      "qa_expected": 3,
+      "qa_rust": 3
+    }
+  }
+}

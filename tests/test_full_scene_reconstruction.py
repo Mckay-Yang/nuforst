@@ -3,6 +3,7 @@ from pathlib import Path
 
 import numpy as np
 import rasterio
+import src.full_scene_reconstruction.pipeline as pipeline
 
 from src.full_scene_reconstruction import (
     build_ground_truth_output_path,
@@ -64,6 +65,59 @@ def test_select_shared_target_timestamp_prefers_latest_complete_candidate() -> N
     )
 
     assert chosen == "2024-03-01T00:00:00"
+
+
+def test_mask_invalid_reflectance_values_uses_strict_open_range() -> None:
+    cube = np.array(
+        [[[-1.0, 0.0, 0.1], [9999.9, 10000.0, 10001.0]]],
+        dtype=np.float32,
+    )
+
+    masked = pipeline._mask_invalid_reflectance_values(cube)
+
+    assert np.isnan(masked[0, 0, 0])
+    assert np.isnan(masked[0, 0, 1])
+    assert masked[0, 0, 2] == np.float32(0.1)
+    assert masked[0, 1, 0] == np.float32(9999.9)
+    assert np.isnan(masked[0, 1, 1])
+    assert np.isnan(masked[0, 1, 2])
+
+
+def test_crop_loaded_cube_uses_center_window() -> None:
+    cube = np.arange(25, dtype=np.float32).reshape(1, 5, 5)
+
+    cropped = pipeline._crop_loaded_cube({"cube": cube}, window_size=3)
+
+    assert np.array_equal(
+        cropped["cube"],
+        np.array([[[6, 7, 8], [11, 12, 13], [16, 17, 18]]], dtype=np.float32),
+    )
+
+
+def test_build_shared_frequency_pool_uses_cross_band_signal() -> None:
+    t_sec = np.arange(0, 4 * 365, 30, dtype=np.float64) * 86400.0
+    target_freq = 1.0 / (365.25 * 86400.0)
+    phase = 2 * np.pi * target_freq * t_sec
+    cube_a = np.stack(
+        [np.full((2, 2), 1000.0 + 100.0 * np.sin(p), dtype=np.float32) for p in phase],
+        axis=0,
+    )
+    cube_b = np.stack(
+        [np.full((2, 2), 2000.0 + 150.0 * np.sin(p), dtype=np.float32) for p in phase],
+        axis=0,
+    )
+
+    freqs = pipeline.build_shared_frequency_pool(
+        {"B2": cube_a, "B3": cube_b},
+        t_sec,
+        top_k=1,
+        nufft_modes=128,
+        power_cum=1.0,
+        ignore_dc_hz=1e-10,
+    )
+
+    assert freqs.shape == (1,)
+    assert abs(float(freqs[0]) - target_freq) / target_freq < 0.2
 
 
 def test_discover_location_band_stacks_for_sentinel2_groups_by_band(tmp_path: Path) -> None:
@@ -151,8 +205,8 @@ def test_build_output_path_includes_timestamp_and_method(tmp_path: Path) -> None
         lat=29.7733,
     )
 
-    assert output_path.parent == tmp_path / "sentinel-2_recon" / "94.2605_29.7733"
-    assert output_path.name == "[nufrost]_sentinel-2_lon94.260500_lat29.773300_2026-01-27T04-19-39.tif"
+    assert output_path.parent == tmp_path / "sentinel-2_recon" / "94.2605_29.7733" / ".partial"
+    assert output_path.name == "[nufrost]_COPERNICUS_S2_HARMONIZED_B2_lon94.2605_lat29.7733_2026-01-27T04-19-39.tif"
 
 
 def test_build_ground_truth_output_path(tmp_path: Path) -> None:
@@ -286,6 +340,107 @@ def test_reconstruct_full_scene_dispatches_methods_with_shared_job_budget(tmp_pa
     assert method_names == ["nufrost", "hants", "zhu2015"]
     assert result["ground_truth_output"].endswith("[ground_truth]_sentinel-2_lon94.260500_lat29.773300_2024-02-01T00-00-00.tif")
     assert result["merged_prediction_outputs"]["nufrost"].endswith("[nufrost]_sentinel-2_lon94.260500_lat29.773300_2024-02-01T00-00-00_prediction.tif")
+
+
+def test_reconstruct_zhu2015_from_cube_returns_prediction_only(monkeypatch) -> None:
+    from src.full_scene_reconstruction.pipeline import reconstruct_zhu2015_from_cube
+
+    def fake_fit_predict_pixel_segments(t_days, y, target_t_day, lasso_alpha=0.001):
+        return 42.0
+
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.fit_predict_pixel_segments", fake_fit_predict_pixel_segments)
+    cube = np.stack(
+        [
+            np.full((2, 3), 1.0, dtype=np.float32),
+            np.full((2, 3), 2.0, dtype=np.float32),
+        ],
+        axis=0,
+    )
+    timestamps = np.asarray(["2024-01-01T00:00:00", "2024-02-01T00:00:00"], dtype="U32")
+
+    output = reconstruct_zhu2015_from_cube(cube, timestamps, "2024-02-01T00:00:00", n_jobs=1)
+
+    assert output.shape == (2, 3)
+    assert np.all(output == 42.0)
+
+
+def test_reconstruct_full_scene_reuses_existing_baseline_and_fills_missing_without_zhu_qa(tmp_path: Path, monkeypatch) -> None:
+    from src.full_scene_reconstruction import reconstruct_full_scene_for_location
+
+    calls = []
+    lon = 94.2605
+    lat = 29.7733
+    target_time = "2024-02-01T00:00:00"
+    meta = {
+        "transform": (1.0, 0.0, 10.0, 0.0, -1.0, 20.0, 0.0, 0.0, 1.0),
+        "crs_wkt": None,
+    }
+    existing_hants_path = build_scene_stack_output_path(
+        output_root=tmp_path,
+        method_name="hants",
+        source_name="sentinel-2",
+        lon=lon,
+        lat=lat,
+        target_time=target_time,
+        suffix="prediction",
+    )
+    write_band_stack(existing_hants_path, {"B2": np.full((2, 2), 20.0, dtype=np.float32)}, ["B2"], meta)
+
+    def fake_discover_location_band_stacks(*args, **kwargs):
+        return {"B2": [tmp_path / "B2.vrt"]}
+
+    def fake_choose_shared_target_timestamp(*args, **kwargs):
+        return target_time, {"B2": {target_time: 1.0}}
+
+    class FakeRSCube:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def load(self):
+            return {
+                "cube": np.ma.array(
+                    [
+                        [[1.0, 2.0], [3.0, 4.0]],
+                        [[5.0, 6.0], [7.0, 8.0]],
+                    ],
+                    dtype=np.float32,
+                ),
+                "timestamps": np.asarray(["2024-01-01T00:00:00", target_time], dtype="U32"),
+                **meta,
+            }
+
+    def fake_nufrost_core(cube, timestamps, target_time, args=None, **kwargs):
+        calls.append("nufrost")
+        return np.full((cube.shape[1], cube.shape[2]), 10.0, dtype=np.float32)
+
+    def fake_reconstruct_hants(cube, timestamps, target_time, **kwargs):
+        calls.append("hants")
+        return np.full((cube.shape[1], cube.shape[2]), 21.0, dtype=np.float32)
+
+    def fake_reconstruct_zhu2015(cube, timestamps, target_time, **kwargs):
+        calls.append("zhu2015")
+        return np.full((cube.shape[1], cube.shape[2]), 30.0, dtype=np.float32)
+
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.discover_location_band_stacks", fake_discover_location_band_stacks)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.choose_shared_target_timestamp", fake_choose_shared_target_timestamp)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.RSCube", FakeRSCube)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.nufrost_core", fake_nufrost_core)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.reconstruct_hants_from_cube", fake_reconstruct_hants)
+    monkeypatch.setattr("src.full_scene_reconstruction.pipeline.reconstruct_zhu2015_from_cube", fake_reconstruct_zhu2015)
+
+    result = reconstruct_full_scene_for_location(
+        source_name="sentinel-2",
+        lon=lon,
+        lat=lat,
+        output_root=tmp_path,
+        data_root=tmp_path,
+        methods=("nufrost", "hants", "zhu2015"),
+        n_jobs=1,
+    )
+
+    assert calls == ["nufrost", "zhu2015"]
+    assert result["merged_prediction_outputs"]["hants"] == str(existing_hants_path)
+    assert not list((tmp_path / "sentinel-2_recon" / "94.2605_29.7733").glob("*[zhu2015]*qa*.tif"))
 
 
 def test_reconstruct_full_scene_passes_limited_budget_into_shared_scheduler(tmp_path: Path, monkeypatch) -> None:

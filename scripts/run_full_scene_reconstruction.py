@@ -22,6 +22,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--methods", nargs="+", default=["nufrost", "hants", "zhu2015"])
     parser.add_argument("--n-jobs", type=int, default=-1)
     parser.add_argument("--force-refresh", action="store_true")
+    parser.add_argument("--frequency-selection", type=str, default=None,
+                        help="NUFROST frequency selection: spectral, preferred, hybrid, shared_spectral")
+    parser.add_argument("--spectral-top-k", type=int, default=None)
+    parser.add_argument("--preferred-top-k", type=int, default=None)
+    parser.add_argument("--num-peaks", type=int, default=None)
+    parser.add_argument("--rerun-methods", nargs="+", default=[])
     return parser
 
 
@@ -35,7 +41,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         "methods": tuple(args.methods),
         "n_jobs": args.n_jobs,
         "force_refresh": args.force_refresh,
+        "rerun_methods": tuple(args.rerun_methods),
     }
+    for key in ("frequency_selection", "spectral_top_k", "preferred_top_k", "num_peaks"):
+        val = getattr(args, key, None)
+        if val is not None:
+            common_kwargs[key] = val
     if args.all_coordinates:
         reconstruct_full_scene_for_all_locations(**common_kwargs)
         return 0

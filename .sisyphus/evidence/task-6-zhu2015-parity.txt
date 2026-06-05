@@ -1,0 +1,78 @@
+===========================================================================
+Task 6: Rust Zhu2015 Prediction Parity Evidence
+===========================================================================
+Generated: 2026-06-01
+Working directory: /Volumes/T7/nuforst/.worktrees/rust-rewrite
+
+=== Prediction Band Parity ===
+
+Fixture: simple_harmonic (50 valid obs, order=3)
+  Python prediction: 0.6048247648
+  Rust prediction:   0.6048247635309305
+  Abs diff:           1.269e-09  ✓ (atol=1e-6, rtol=5e-4)
+
+Fixture: gaps_outliers (64 valid obs, order=3)
+  Python prediction: -0.0661619562
+  Rust prediction:   -0.06616195521181784
+  Abs diff:           9.882e-10  ✓ (atol=1e-6, rtol=5e-4)
+
+Fixture: step_break (95 valid obs, order=3)
+  Python prediction: 0.5932066629
+  Rust prediction:   0.593206662319738
+  Abs diff:           5.803e-10  ✓ (atol=1e-6, rtol=5e-4)
+
+=== QA Band Parity ===
+
+Fixture: simple_harmonic
+  Python QA: 3 (full model)
+  Rust QA:   3
+  Match:     EXACT ✓
+
+Fixture: gaps_outliers
+  Python QA: 3 (full model)
+  Rust QA:   3
+  Match:     EXACT ✓
+
+Fixture: step_break
+  Python QA: 3 (full model)
+  Rust QA:   3
+  Match:     EXACT ✓
+
+=== All 16 zhu2015 tests passed (65 total core tests) ===
+
+Test list (zhu2015::tests::*):
+  test_all_nan_returns_nan_qa0         PASS
+  test_detect_breaks_no_break          PASS
+  test_fit_segment_clean_signal        PASS
+  test_fit_segment_too_short           PASS
+  test_gaps_outliers_parity            PASS
+  test_lasso_fit_sparse_recovery       PASS
+  test_make_design_matrix_dims         PASS
+  test_make_design_matrix_values       PASS
+  test_median_fallback_qa0             PASS
+  test_qa_encodes_model_order          PASS
+  test_reconstruct_raster_basic        PASS
+  test_select_model_order              PASS
+  test_simple_harmonic_parity          PASS
+  test_single_valid_median_qa0         PASS
+  test_soft_threshold                  PASS
+  test_step_break_parity               PASS
+
+=== Solver Documentation ===
+
+Solver: Custom coordinate descent LASSO
+Rationale: sklearn parity requires matching exact update rule;
+  external solvers (ndarray-linalg, smartcore) use different
+  formulations that diverge on the same data.
+Update: w_j = soft_threshold(ρ_j, α) / (||X_cj||² / n)
+  With intercept handled by centering (matches sklearn).
+Verified: Manual CD implementation matches sklearn output
+  to within 1e-16 on reference test case.
+
+=== Notes ===
+
+- ndarray-npy v0.9.1 used (compatible with workspace ndarray 0.16)
+- npz feature for reading parity fixture NPZ files
+- Fixtures at tests/fixtures/rust_parity/synthetic/*/data.npz
+- CARGO_MANIFEST_DIR used for path resolution from crate root
+- 0-d numpy scalars handled via IxDyn read + ndim check

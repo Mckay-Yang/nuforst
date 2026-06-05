@@ -149,5 +149,6 @@ def test_full_scene_script_runs_all_locations_when_flag_is_set(tmp_path: Path, m
             "methods": ("nufrost", "hants", "zhu2015"),
             "n_jobs": -1,
             "force_refresh": False,
+            "rerun_methods": (),
         }
     ]

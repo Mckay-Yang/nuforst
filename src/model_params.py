@@ -41,7 +41,7 @@ def fit_cube_params(
     max_segments: int = 10,
 ) -> Dict[str, Any]:
     if args is None:
-        args = build_args({})
+        args = build_args(algorithm.lower(), {})
 
     algorithm = algorithm.lower()
     _, height, width = cube.shape
@@ -88,7 +88,6 @@ def fit_cube_params(
                 "segment_start_days": np.full((height, width, max_segments), np.nan, dtype=np.float64),
                 "segment_end_days": np.full((height, width, max_segments), np.nan, dtype=np.float64),
                 "segment_orders": np.zeros((height, width, max_segments), dtype=np.int16),
-                "segment_unit_qas": np.full((height, width, max_segments), 255, dtype=np.int16),
                 "segment_has_model": np.zeros((height, width, max_segments), dtype=np.int8),
                 "segment_median_values": np.full((height, width, max_segments), np.nan, dtype=np.float64),
                 "segment_intercepts": np.zeros((height, width, max_segments), dtype=np.float64),
@@ -145,7 +144,6 @@ def fit_cube_params(
                     params["segment_start_days"][i, j, :] = np.asarray(pixel["segment_start_days"], dtype=np.float64)
                     params["segment_end_days"][i, j, :] = np.asarray(pixel["segment_end_days"], dtype=np.float64)
                     params["segment_orders"][i, j, :] = np.asarray(pixel["segment_orders"], dtype=np.int16)
-                    params["segment_unit_qas"][i, j, :] = np.asarray(pixel["segment_unit_qas"], dtype=np.int16)
                     params["segment_has_model"][i, j, :] = np.asarray(pixel["segment_has_model"], dtype=np.int8)
                     params["segment_median_values"][i, j, :] = np.asarray(pixel["segment_median_values"], dtype=np.float64)
                     params["segment_intercepts"][i, j, :] = np.asarray(pixel["segment_intercepts"], dtype=np.float64)
@@ -167,7 +165,7 @@ def fit_param_cube_from_source(
     width = int(meta["width"])
     timestamps = np.asarray(meta["timestamps"])
     if args is None:
-        args = build_args({})
+        args = build_args(algorithm.lower(), {})
 
     algorithm = algorithm.lower()
     t_sec = timestamps_to_seconds(timestamps, unit=args.time_unit)
@@ -213,7 +211,6 @@ def fit_param_cube_from_source(
                 "segment_start_days": np.full((height, width, max_segments), np.nan, dtype=np.float64),
                 "segment_end_days": np.full((height, width, max_segments), np.nan, dtype=np.float64),
                 "segment_orders": np.zeros((height, width, max_segments), dtype=np.int16),
-                "segment_unit_qas": np.full((height, width, max_segments), 255, dtype=np.int16),
                 "segment_has_model": np.zeros((height, width, max_segments), dtype=np.int8),
                 "segment_median_values": np.full((height, width, max_segments), np.nan, dtype=np.float64),
                 "segment_intercepts": np.zeros((height, width, max_segments), dtype=np.float64),
@@ -270,7 +267,6 @@ def fit_param_cube_from_source(
                     params["segment_start_days"][i, j, :] = np.asarray(pixel["segment_start_days"], dtype=np.float64)
                     params["segment_end_days"][i, j, :] = np.asarray(pixel["segment_end_days"], dtype=np.float64)
                     params["segment_orders"][i, j, :] = np.asarray(pixel["segment_orders"], dtype=np.int16)
-                    params["segment_unit_qas"][i, j, :] = np.asarray(pixel["segment_unit_qas"], dtype=np.int16)
                     params["segment_has_model"][i, j, :] = np.asarray(pixel["segment_has_model"], dtype=np.int8)
                     params["segment_median_values"][i, j, :] = np.asarray(pixel["segment_median_values"], dtype=np.float64)
                     params["segment_intercepts"][i, j, :] = np.asarray(pixel["segment_intercepts"], dtype=np.float64)
@@ -317,14 +313,12 @@ def predict_cube_from_params(params: Dict[str, Any], target_time: str, block_sha
                         "segment_start_days": params["segment_start_days"][i, j, :],
                         "segment_end_days": params["segment_end_days"][i, j, :],
                         "segment_orders": params["segment_orders"][i, j, :],
-                        "segment_unit_qas": params["segment_unit_qas"][i, j, :],
                         "segment_has_model": params["segment_has_model"][i, j, :],
                         "segment_median_values": params["segment_median_values"][i, j, :],
                         "segment_intercepts": params["segment_intercepts"][i, j, :],
                         "segment_coefficients": params["segment_coefficients"][i, j, :, :],
                     }
-                    pred, _ = predict_zhu2015_from_params(pixel, target_value)
-                    out[i, j] = pred
+                    out[i, j] = predict_zhu2015_from_params(pixel, target_value)
 
     return out
 

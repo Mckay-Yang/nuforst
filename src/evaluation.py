@@ -815,11 +815,11 @@ def _process_pixel_ts(r: int, c: int, y_ts: np.ndarray, t_days: np.ndarray, t_se
         preds_nufrost.append(pred_n)
         
         # Zhu2015
-        pred_z, _ = fit_predict_pixel(t_days, y_corrupted, t_target_day, lasso_alpha=0.0001)
+        pred_z = fit_predict_pixel(t_days, y_corrupted, t_target_day, lasso_alpha=0.1)
         preds_zhu.append(pred_z)
         
         # HANTS
-        pred_h = hants_pixel(t_days, y_corrupted, t_target_day, nof=3, sf='low', fet=0.05, dod=5)
+        pred_h = hants_pixel(t_days, y_corrupted, t_target_day, nof=3, sf='high', fet=500.0, dod=5)
         preds_hants.append(pred_h)
         
     return {
@@ -874,8 +874,8 @@ def _process_random_point(t_idx: int, r: int, c: int, y_ts: np.ndarray, t_sec: n
         ridge_lam=args.ridge, freq_weight=args.freq_weight, huber_iters=args.huber_iters, huber_delta=args.huber_delta,
         min_obs=args.min_obs
     )
-    pred_z, _ = fit_predict_pixel(t_days, y_ts, target_t_day, lasso_alpha=0.0001)
-    pred_h = hants_pixel(t_days, y_ts, target_t_day, nof=3, sf='low', fet=0.05, dod=5)
+    pred_z = fit_predict_pixel(t_days, y_ts, target_t_day, lasso_alpha=0.1)
+    pred_h = hants_pixel(t_days, y_ts, target_t_day, nof=3, sf='high', fet=500.0, dod=5)
     
     return {"t_idx": t_idx, "r": r, "c": c, "nufrost": pred_n, "zhu": pred_z, "hants": pred_h}
 

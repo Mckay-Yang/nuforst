@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 import rasterio
+import finufft
 from joblib import Parallel, delayed, cpu_count
 from rasterio import Affine
 from tqdm import tqdm
@@ -24,8 +26,8 @@ from ..data_loader import (
 )
 from ..hants import hants_pixel
 from ..logger import log as _log
-from ..nufrost import nufrost_core, timestamps_to_seconds
-from ..zhu2015 import fit_predict_pixel
+from ..nufrost import nufrost_core, nufrost_core_multiband, timestamps_to_seconds, next_even, select_peaks_adaptive, refine_parabolic, _preferred_periods_to_freqs
+from ..zhu2015 import fit_predict_pixel_segments
 
 
 SENTINEL_SOURCE = "sentinel-2"
@@ -35,6 +37,74 @@ DEFAULT_OUTPUT_ROOT = Path("data/output")
 DEFAULT_CACHE_ROOT = Path("data/cache/local")
 DEFAULT_LATE_FRACTION = 0.25
 DEFAULT_MIN_VALID_RATIO = 0.9
+
+
+def _mask_invalid_reflectance_values(cube: np.ndarray, valid_min: float = 0.0, valid_max: float = 10000.0) -> np.ndarray:
+    arr = np.asarray(cube, dtype=np.float32).copy()
+    invalid = np.isfinite(arr) & ((arr <= valid_min) | (arr >= valid_max))
+    arr[invalid] = np.nan
+    return arr
+
+
+def build_shared_frequency_pool(
+    band_cubes: Mapping[str, np.ndarray],
+    t_sec: np.ndarray,
+    *,
+    top_k: int,
+    nufft_modes: int,
+    power_cum: float,
+    ignore_dc_hz: float,
+    max_pixels_per_band: int = 1024,
+    y_scale: float = 10000.0,
+) -> np.ndarray:
+    valid_t = np.asarray(t_sec, dtype=np.float64)
+    valid_t = valid_t[np.isfinite(valid_t)]
+    if valid_t.size < 3 or top_k <= 0:
+        return np.zeros(0, dtype=np.float64)
+    t_rel = valid_t - float(np.min(valid_t))
+    span = float(np.max(t_rel) - np.min(t_rel))
+    if not np.isfinite(span) or span <= 0:
+        return np.zeros(0, dtype=np.float64)
+    x = 2 * np.pi * (t_rel - np.min(t_rel)) / span - np.pi
+    x = np.ascontiguousarray(x, dtype=np.float64)
+    ms = next_even(nufft_modes)
+    k = np.arange(-ms // 2, ms // 2, dtype=np.int64)
+    freqs = k.astype(np.float64) / span
+    pos = freqs >= 0
+    f_pos = freqs[pos]
+    powers: List[np.ndarray] = []
+
+    for cube in band_cubes.values():
+        arr = np.asarray(cube, dtype=np.float32)
+        if arr.ndim != 3 or arr.shape[0] != t_rel.size:
+            continue
+        _, height, width = arr.shape
+        candidates = np.argwhere(np.isfinite(arr).sum(axis=0) >= 3)
+        if candidates.size == 0:
+            continue
+        step = max(1, int(np.ceil(len(candidates) / max_pixels_per_band)))
+        for row, col in candidates[::step][:max_pixels_per_band]:
+            y = arr[:, int(row), int(col)].astype(np.float64)
+            mask = np.isfinite(y)
+            if mask.sum() < 3:
+                continue
+            y_clean = y.copy()
+            if mask.sum() < len(y_clean):
+                y_clean[~mask] = np.nanmean(y_clean[mask])
+            centered = (y_clean - np.nanmean(y_clean)) / y_scale
+            Fk = finufft.nufft1d1(x, np.ascontiguousarray(centered.astype(np.complex128)), ms, eps=1e-12, isign=-1)
+            powers.append((np.abs(Fk[pos]) ** 2).astype(np.float64))
+
+    if not powers:
+        return np.zeros(0, dtype=np.float64)
+    P_pos = np.nanmedian(np.stack(powers, axis=0), axis=0)
+    dt = np.diff(np.sort(t_rel))
+    dt_pos = dt[dt > 0]
+    dt_med = float(np.median(dt_pos)) if dt_pos.size else span / len(t_rel)
+    fmax = 0.5 / max(dt_med, 1e-12)
+    peak_idx = select_peaks_adaptive(f_pos, P_pos, k_max=top_k, power_cum=power_cum, ignore_dc_hz=ignore_dc_hz, fmax=fmax)
+    selected = [refine_parabolic(f_pos, P_pos, int(i)) for i in peak_idx]
+    return np.array(sorted(float(f) for f in selected if np.isfinite(f) and f > ignore_dc_hz and f <= fmax), dtype=np.float64)
 
 
 def _resolve_data_dir(source_name: str, data_root: Path) -> Path:
@@ -162,7 +232,7 @@ def _batch_score_candidates(
         resolved = [str(p) for p in stack_paths]
         loader = RSCube(resolved, cache_dir=cache_dir)
         data = loader.load()
-        cube = np.asarray(data["cube"], dtype=np.float32)
+        cube = _mask_invalid_reflectance_values(data["cube"])
         timestamps = [str(ts) for ts in data["timestamps"]]
         index_map = {ts: idx for idx, ts in enumerate(timestamps)}
         step = _VALID_RATIO_SUBSAMPLE_STEP
@@ -234,7 +304,7 @@ def choose_shared_target_timestamp(
 def build_output_path(output_root: Path, method_name: str, source_file: Path, target_time: str, *, source_name: str = "", lon: float = 0.0, lat: float = 0.0) -> Path:
     safe_time = target_time.replace(":", "-")
     if source_name and lon and lat:
-        return output_root / f"{source_name}_recon" / f"{lon:.4f}_{lat:.4f}" / f"[{method_name}]_{source_name}_{_location_output_token(lon, lat)}_{safe_time}.tif"
+        return output_root / f"{source_name}_recon" / f"{lon:.4f}_{lat:.4f}" / ".partial" / f"[{method_name}]_{source_file.stem}_{safe_time}.tif"
     return output_root / method_name / f"[{method_name}]_{source_file.stem}_{safe_time}.tif"
 
 
@@ -295,9 +365,11 @@ def make_masked_time_series(cube: np.ndarray, timestamps: Sequence[str], target_
 
 def extract_prediction_2d(method_name: str, prediction: np.ndarray) -> np.ndarray:
     if method_name == "zhu2015":
-        if prediction.ndim != 3 or prediction.shape[0] < 1:
-            raise ValueError("Zhu2015 prediction must have shape (2, H, W) or compatible.")
-        return np.asarray(prediction[0], dtype=np.float32)
+        if prediction.ndim == 2:
+            return np.asarray(prediction, dtype=np.float32)
+        if prediction.ndim == 3 and prediction.shape[0] >= 1:
+            return np.asarray(prediction[0], dtype=np.float32)
+        raise ValueError("Zhu2015 prediction must have shape (H, W) or compatible.")
     return np.asarray(prediction, dtype=np.float32)
 
 
@@ -328,6 +400,10 @@ def _summary_matches_run(
     source_files: Mapping[str, Sequence[str]],
     min_valid_ratio: float,
     late_fraction: float,
+    frequency_selection: Optional[str] = None,
+    spectral_top_k: Optional[int] = None,
+    preferred_top_k: Optional[int] = None,
+    num_peaks: Optional[int] = None,
 ) -> bool:
     try:
         payload = json.loads(candidate.read_text(encoding="utf-8"))
@@ -339,12 +415,20 @@ def _summary_matches_run(
     candidate_source_files = payload.get("source_files", {})
     candidate_min_valid_ratio = float(payload.get("min_valid_ratio", DEFAULT_MIN_VALID_RATIO))
     candidate_late_fraction = float(payload.get("late_fraction", DEFAULT_LATE_FRACTION))
+    candidate_frequency_selection = payload.get("frequency_selection")
+    candidate_spectral_top_k = payload.get("spectral_top_k")
+    candidate_preferred_top_k = payload.get("preferred_top_k")
+    candidate_num_peaks = payload.get("num_peaks")
     return (
         candidate_methods == tuple(methods)
         and candidate_window_size == window_size
         and candidate_source_files == {band: list(paths) for band, paths in source_files.items()}
         and candidate_min_valid_ratio == float(min_valid_ratio)
         and candidate_late_fraction == float(late_fraction)
+        and candidate_frequency_selection == frequency_selection
+        and candidate_spectral_top_k == spectral_top_k
+        and candidate_preferred_top_k == preferred_top_k
+        and candidate_num_peaks == num_peaks
     )
 
 
@@ -359,6 +443,10 @@ def _find_existing_summary(
     source_files: Mapping[str, Sequence[str]],
     min_valid_ratio: float,
     late_fraction: float,
+    frequency_selection: Optional[str] = None,
+    spectral_top_k: Optional[int] = None,
+    preferred_top_k: Optional[int] = None,
+    num_peaks: Optional[int] = None,
 ) -> Optional[Path]:
     pattern = _summary_path_for_location(output_root, source_name, lon, lat)
     pattern_parent = pattern.parent
@@ -373,6 +461,10 @@ def _find_existing_summary(
             source_files=source_files,
             min_valid_ratio=min_valid_ratio,
             late_fraction=late_fraction,
+            frequency_selection=frequency_selection,
+            spectral_top_k=spectral_top_k,
+            preferred_top_k=preferred_top_k,
+            num_peaks=num_peaks,
         ):
             return candidate
     return None
@@ -411,7 +503,10 @@ def _crop_loaded_cube(data: Mapping[str, object], window_size: Optional[int]) ->
     cube = data.get("cube")
     if cube is None:
         raise ValueError("Loaded cube data must include 'cube'")
-    cropped["cube"] = cube[:, :window_size, :window_size]
+    _, height, width = cube.shape
+    row_start = max(0, (height - window_size) // 2)
+    col_start = max(0, (width - window_size) // 2)
+    cropped["cube"] = cube[:, row_start:row_start + window_size, col_start:col_start + window_size]
     return cropped
 
 
@@ -421,8 +516,8 @@ def reconstruct_hants_from_cube(
     target_time: str,
     *,
     nof: int = 3,
-    sf: str = "low",
-    fet: float = 0.05,
+    sf: str = "high",
+    fet: float = 500.0,
     dod: int = 5,
     n_jobs: int = -1,
 ) -> np.ndarray:
@@ -451,7 +546,7 @@ def reconstruct_zhu2015_from_cube(
     timestamps: Sequence[str],
     target_time: str,
     *,
-    lasso_alpha: float = 0.0001,
+    lasso_alpha: float = 0.1,
     n_jobs: int = -1,
 ) -> np.ndarray:
     target_dt = _parse_target_datetime(target_time)
@@ -461,19 +556,37 @@ def reconstruct_zhu2015_from_cube(
     target_t_day = (target_dt.timestamp() - t0_sec) / 86400.0
 
     _, height, width = cube.shape
-    out = np.full((2, height, width), np.nan, dtype=np.float32)
+    out = np.full((height, width), np.nan, dtype=np.float32)
 
     def _process_row(row_idx: int):
-        row = np.full((2, width), np.nan, dtype=np.float32)
+        row = np.full(width, np.nan, dtype=np.float32)
         for col_idx in range(width):
-            pred, qa = fit_predict_pixel(t_days, cube[:, row_idx, col_idx], target_t_day, lasso_alpha=lasso_alpha)
-            row[0, col_idx] = pred
-            row[1, col_idx] = qa
+            row[col_idx] = fit_predict_pixel_segments(t_days, cube[:, row_idx, col_idx], target_t_day, lasso_alpha=lasso_alpha)
         return row_idx, row
 
     for row_idx, row in _run_parallel_rows(height, _process_row, n_jobs=n_jobs, desc="Zhu2015 Rows"):
-        out[:, row_idx, :] = row
+        out[row_idx, :] = row
     return out
+
+
+def _existing_merged_prediction_path(
+    output_root: Path,
+    method_name: str,
+    source_name: str,
+    lon: float,
+    lat: float,
+    target_time: str,
+) -> Optional[Path]:
+    path = build_scene_stack_output_path(
+        output_root=output_root,
+        method_name=method_name,
+        source_name=source_name,
+        lon=lon,
+        lat=lat,
+        target_time=target_time,
+        suffix="prediction",
+    )
+    return path if path.exists() else None
 
 
 def _write_prediction(output_path: Path, array: np.ndarray, meta: Mapping[str, object]) -> None:
@@ -554,11 +667,17 @@ def reconstruct_full_scene_for_location(
     min_valid_ratio: float = DEFAULT_MIN_VALID_RATIO,
     late_fraction: float = DEFAULT_LATE_FRACTION,
     window_size: Optional[int] = None,
+    frequency_selection: Optional[str] = None,
+    spectral_top_k: Optional[int] = None,
+    preferred_top_k: Optional[int] = None,
+    num_peaks: Optional[int] = None,
+    rerun_methods: Sequence[str] = (),
 ) -> Dict[str, Any]:
     _log("reconstruct_full_scene_for_location", f"Start source={source_name} lon={lon:.4f} lat={lat:.4f} methods={list(methods)} window_size={window_size}")
     output_root = Path(output_root)
     data_root = Path(data_root)
     cache_dir = Path(cache_dir)
+    rerun_methods = tuple(str(method) for method in rerun_methods)
 
     data_dir = _resolve_data_dir(source_name, data_root)
     band_stacks = discover_location_band_stacks(data_dir, source_name=source_name, lon=lon, lat=lat, cache_dir=cache_dir)
@@ -576,8 +695,12 @@ def reconstruct_full_scene_for_location(
         source_files=source_map,
         min_valid_ratio=min_valid_ratio,
         late_fraction=late_fraction,
+        frequency_selection=frequency_selection,
+        spectral_top_k=spectral_top_k,
+        preferred_top_k=preferred_top_k,
+        num_peaks=num_peaks,
     )
-    if existing_summary is not None:
+    if existing_summary is not None and not rerun_methods:
         _log("reconstruct_full_scene_for_location", f"Skipping (existing summary): {existing_summary}")
         return {"skipped": True, "summary_path": str(existing_summary)}
 
@@ -599,19 +722,33 @@ def reconstruct_full_scene_for_location(
     )
     _log("reconstruct_full_scene_for_location", f"Selected target_time={target_time}")
 
-    output_map: Dict[str, Dict[str, str]] = {method: {} for method in methods}
     merged_prediction_map: Dict[str, str] = {}
+    reusable_methods: set[str] = set()
+    for method_name in methods:
+        if method_name == "nufrost" or method_name in rerun_methods:
+            continue
+        existing_prediction = _existing_merged_prediction_path(
+            output_root, method_name, source_name, lon, lat, target_time,
+        )
+        if existing_prediction is not None:
+            reusable_methods.add(method_name)
+            merged_prediction_map[method_name] = str(existing_prediction)
+            _log("reconstruct_full_scene_for_location", f"Reusing existing {method_name} prediction: {existing_prediction}")
+
+    output_map: Dict[str, Dict[str, str]] = {method: {} for method in methods}
+    timing_seconds: Dict[str, Dict[str, float]] = {method: {} for method in methods}
     mask_indices: Dict[str, int] = {}
     counts_before: Dict[str, int] = {}
     counts_after: Dict[str, int] = {}
     prediction_arrays: Dict[str, Dict[str, np.ndarray]] = {method: {} for method in methods}
     ground_truth_arrays: Dict[str, np.ndarray] = {}
     band_meta: Dict[str, Mapping[str, object]] = {}
+    prepared_bands: Dict[str, Dict[str, object]] = {}
 
     for band_name, stack_paths in band_stacks.items():
         _log("reconstruct_full_scene_for_location", f"Band {band_name}: cube shape={band_to_data[band_name]['cube'].shape}, timestamps={counts_before.get(band_name, '?')}")
         data = _crop_loaded_cube(band_to_data[band_name], window_size)
-        cube = np.ma.filled(data["cube"], np.nan).astype(np.float32)
+        cube = _mask_invalid_reflectance_values(np.ma.filled(data["cube"], np.nan))
         timestamps = [str(ts) for ts in data["timestamps"]]
         cube, deduped_timestamps = collapse_duplicate_timestamps(cube, timestamps)
         timestamps = deduped_timestamps.tolist()
@@ -622,25 +759,100 @@ def reconstruct_full_scene_for_location(
         counts_before[band_name] = int(len(timestamps))
         counts_after[band_name] = int(len(masked_timestamps))
         band_meta[band_name] = data
-
-        build_nufrost_args = {
-            "cache_dir": cache_dir,
-            "n_jobs": n_jobs,
-            "force_refresh": force_refresh,
-            "target_time": target_time,
+        prepared_bands[band_name] = {
+            "stack_paths": stack_paths,
+            "data": data,
+            "masked_cube": masked_cube,
+            "masked_timestamps": masked_timestamps,
         }
+
+    build_nufrost_args = {
+        "cache_dir": cache_dir,
+        "n_jobs": n_jobs,
+        "force_refresh": force_refresh,
+        "target_time": target_time,
+    }
+    for key in ("frequency_selection", "spectral_top_k", "preferred_top_k", "num_peaks"):
+        val = {k: v for k, v in (
+            ("frequency_selection", frequency_selection),
+            ("spectral_top_k", spectral_top_k),
+            ("preferred_top_k", preferred_top_k),
+            ("num_peaks", num_peaks),
+        )}.get(key)
+        if val is not None:
+            build_nufrost_args[key] = val
+    nufrost_args = build_args("nufrost", dict(build_nufrost_args)) if "nufrost" in methods else None
+    shared_freqs = None
+    if nufrost_args is not None and getattr(nufrost_args, "frequency_selection", None) == "shared_spectral":
+        first_prepared = next(iter(prepared_bands.values()))
+        shared_t_sec = timestamps_to_seconds(first_prepared["masked_timestamps"], unit=nufrost_args.time_unit)
+        spectral_freqs = build_shared_frequency_pool(
+            {band: info["masked_cube"] for band, info in prepared_bands.items()},
+            shared_t_sec,
+            top_k=max(0, int(nufrost_args.spectral_top_k or nufrost_args.num_peaks)),
+            nufft_modes=nufrost_args.modes,
+            power_cum=nufrost_args.power_cum,
+            ignore_dc_hz=nufrost_args.ignore_dc_hz,
+        )
+        preferred_freqs = _preferred_periods_to_freqs(nufrost_args.preferred_periods_days, time_unit="seconds")
+        pref_top = max(0, int(nufrost_args.preferred_top_k))
+        pref_valid = preferred_freqs[preferred_freqs > nufrost_args.ignore_dc_hz][:pref_top]
+        combined = list(spectral_freqs)
+        for pf in pref_valid:
+            if np.isfinite(pf) and pf > nufrost_args.ignore_dc_hz:
+                combined.append(pf)
+        shared_freqs = np.array(sorted(set(float(f) for f in combined if np.isfinite(f) and f > nufrost_args.ignore_dc_hz)), dtype=np.float64)
+        _log("reconstruct_full_scene_for_location", f"Shared NUFROST frequencies: {len(shared_freqs)} (spectral={len(spectral_freqs)} preferred={pref_top})")
+
+    # If NUFROST is requested with the multi-band step term enabled, run it
+    # once across all bands so that the group fused lasso can find shared
+    # break points. Otherwise fall back to the per-band legacy path.
+    nufrost_predictions: Dict[str, np.ndarray] = {}
+    if "nufrost" in methods:
+        active_args = nufrost_args or build_args("nufrost", dict(build_nufrost_args))
+        if getattr(active_args, "lambda_step", 1e30) < 1e30 and len(prepared_bands) > 0:
+            _log("reconstruct_full_scene_for_location", "Running NUFROST multi-band path")
+            band_cubes_for_multi = {b: prepared_bands[b]["masked_cube"] for b in band_stacks.keys()}
+            shared_ts = next(iter(prepared_bands.values()))["masked_timestamps"]
+            t0 = time.perf_counter()
+            preds_by_band = nufrost_core_multiband(
+                band_cubes_for_multi, shared_ts, target_time,
+                args=active_args, shared_freqs=shared_freqs,
+            )
+            elapsed = time.perf_counter() - t0
+            for b, arr in preds_by_band.items():
+                timing_seconds["nufrost"][b] = elapsed / max(1, len(preds_by_band))
+                nufrost_predictions[b] = arr
+
+    for band_name, prepared in prepared_bands.items():
+        stack_paths = prepared["stack_paths"]
+        data = prepared["data"]
+        masked_cube = prepared["masked_cube"]
+        masked_timestamps = prepared["masked_timestamps"]
         for method_name in methods:
+            if method_name in reusable_methods:
+                continue
             _log("reconstruct_full_scene_for_location", f"Band {band_name}: running {method_name}")
             output_path = build_output_path(output_root=output_root, method_name=method_name, source_file=stack_paths[0], target_time=target_time, source_name=source_name, lon=lon, lat=lat)
+            t0 = time.perf_counter()
             if method_name == "nufrost":
-                args = build_args(dict(build_nufrost_args))
-                prediction = nufrost_core(masked_cube, masked_timestamps, target_time, args=args)
+                if band_name in nufrost_predictions:
+                    prediction = nufrost_predictions[band_name]
+                    elapsed = timing_seconds["nufrost"].get(band_name, 0.0)
+                else:
+                    args = nufrost_args or build_args("nufrost", dict(build_nufrost_args))
+                    prediction = nufrost_core(masked_cube, masked_timestamps, target_time, args=args, shared_freqs=shared_freqs)
+                    elapsed = time.perf_counter() - t0
             elif method_name == "hants":
                 prediction = reconstruct_hants_from_cube(masked_cube, masked_timestamps, target_time, n_jobs=n_jobs)
+                elapsed = time.perf_counter() - t0
             elif method_name == "zhu2015":
                 prediction = reconstruct_zhu2015_from_cube(masked_cube, masked_timestamps, target_time, n_jobs=n_jobs)
+                elapsed = time.perf_counter() - t0
             else:
                 raise ValueError(f"Unsupported method: {method_name}")
+            timing_seconds[method_name][band_name] = elapsed
+            _log("reconstruct_full_scene_for_location", f"Band {band_name} / {method_name}: {elapsed:.1f}s")
 
             prediction_2d = extract_prediction_2d(method_name, prediction)
             _write_prediction(output_path, prediction_2d, data)
@@ -661,6 +873,8 @@ def reconstruct_full_scene_for_location(
     write_band_stack(gt_path, ground_truth_arrays, ordered_bands, first_meta)
 
     for method_name in methods:
+        if method_name in reusable_methods:
+            continue
         merged_prediction_path = build_scene_stack_output_path(
             output_root=output_root,
             method_name=method_name,
@@ -693,8 +907,18 @@ def reconstruct_full_scene_for_location(
         "late_fraction": late_fraction,
         "merged_prediction_outputs": merged_prediction_map,
         "ground_truth_output": str(gt_path),
+        "timing_seconds": timing_seconds,
         "window_size": window_size,
     }
+    for key in ("frequency_selection", "spectral_top_k", "preferred_top_k", "num_peaks"):
+        val = {k: v for k, v in (
+            ("frequency_selection", frequency_selection),
+            ("spectral_top_k", spectral_top_k),
+            ("preferred_top_k", preferred_top_k),
+            ("num_peaks", num_peaks),
+        )}.get(key)
+        if val is not None:
+            payload[key] = val
     summary_path = write_run_summary(output_root, payload)
     payload["summary_path"] = str(summary_path)
     summary_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -713,6 +937,11 @@ def reconstruct_full_scene_for_all_locations(
     force_refresh: bool = False,
     min_valid_ratio: float = DEFAULT_MIN_VALID_RATIO,
     late_fraction: float = DEFAULT_LATE_FRACTION,
+    frequency_selection: Optional[str] = None,
+    spectral_top_k: Optional[int] = None,
+    preferred_top_k: Optional[int] = None,
+    num_peaks: Optional[int] = None,
+    rerun_methods: Sequence[str] = (),
 ) -> List[Dict[str, Any]]:
     data_root = Path(data_root)
     data_dir = _resolve_data_dir(source_name, data_root)
@@ -737,6 +966,11 @@ def reconstruct_full_scene_for_all_locations(
                 force_refresh=force_refresh,
                 min_valid_ratio=min_valid_ratio,
                 late_fraction=late_fraction,
+                frequency_selection=frequency_selection,
+                spectral_top_k=spectral_top_k,
+                preferred_top_k=preferred_top_k,
+                num_peaks=num_peaks,
+                rerun_methods=rerun_methods,
             )
         )
     return results

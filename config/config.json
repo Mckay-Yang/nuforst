@@ -1,0 +1,7 @@
+{
+  "cache_dir": "data/cache/local",
+  "force_refresh": false,
+  "n_jobs": -1,
+  "time_unit": "seconds",
+  "output_path": "./recon.tif"
+}

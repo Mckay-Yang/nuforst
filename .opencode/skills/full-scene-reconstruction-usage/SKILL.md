@@ -26,6 +26,7 @@ Do not use this skill for streaming evaluation experiments or point-sampling swe
 - Algorithms: `nufrost`, `hants`, `zhu2015`
 - Shared timestamp: one timestamp per location/source, reused across all bands and all methods
 - Ground truth meaning: held-out observed scene at the masked timestamp, stacked in the same band order
+- Cache policy: do not refresh caches by default; avoid `force_refresh=True` / `--force-refresh` unless the user explicitly asks or cached inputs are known stale/corrupt
 
 ## How To Run
 
@@ -94,6 +95,7 @@ Merged prediction stacks are one GeoTIFF per method per location/time.
 - Do not treat Zhu2015's old second output band as a full-scene QA product in this workflow.
 - Do not expect per-band intermediate prediction files to persist after a run. They are deleted after merge.
 - Do not guess band order from filenames alone when a merged stack is available. Read band descriptions or `summary.json`.
+- Do not pass `force_refresh=True` / `--force-refresh` for routine smoke tests; full-scene NPZ cache refresh can add tens of minutes with no benefit when existing caches are valid.
 
 ## Recommended Reading Pattern
 

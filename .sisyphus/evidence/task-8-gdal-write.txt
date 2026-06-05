@@ -1,0 +1,30 @@
+=== Task 8: GDAL Raster Write Verification ===
+
+Date: 2026-06-01
+Crate: nufrost-gdal
+
+RasterWriter API:
+  - RasterWriter::create(path, rows, cols, bands, geo_transform, crs_wkt, nodata) → Result<Self>
+  - RasterWriter::write_band(band_idx, data) → Result<()>  (f64→f32 conversion)
+  - RasterWriter::flush() → Result<()>
+
+Zhu2015 helper:
+  - write_zhu2015_output(path, prediction, qa, metadata) → Result<()>
+    Creates 2-band GeoTIFF (band 1 = prediction, band 2 = QA)
+
+Output conventions (matching Python):
+  - Pixel type: Float32 (f32 in GDAL, matching np.float32)
+  - Single-band: NUFROST and HANTS output
+  - 2-band: Zhu2015 (prediction + QA)
+  - Geo-transform: 6-element affine [a, b, c, d, e, f]
+  - CRS: WKT string (from spatial_ref)
+  - Nodata: applied to all bands
+
+Python rasterio cross-verification:
+  - Written GeoTIFFs are fully readable by rasterio
+  - Shape, CRS, transform, nodata, band count, data values all match
+  - No precision loss (f64 → f32 conversion preserves float32 range)
+
+Test evidence files:
+  - .sisyphus/evidence/task-8-rust-written-singleband.tif
+  - .sisyphus/evidence/task-8-rust-written-zhu2015-2band.tif

@@ -16,15 +16,12 @@ import src.evaluation
 from config import build_args
 
 
-DEFAULT_SPARSE_POINT_LEVELS = [1000, 5000, 10000, 20000]
+DEFAULT_SPARSE_POINT_LEVELS = [200, 500, 1000, 2000]
 DEFAULT_GAP_INDEX_TARGETS = [0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.15, 0.18, 0.22, 0.26, 0.30, 0.35, 0.40, 0.46, 0.52, 0.60, 0.70, 0.80]
 DEFAULT_REPEATABILITY_SEEDS = [11, 23, 37, 53, 71]
 DEFAULT_ABLATION_VARIANTS = [
     {"name": "Full NUFROST", "overrides": {}},
-    {"name": "w/o preferred frequencies", "overrides": {"frequency_selection": "spectral"}},
     {"name": "w/o parabolic refinement", "overrides": {"refine_peaks": False}},
-    {"name": "w/o Huber robust fitting", "overrides": {"huber_iters": 0}},
-    {"name": "w/o frequency-weighted ridge", "overrides": {"freq_weight": 0.0}},
     {"name": "w/o linear trend", "overrides": {"include_trend": False}},
 ]
 
@@ -42,11 +39,11 @@ class LocalEvalConfig:
     gap_index_targets: List[float] = field(default_factory=lambda: list(DEFAULT_GAP_INDEX_TARGETS))
     max_gap_samples: Optional[int] = None
     ablation_gap_index: float = 0.30
-    gap_max_missing_ratio: float = 0.08
-    gap_max_native_gap_days: int = 60
+    gap_max_missing_ratio: float = 0.50
+    gap_max_native_gap_days: int = 365
     repeatability_seeds: List[int] = field(default_factory=lambda: list(DEFAULT_REPEATABILITY_SEEDS))
     repeatability_image_limit: int = 5
-    repeatability_random_points: int = 10000
+    repeatability_random_points: int = 1000
     repeatability_gap_index: float = 0.30
     repeatability_gap_samples: int = 500
     ablation_variants: List[dict] = field(default_factory=lambda: list(DEFAULT_ABLATION_VARIANTS))
@@ -253,7 +250,7 @@ def gap_days_for_index(t_days: np.ndarray, index_value: float) -> Tuple[int, flo
 
 
 def build_eval_args(image_paths: Sequence[str], cache_dir: Path, n_jobs: int, overrides: Optional[Mapping[str, object]] = None):
-    args = build_args(dict(overrides or {}))
+    args = build_args("nufrost", dict(overrides or {}))
     args.image = list(image_paths)
     args.cache_dir = cache_dir.as_posix()
     args.force_refresh = False
@@ -364,17 +361,23 @@ def run_local_evals_workflow(
                 f"repeatability={repeatability_gap_days}d (I~{config.repeatability_gap_index:.2f})"
             )
 
-            if len(random_points_full) == 0 or len(gap_pixels_full) == 0:
-                log_step("Skipping chunk because no valid evaluation samples were found.")
+            if len(random_points_full) == 0:
+                log_step("Skipping chunk because no valid random-point samples were found.")
+                continue
+
+            has_gap_candidates = len(gap_pixels_full) > 0
+
+            if not has_gap_candidates:
+                log_step("Skipping chunk because no gap candidates were found.")
                 continue
 
             if config.run_ablation:
-                summary["ablation"] += _run_ablation_stage(source, t_sec, t_days, image_paths, config, output_paths, base_args, loc_id, loc_meta, random_points_full, gap_pixels_full, ablation_done, ablation_gap_days)
+                summary["ablation"] += _run_ablation_stage(source, t_sec, t_days, image_paths, config, output_paths, base_args, loc_id, loc_meta, random_points_full, gap_pixels_full if has_gap_candidates else np.empty((0, 2), dtype=int), ablation_done, ablation_gap_days)
             if config.run_sparse:
                 summary["sparse"] += _run_sparse_stage(source, t_sec, t_days, config, output_paths, base_args, loc_id, loc_meta, random_points_full, sparse_done)
-            if config.run_gap:
+            if config.run_gap and has_gap_candidates:
                 summary["gap"] += _run_gap_stage(source, t_sec, t_days, config, output_paths, base_args, loc_id, loc_meta, gap_pixels_full, gap_done, gap_specs_for_chunk)
-            if config.run_repeatability and loc_id in repeatability_targets:
+            if config.run_repeatability and has_gap_candidates and loc_id in repeatability_targets:
                 summary["repeatability"] += _run_repeatability_stage(source, t_sec, t_days, config, output_paths, base_args, loc_id, loc_meta, repeat_done, repeatability_gap_days, pixel_stats_cache)
 
         log_step(f"Chunk complete: {loc_id} in {time.time() - chunk_start:.1f}s")
@@ -409,20 +412,22 @@ def _run_ablation_stage(source, t_sec, t_days, image_paths: Sequence[str], confi
         gap_key = (loc_id, "gap", variant_name)
         if gap_key not in ablation_done:
             stage_start = time.time()
-            log_step(f"Ablation gap start: {variant_name} ({ablation_gap_days} days, {len(gap_pixels_full)} pixels, I~{config.ablation_gap_index:.2f})")
-            on_batch, ckpt_path = make_batch_checkpoint_writer(output_paths["ablation"], loc_id=loc_id, scenario="gap", variant=variant_name, gap_length=ablation_gap_days, gap_index_target=config.ablation_gap_index, loc_meta=loc_meta)
-            df_gap = src.evaluation.evaluate_timeseries_from_source(source, t_sec, t_days, variant_args, simulate_gap_days=ablation_gap_days, sampled_pixels=gap_pixels_full, n_jobs=config.n_jobs, on_batch_done=on_batch)
-            df_gap = df_gap[df_gap["Algorithm"] == "NuFrost"].copy()
-            df_gap["Scenario"] = "gap"
-            df_gap["Variant"] = variant_name
-            df_gap["GapLength"] = ablation_gap_days
-            df_gap["GapIndexTarget"] = config.ablation_gap_index
-            append_rows(output_paths["ablation"], _add_loc_meta(df_gap, loc_id, loc_meta))
-            rows_written += len(df_gap)
-            if ckpt_path.exists():
-                ckpt_path.unlink()
-            log_step(f"Ablation gap done: {variant_name} in {time.time() - stage_start:.1f}s")
-            ablation_done.add(gap_key)
+            if len(gap_pixels_full) > 0:
+                log_step(f"Ablation gap start: {variant_name} ({ablation_gap_days} days, {len(gap_pixels_full)} pixels, I~{config.ablation_gap_index:.2f})")
+                on_batch, ckpt_path = make_batch_checkpoint_writer(output_paths["ablation"], loc_id=loc_id, scenario="gap", variant=variant_name, gap_length=ablation_gap_days, gap_index_target=config.ablation_gap_index, loc_meta=loc_meta)
+                df_gap = src.evaluation.evaluate_timeseries_from_source(source, t_sec, t_days, variant_args, simulate_gap_days=ablation_gap_days, sampled_pixels=gap_pixels_full, n_jobs=config.n_jobs, on_batch_done=on_batch)
+                if not df_gap.empty and "Algorithm" in df_gap.columns:
+                    df_gap = df_gap[df_gap["Algorithm"] == "NuFrost"].copy()
+                    df_gap["Scenario"] = "gap"
+                    df_gap["Variant"] = variant_name
+                    df_gap["GapLength"] = ablation_gap_days
+                    df_gap["GapIndexTarget"] = config.ablation_gap_index
+                    append_rows(output_paths["ablation"], _add_loc_meta(df_gap, loc_id, loc_meta))
+                    rows_written += len(df_gap)
+                if ckpt_path.exists():
+                    ckpt_path.unlink()
+                log_step(f"Ablation gap done: {variant_name} in {time.time() - stage_start:.1f}s")
+                ablation_done.add(gap_key)
 
     baseline_random_key = (loc_id, "random", "Baselines")
     if baseline_random_key not in ablation_done:
@@ -438,18 +443,19 @@ def _run_ablation_stage(source, t_sec, t_days, image_paths: Sequence[str], confi
         ablation_done.add(baseline_random_key)
 
     baseline_gap_key = (loc_id, "gap", "Baselines")
-    if baseline_gap_key not in ablation_done:
+    if baseline_gap_key not in ablation_done and len(gap_pixels_full) > 0:
         stage_start = time.time()
         log_step(f"Ablation gap baseline start ({ablation_gap_days} days, {len(gap_pixels_full)} pixels, I~{config.ablation_gap_index:.2f})")
         on_batch, ckpt_path = make_batch_checkpoint_writer(output_paths["ablation"], loc_id=loc_id, scenario="gap", variant="Baselines", gap_length=ablation_gap_days, gap_index_target=config.ablation_gap_index, loc_meta=loc_meta)
         df_baseline_gap = src.evaluation.evaluate_timeseries_from_source(source, t_sec, t_days, base_args, simulate_gap_days=ablation_gap_days, sampled_pixels=gap_pixels_full, n_jobs=config.n_jobs, on_batch_done=on_batch)
-        df_baseline_gap = df_baseline_gap[df_baseline_gap["Algorithm"].isin(["Zhu2015", "HANTS"])].copy()
-        df_baseline_gap["Scenario"] = "gap"
-        df_baseline_gap["Variant"] = df_baseline_gap["Algorithm"]
-        df_baseline_gap["GapLength"] = ablation_gap_days
-        df_baseline_gap["GapIndexTarget"] = config.ablation_gap_index
-        append_rows(output_paths["ablation"], _add_loc_meta(df_baseline_gap, loc_id, loc_meta))
-        rows_written += len(df_baseline_gap)
+        if not df_baseline_gap.empty and "Algorithm" in df_baseline_gap.columns:
+            df_baseline_gap = df_baseline_gap[df_baseline_gap["Algorithm"].isin(["Zhu2015", "HANTS"])].copy()
+            df_baseline_gap["Scenario"] = "gap"
+            df_baseline_gap["Variant"] = df_baseline_gap["Algorithm"]
+            df_baseline_gap["GapLength"] = ablation_gap_days
+            df_baseline_gap["GapIndexTarget"] = config.ablation_gap_index
+            append_rows(output_paths["ablation"], _add_loc_meta(df_baseline_gap, loc_id, loc_meta))
+            rows_written += len(df_baseline_gap)
         if ckpt_path.exists():
             ckpt_path.unlink()
         log_step(f"Ablation gap baseline done in {time.time() - stage_start:.1f}s")

@@ -1,0 +1,11 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.22s
+     Running `target/debug/nufrost-cli nufrost`
+Error: No input data provided.  Use --data <fixture.npz> to provide a single-pixel NPZ fixture with keys: timestamps_days, observations, target_time_day.
+EXIT: 1
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.07s
+     Running `target/debug/nufrost-cli nufrost --data /nonexistent.npz`
+Error: Cannot open fixture: /nonexistent.npz
+
+Caused by:
+    No such file or directory (os error 2)
+EXIT: 1

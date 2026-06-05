@@ -71,13 +71,12 @@ def test_zhu2015_pixel_params_reproduce_direct_prediction(
 ) -> None:
     target_t = float(synthetic_t_days[3])
 
-    direct_pred, direct_qa = fit_predict_pixel(synthetic_t_days, synthetic_signal, target_t_day=target_t)
+    direct_pred = fit_predict_pixel(synthetic_t_days, synthetic_signal, target_t_day=target_t)
     params = fit_zhu2015_pixel_params(synthetic_t_days, synthetic_signal, max_segments=10)
-    param_pred, param_qa = predict_zhu2015_from_params(params, target_t)
+    param_pred = predict_zhu2015_from_params(params, target_t)
 
     assert np.isfinite(param_pred)
     assert abs(param_pred - direct_pred) < 1e-6
-    assert param_qa == direct_qa
 
 
 def test_cube_param_roundtrip_reconstructs_complete_image(tmp_path) -> None:
@@ -105,7 +104,7 @@ def test_cube_param_roundtrip_reconstructs_complete_image(tmp_path) -> None:
     )
     cube[2, 0, 0] = np.nan
 
-    args = build_args({"n_jobs": 1, "show_progress": False, "min_obs": 6, "modes": 64, "num_peaks": 4})
+    args = build_args("nufrost", {"n_jobs": 1, "show_progress": False, "min_obs": 6, "modes": 64, "num_peaks": 4})
     params = fit_cube_params(cube, timestamps, algorithm="nufrost", args=args, max_freqs=10)
 
     path = tmp_path / "nufrost_params.npz"
@@ -118,7 +117,7 @@ def test_cube_param_roundtrip_reconstructs_complete_image(tmp_path) -> None:
 
 
 def test_param_cube_from_streaming_source_avoids_npz(single_tile_path: str, cache_dir, tmp_path) -> None:
-    args = build_args({"cache_dir": cache_dir, "n_jobs": 1, "show_progress": False, "min_obs": 6, "modes": 64, "num_peaks": 4})
+    args = build_args("nufrost", {"cache_dir": cache_dir, "n_jobs": 1, "show_progress": False, "min_obs": 6, "modes": 64, "num_peaks": 4})
 
     with TimeSeriesRasterSource([single_tile_path], cache_dir=cache_dir) as source:
         params = fit_param_cube_from_source(source, algorithm="nufrost", args=args, max_freqs=10)
