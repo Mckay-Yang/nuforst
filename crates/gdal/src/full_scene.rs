@@ -1,7 +1,6 @@
 // Full-scene Sentinel-2 band discovery.
 //
-// Mirrors Python `discover_location_band_stacks()` and helpers from
-// `src/full_scene_reconstruction/pipeline.py:125-193`.
+// Rust implementation of full-scene Sentinel-2 band discovery and helpers.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -1105,7 +1104,7 @@ mod tests {
         let rows = win.min(full_rows);
         let cols = win.min(full_cols);
 
-        // Read the B2 cube (windowed to 512×512, matching Python RSCube._read_tif)
+        // Read the B2 cube through a bounded 512×512 window.
         let mut b2_cube = ndarray::Array3::<f64>::zeros((n_bands, rows, cols));
         for b in 1..=n_bands {
             let band_data = reader.read_band_window(b, win, win).expect("should read band");

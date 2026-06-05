@@ -155,8 +155,7 @@ impl RasterReader {
     /// Read a window `(window_rows, window_cols)` from the top-left of a band.
     ///
     /// Returns an [`Array2<f64>`] with shape `(window_rows, window_cols)`.
-    /// Matches the Python behaviour of `RSCube._read_tif()` which only reads
-    /// the top-left 512×512 window for memory safety.
+    /// Used by small-window smoke tests to avoid reading very large rasters.
     pub fn read_band_window(
         &self,
         band_idx: usize,

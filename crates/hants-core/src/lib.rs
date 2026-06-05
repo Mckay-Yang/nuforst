@@ -1,6 +1,6 @@
 // HANTS (Harmonic ANalysis of Time Series) — paper-faithful Rust port.
 //
-// Based on Roerink et al. (2000) and the Python reference in `src/hants.py`.
+// Based on Roerink et al. (2000).
 // Preserves paper-mandated semantics: NOF includes zero-frequency mean,
 // SF controls directional outlier suppression, DOD enforces minimum retained
 // observations, and FET gates the iterative rejection loop.
