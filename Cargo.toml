@@ -1,10 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
-    "rust/nufrost-core",
-    "rust/nufrost-gdal",
-    "rust/nufrost-cli",
-    "rust/nufrost-py",
+    "crates/nufrost-core",
+    "crates/nufrost-gdal",
+    "crates/nufrost-cli",
+    "crates/nufrost-py",
 ]
 
 [workspace.dependencies]

@@ -1,7 +1,8 @@
 # Rust Workspace — NUFROST Rewrite
 
 This workspace bootstraps a Rust rewrite of the NUFROST reconstruction pipeline.
-It contains four crates:
+It contains four crates under `crates/`, using the standard Cargo workspace
+layout where each crate keeps its Rust sources under its own `src/` directory:
 
 | Crate            | Type        | Purpose                                      |
 |------------------|-------------|----------------------------------------------|
