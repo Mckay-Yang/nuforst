@@ -1,0 +1,64 @@
+nufrost-gdal v0.1.0 (/Volumes/T7/nuforst/.worktrees/rust-rewrite/rust/nufrost-gdal)
+├── anyhow v1.0.102
+├── gdal v0.19.0
+│   ├── bitflags v2.11.1
+│   ├── chrono v0.4.44
+│   │   ├── iana-time-zone v0.1.65
+│   │   │   └── core-foundation-sys v0.8.7
+│   │   └── num-traits v0.2.19
+│   │       └── libm v0.2.16
+│   │       [build-dependencies]
+│   │       └── autocfg v1.5.1
+│   ├── gdal-sys v0.12.0
+│   │   [build-dependencies]
+│   │   ├── pkg-config v0.3.33
+│   │   └── semver v1.0.28
+│   ├── geo-types v0.7.19
+│   │   └── num-traits v0.2.19 (*)
+│   └── thiserror v2.0.18
+│       └── thiserror-impl v2.0.18 (proc-macro)
+│           ├── proc-macro2 v1.0.106
+│           │   └── unicode-ident v1.0.24
+│           ├── quote v1.0.45
+│           │   └── proc-macro2 v1.0.106 (*)
+│           └── syn v2.0.117
+│               ├── proc-macro2 v1.0.106 (*)
+│               ├── quote v1.0.45 (*)
+│               └── unicode-ident v1.0.24
+│   [build-dependencies]
+│   └── semver v1.0.28
+├── ndarray v0.16.1
+│   ├── matrixmultiply v0.3.10
+│   │   └── rawpointer v0.2.1
+│   │   [build-dependencies]
+│   │   └── autocfg v1.5.1
+│   ├── num-complex v0.4.6
+│   │   └── num-traits v0.2.19 (*)
+│   ├── num-integer v0.1.46
+│   │   └── num-traits v0.2.19 (*)
+│   ├── num-traits v0.2.19 (*)
+│   └── rawpointer v0.2.1
+├── nufrost-core v0.1.0 (/Volumes/T7/nuforst/.worktrees/rust-rewrite/rust/nufrost-core)
+│   ├── chrono v0.4.44 (*)
+│   ├── ndarray v0.16.1 (*)
+│   ├── rayon v1.12.0
+│   │   ├── either v1.16.0
+│   │   └── rayon-core v1.13.0
+│   │       ├── crossbeam-deque v0.8.6
+│   │       │   ├── crossbeam-epoch v0.9.18
+│   │       │   │   └── crossbeam-utils v0.8.21
+│   │       │   └── crossbeam-utils v0.8.21
+│   │       └── crossbeam-utils v0.8.21
+│   ├── serde v1.0.228
+│   │   ├── serde_core v1.0.228
+│   │   └── serde_derive v1.0.228 (proc-macro)
+│   │       ├── proc-macro2 v1.0.106 (*)
+│   │       ├── quote v1.0.45 (*)
+│   │       └── syn v2.0.117 (*)
+│   ├── serde_json v1.0.150
+│   │   ├── itoa v1.0.18
+│   │   ├── memchr v2.8.1
+│   │   ├── serde_core v1.0.228
+│   │   └── zmij v1.0.21
+│   └── thiserror v2.0.18 (*)
+└── thiserror v2.0.18 (*)

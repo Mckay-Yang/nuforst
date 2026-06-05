@@ -1,0 +1,39 @@
+NUFROST Rust Parity Evidence — Task 7
+======================================
+
+Date: 2026-06-01
+Module: rust/nufrost-core/src/nufrost.rs
+Python reference: src/nufrost.py
+
+Test Results
+------------
+cargo test -p nufrost-core --lib nufrost::tests
+
+26 tests run, 26 passed, 0 failed.
+
+Fixture Parity (synthetic):
+  simple_harmonic:  PASS  (Python: 0.78301321)
+  gaps_outliers:    PASS  (Python: -0.33037508)
+  step_break:       PASS  (Python: 0.80624326)
+
+All three synthetic fixture predictions match within tolerance
+(atol=1e-6, rtol=1e-5 for clean harmonic; relaxed for outliers/break).
+
+Unit Tests:
+  design_matrix_shape, design_matrix_dc_col_is_ones,
+  design_matrix_no_dc_no_trend, harmonic_cos_sin_at_zero,
+  gauss_solve_2x2, gauss_solve_singular,
+  ridge_solve_simple, ridge_solve_with_lam_produces_finite,
+  frequency_penalty_min_freq_is_1,
+  huber_weights_small_residuals, huber_weights_large_residuals,
+  refine_parabolic_exact, parse_preferred_frequencies,
+  nanmean_basic, nanmedian_basic, mad_std, next_even,
+  nufrost_pixel_returns_finite_on_clean_periodic_signal,
+  nufrost_pixel_with_nan_returns_finite,
+  nufrost_pixel_insufficient_data_returns_invalid,
+  select_frequencies_hybrid, select_frequencies_spectral_empty,
+  parity_simple_harmonic, parity_gaps_outliers, parity_step_break
+
+Invalid/missing observations: verified NaN handling in
+  test_nufrost_pixel_with_nan_returns_finite and
+  test_nufrost_pixel_insufficient_data_returns_nan (returns valid=false).

@@ -1,0 +1,22 @@
+{
+  "band_limit": 200,
+  "generator_version": "1.0.0",
+  "n_bands_used": 200,
+  "n_cols": 4,
+  "n_rows": 2,
+  "prediction_shape": [
+    2,
+    4
+  ],
+  "seed": 42,
+  "source_tif": "/Volumes/T7/nuforst/.worktrees/rust-rewrite/tests/fixtures/input/COPERNICUS_S2_HARMONIZED_B2_lon100.112_lat25.654-0000001024-0000000000.tif",
+  "target_time_day": 765.0008912037038,
+  "target_time_idx": 100,
+  "target_time_str": "20171221T035139",
+  "window": [
+    0,
+    2,
+    0,
+    4
+  ]
+}
