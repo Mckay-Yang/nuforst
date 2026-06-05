@@ -1,5 +1,5 @@
 [package]
-name = "nufrost-gdal"
+name = "zhu2015"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,16 +7,11 @@ rust-version.workspace = true
 
 [dependencies]
 nufrost-core = { path = "../nufrost-core" }
-hants = { path = "../hants" }
-zhu2015 = { path = "../zhu2015" }
 ndarray.workspace = true
 rayon.workspace = true
-chrono.workspace = true
-gdal.workspace = true
-gdal-sys = "0.12"
-thiserror.workspace = true
-anyhow.workspace = true
-regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 approx.workspace = true
+ndarray-npy = { version = "0.9", features = ["npz"] }

@@ -7,11 +7,14 @@ rust-version.workspace = true
 
 [dependencies]
 nufrost-core = { path = "../nufrost-core" }
+hants = { path = "../hants" }
+zhu2015 = { path = "../zhu2015" }
 nufrost-gdal = { path = "../nufrost-gdal" }
 clap.workspace = true
 anyhow.workspace = true
 ndarray.workspace = true
 ndarray-npy = { version = "0.9", features = ["npz"] }
 serde_json.workspace = true
+serde.workspace = true
 rayon.workspace = true
 chrono.workspace = true

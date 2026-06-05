@@ -10,12 +10,13 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use ndarray::Array3;
 use rayon::prelude::*;
+use serde::Deserialize;
 
 use nufrost_core::{
-    hants_pixel, nufrost_pixel, zhu2015::fit_predict_pixel,
-    parse_iso8601_to_epoch_seconds, HantsConfig, NufrostConfig,
-    Zhu2015Config,
+    nufrost_pixel, parse_iso8601_to_epoch_seconds, NufrostConfig,
 };
+use hants::{hants_pixel, HantsConfig};
+use zhu2015::{fit_predict_pixel, Zhu2015Config};
 use nufrost_gdal::{
     full_scene::{
         self, build_ground_truth_output_path, build_scene_stack_output_path,
@@ -30,6 +31,13 @@ use nufrost_gdal::{
     reconstruct_nufrost_geotiff, reconstruct_hants_geotiff, reconstruct_zhu2015_geotiff,
     synthetic_timestamps_from_bands,
 };
+
+#[derive(Debug, Deserialize)]
+struct ReconstructionConfig {
+    nufrost: NufrostConfig,
+    hants: HantsConfig,
+    zhu2015: Zhu2015Config,
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  CLI definition (clap derive)
@@ -265,7 +273,7 @@ fn default_nufrost_config() -> NufrostConfig {
         "hants":{"nof":3,"sf":"high","fet":500.0,"dod":5,"period":365.25,"valid_min":null,"valid_max":null},
         "zhu2015":{"lasso_alpha":0.1}
     }"#;
-    let rc: nufrost_core::ReconstructionConfig = serde_json::from_str(full_json).unwrap();
+    let rc: ReconstructionConfig = serde_json::from_str(full_json).unwrap();
     rc.nufrost
 }
 
@@ -287,7 +295,7 @@ fn load_nufrost_config(path: Option<&std::path::Path>) -> Result<NufrostConfig> 
         Some(p) => {
             let bytes = fs::read(p)
                 .with_context(|| format!("Cannot read config: {}", p.display()))?;
-            serde_json::from_slice::<nufrost_core::ReconstructionConfig>(&bytes)
+            serde_json::from_slice::<ReconstructionConfig>(&bytes)
                 .map(|rc| rc.nufrost)
                 .or_else(|_| NufrostConfig::from_json(&bytes))
                 .with_context(|| format!("Invalid NUFROST config: {}", p.display()))
@@ -301,7 +309,7 @@ fn load_hants_config(path: Option<&std::path::Path>) -> Result<HantsConfig> {
         Some(p) => {
             let bytes = fs::read(p)
                 .with_context(|| format!("Cannot read config: {}", p.display()))?;
-            serde_json::from_slice::<nufrost_core::ReconstructionConfig>(&bytes)
+            serde_json::from_slice::<ReconstructionConfig>(&bytes)
                 .map(|rc| rc.hants)
                 .or_else(|_| HantsConfig::from_json(&bytes))
                 .with_context(|| format!("Invalid HANTS config: {}", p.display()))
@@ -315,7 +323,7 @@ fn load_zhu2015_config(path: Option<&std::path::Path>) -> Result<Zhu2015Config> 
         Some(p) => {
             let bytes = fs::read(p)
                 .with_context(|| format!("Cannot read config: {}", p.display()))?;
-            serde_json::from_slice::<nufrost_core::ReconstructionConfig>(&bytes)
+            serde_json::from_slice::<ReconstructionConfig>(&bytes)
                 .map(|rc| rc.zhu2015)
                 .or_else(|_| Zhu2015Config::from_json(&bytes))
                 .with_context(|| format!("Invalid Zhu2015 config: {}", p.display()))

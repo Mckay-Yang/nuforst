@@ -1266,6 +1266,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hants"
+version = "0.1.0"
+dependencies = [
+ "approx",
+ "ndarray",
+ "ndarray-npy",
+ "nufrost-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2016,12 +2028,15 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "hants",
  "ndarray",
  "ndarray-npy",
  "nufrost-core",
  "nufrost-gdal",
  "rayon",
+ "serde",
  "serde_json",
+ "zhu2015",
 ]
 
 [[package]]
@@ -2048,23 +2063,27 @@ dependencies = [
  "chrono",
  "gdal",
  "gdal-sys",
+ "hants",
  "ndarray",
  "nufrost-core",
  "rayon",
  "regex",
  "thiserror 2.0.18",
+ "zhu2015",
 ]
 
 [[package]]
 name = "nufrost-py"
 version = "0.1.0"
 dependencies = [
+ "hants",
  "maturin",
  "nufrost-core",
  "numpy",
  "pyo3",
  "rayon",
  "serde_json",
+ "zhu2015",
 ]
 
 [[package]]
@@ -4525,6 +4544,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "zhu2015"
+version = "0.1.0"
+dependencies = [
+ "approx",
+ "ndarray",
+ "ndarray-npy",
+ "nufrost-core",
+ "rayon",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

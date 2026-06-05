@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "crates/nufrost-core",
+    "crates/hants",
+    "crates/zhu2015",
     "crates/nufrost-gdal",
     "crates/nufrost-cli",
     "crates/nufrost-py",

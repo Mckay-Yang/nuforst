@@ -1,21 +1,14 @@
-// nufrost-core — shared types, error handling, config parsing, and validation
-// helpers for the NUFROST / HANTS / Zhu2015 reconstruction suite.
-//
-// Algorithms live in sibling crates; this crate provides the canonical data
-// model that all three algorithms share.
+// nufrost-core — NUFROST algorithm, shared types, errors, and time helpers.
 
 pub mod config;
 pub mod error;
-pub mod hants;
 pub mod nufrost;
 pub mod nufft;
 pub mod time;
 pub mod types;
-pub mod zhu2015;
 
-pub use config::{NufrostConfig, HantsConfig, Zhu2015Config, ReconstructionConfig};
+pub use config::NufrostConfig;
 pub use error::NufrostError;
-pub use hants::{HantsResult, hants_fit, hants_predict, hants_predict_curve, hants_pixel, make_design_matrix};
 pub use nufrost::{NufrostResult, nufrost_fit_pixel, nufrost_predict, nufrost_predict_curve, nufrost_pixel,
     compute_spectrum_direct, compute_spectrum_nufft, select_peaks_adaptive, refine_parabolic, next_even, select_frequencies};
 pub use time::{find_timestamp_substring, parse_iso8601_to_epoch_seconds, to_seconds_since_start, parse_timestamps_to_epoch_seconds, parse_to_relative_days};

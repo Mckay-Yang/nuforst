@@ -57,6 +57,35 @@
 //! Matches the Python reference's simplified model-order encoding.
 
 use ndarray::{Array1, Array2, Axis};
+use nufrost_core::NufrostError;
+use serde::{Deserialize, Serialize};
+
+/// Zhu2015 reconstruction parameters.
+///
+/// Field names match `config/zhu2015.json`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Zhu2015Config {
+    pub lasso_alpha: f64,
+}
+
+impl Zhu2015Config {
+    /// Load from a JSON byte slice.
+    pub fn from_json(data: &[u8]) -> Result<Self, NufrostError> {
+        serde_json::from_slice(data).map_err(NufrostError::Json)
+    }
+
+    /// Validate required fields.
+    pub fn validate(&self) -> Result<(), NufrostError> {
+        if self.lasso_alpha < 0.0 {
+            return Err(NufrostError::InvalidConfigValue {
+                field: "lasso_alpha".into(),
+                reason: "must be >= 0".into(),
+            });
+        }
+        Ok(())
+    }
+}
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -593,6 +622,20 @@ mod tests {
             result.qa, expected_qa,
             "{} QA mismatch", name
         );
+    }
+
+    #[test]
+    fn parse_zhu2015_config() {
+        let cfg = Zhu2015Config::from_json(br#"{"lasso_alpha":0.1}"#).unwrap();
+        assert!((cfg.lasso_alpha - 0.1).abs() < 1e-10);
+    }
+
+    #[test]
+    fn zhu2015_validate_negative_alpha() {
+        let mut cfg = Zhu2015Config::from_json(br#"{"lasso_alpha":0.1}"#).unwrap();
+        cfg.lasso_alpha = -0.5;
+        let err = cfg.validate().unwrap_err();
+        assert!(format!("{err}").contains("lasso_alpha"));
     }
 
     #[test]

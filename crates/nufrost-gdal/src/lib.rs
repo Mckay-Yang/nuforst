@@ -566,7 +566,7 @@ pub fn reconstruct_nufrost_geotiff<P: AsRef<Path>>(
 
 /// Reconstruct a full raster using HANTS.
 ///
-/// Reads all bands from `reader`, applies [`nufrost_core::hants_pixel`] to
+/// Reads all bands from `reader`, applies [`hants::hants_pixel`] to
 /// every pixel in parallel, and writes a single-band Float32 GeoTIFF.
 pub fn reconstruct_hants_geotiff<P: AsRef<Path>>(
     reader: &RasterReader,
@@ -590,7 +590,7 @@ pub fn reconstruct_hants_geotiff<P: AsRef<Path>>(
         output_path,
         metadata,
         |ts, obs, targ| {
-            let pred = nufrost_core::hants_pixel(
+            let pred = hants::hants_pixel(
                 ts, obs, targ, nof, sf, valid_min, valid_max, fet, dod, period,
             );
             if pred.is_finite() { pred } else { f64::NAN }
@@ -601,7 +601,7 @@ pub fn reconstruct_hants_geotiff<P: AsRef<Path>>(
 /// Reconstruct a full raster using Zhu2015.
 ///
 /// Reads all bands from `reader`, applies
-/// [`nufrost_core::zhu2015::fit_predict_pixel`] to every pixel in parallel,
+/// [`zhu2015::fit_predict_pixel`] to every pixel in parallel,
 /// and writes a single-band GeoTIFF (Float32 prediction).
 pub fn reconstruct_zhu2015_geotiff<P: AsRef<Path>>(
     reader: &RasterReader,
@@ -642,7 +642,7 @@ pub fn reconstruct_zhu2015_geotiff<P: AsRef<Path>>(
                     }
                 }
                 if !ts_buf.is_empty() {
-                    let result = nufrost_core::zhu2015::fit_predict_pixel(
+                    let result = zhu2015::fit_predict_pixel(
                         &ts_buf, &obs_buf, target_t_day, lasso_alpha,
                     );
                     pred_row[c] = if result.prediction.is_finite() {

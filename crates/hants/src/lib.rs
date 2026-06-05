@@ -13,6 +13,48 @@
 //   DOD  : degree of overdeterminedness — keep at least (2*nof-1 + dod) points
 
 use ndarray::{Array1, Array2};
+use nufrost_core::NufrostError;
+use serde::{Deserialize, Serialize};
+
+/// HANTS reconstruction parameters.
+///
+/// Field names match `config/hants.json` exactly, with `Option<f64>` for the
+/// optional `valid_min` / `valid_max` thresholds.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HantsConfig {
+    pub nof: u32,
+    pub sf: String,
+    pub fet: f64,
+    pub dod: u32,
+    pub valid_min: Option<f64>,
+    pub valid_max: Option<f64>,
+    pub period: f64,
+}
+
+impl HantsConfig {
+    /// Load from a JSON byte slice.
+    pub fn from_json(data: &[u8]) -> Result<Self, NufrostError> {
+        serde_json::from_slice(data).map_err(NufrostError::Json)
+    }
+
+    /// Validate required fields.
+    pub fn validate(&self) -> Result<(), NufrostError> {
+        if self.nof == 0 {
+            return Err(NufrostError::InvalidConfigValue {
+                field: "nof".into(),
+                reason: "number of frequencies must be > 0".into(),
+            });
+        }
+        if self.dod == 0 {
+            return Err(NufrostError::InvalidConfigValue {
+                field: "dod".into(),
+                reason: "degree of over-determination must be > 0".into(),
+            });
+        }
+        Ok(())
+    }
+}
 
 /// Result of a single-pixel HANTS fit.
 #[derive(Debug, Clone)]
@@ -707,6 +749,36 @@ mod tests {
 
     use serde_json::Value;
     use std::fs;
+
+    const HANTS_JSON: &str = r#"{
+        "nof": 3,
+        "sf": "high",
+        "fet": 500.0,
+        "dod": 5,
+        "valid_min": null,
+        "valid_max": null,
+        "period": 365.25
+    }"#;
+
+    #[test]
+    fn parse_hants_config() {
+        let cfg = HantsConfig::from_json(HANTS_JSON.as_bytes()).unwrap();
+        assert_eq!(cfg.nof, 3);
+        assert_eq!(cfg.sf, "high");
+        assert!((cfg.fet - 500.0).abs() < 1e-10);
+        assert_eq!(cfg.dod, 5);
+        assert!(cfg.valid_min.is_none());
+        assert!(cfg.valid_max.is_none());
+        assert!((cfg.period - 365.25).abs() < 1e-10);
+    }
+
+    #[test]
+    fn hants_validate_zero_nof() {
+        let mut cfg = HantsConfig::from_json(HANTS_JSON.as_bytes()).unwrap();
+        cfg.nof = 0;
+        let err = cfg.validate().unwrap_err();
+        assert!(format!("{err}").contains("nof"));
+    }
 
     fn fixture_path(name: &str) -> String {
         format!(
