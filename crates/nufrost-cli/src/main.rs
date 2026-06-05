@@ -10,7 +10,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use ndarray::Array3;
 use rayon::prelude::*;
-use serde::Deserialize;
+use serde::de::DeserializeOwned;
 
 use nufrost_core::{
     nufrost_pixel, parse_iso8601_to_epoch_seconds, NufrostConfig,
@@ -29,15 +29,7 @@ use nufrost_gdal::{
     read_all_bands_window_offset,
     RasterMetadata, RasterReader,
     reconstruct_nufrost_geotiff, reconstruct_hants_geotiff, reconstruct_zhu2015_geotiff,
-    synthetic_timestamps_from_bands,
 };
-
-#[derive(Debug, Deserialize)]
-struct ReconstructionConfig {
-    nufrost: NufrostConfig,
-    hants: HantsConfig,
-    zhu2015: Zhu2015Config,
-}
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  CLI definition (clap derive)
@@ -273,8 +265,8 @@ fn default_nufrost_config() -> NufrostConfig {
         "hants":{"nof":3,"sf":"high","fet":500.0,"dod":5,"period":365.25,"valid_min":null,"valid_max":null},
         "zhu2015":{"lasso_alpha":0.1}
     }"#;
-    let rc: ReconstructionConfig = serde_json::from_str(full_json).unwrap();
-    rc.nufrost
+    parse_grouped_config_section(full_json.as_bytes(), "nufrost")
+        .expect("hardcoded grouped default config must be valid")
 }
 
 /// Default HANTS config matching Python `config/hants.json`.
@@ -290,13 +282,25 @@ fn default_zhu2015_config() -> Zhu2015Config {
     serde_json::from_str(r#"{"lasso_alpha":0.1}"#).expect("hardcoded default Zhu2015 config must be valid")
 }
 
+fn parse_grouped_config_section<T: DeserializeOwned>(
+    bytes: &[u8],
+    section: &str,
+) -> serde_json::Result<T> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)?;
+    serde_json::from_value(value[section].clone())
+}
+
+#[allow(deprecated)]
+fn synthetic_geotiff_timestamps(n_bands: usize) -> (Vec<f64>, f64) {
+    nufrost_gdal::synthetic_timestamps_from_bands(n_bands)
+}
+
 fn load_nufrost_config(path: Option<&std::path::Path>) -> Result<NufrostConfig> {
     match path {
         Some(p) => {
             let bytes = fs::read(p)
                 .with_context(|| format!("Cannot read config: {}", p.display()))?;
-            serde_json::from_slice::<ReconstructionConfig>(&bytes)
-                .map(|rc| rc.nufrost)
+            parse_grouped_config_section(&bytes, "nufrost")
                 .or_else(|_| NufrostConfig::from_json(&bytes))
                 .with_context(|| format!("Invalid NUFROST config: {}", p.display()))
         }
@@ -309,8 +313,7 @@ fn load_hants_config(path: Option<&std::path::Path>) -> Result<HantsConfig> {
         Some(p) => {
             let bytes = fs::read(p)
                 .with_context(|| format!("Cannot read config: {}", p.display()))?;
-            serde_json::from_slice::<ReconstructionConfig>(&bytes)
-                .map(|rc| rc.hants)
+            parse_grouped_config_section(&bytes, "hants")
                 .or_else(|_| HantsConfig::from_json(&bytes))
                 .with_context(|| format!("Invalid HANTS config: {}", p.display()))
         }
@@ -323,8 +326,7 @@ fn load_zhu2015_config(path: Option<&std::path::Path>) -> Result<Zhu2015Config> 
         Some(p) => {
             let bytes = fs::read(p)
                 .with_context(|| format!("Cannot read config: {}", p.display()))?;
-            serde_json::from_slice::<ReconstructionConfig>(&bytes)
-                .map(|rc| rc.zhu2015)
+            parse_grouped_config_section(&bytes, "zhu2015")
                 .or_else(|_| Zhu2015Config::from_json(&bytes))
                 .with_context(|| format!("Invalid Zhu2015 config: {}", p.display()))
         }
@@ -504,7 +506,7 @@ fn run_nufrost_geotiff(
 ) -> Result<()> {
     let config = load_nufrost_config(args.config.as_deref())?;
     let meta = metadata_from_reader(reader);
-    let (timestamps_days, target_t) = synthetic_timestamps_from_bands(reader.band_count());
+    let (timestamps_days, target_t) = synthetic_geotiff_timestamps(reader.band_count());
     let target_t = args.shared.target_time.unwrap_or(target_t);
 
     reconstruct_nufrost_geotiff(reader, &timestamps_days, target_t, &config, output, &meta)
@@ -521,7 +523,7 @@ fn run_hants_geotiff(
 ) -> Result<()> {
     let config = load_hants_config(args.config.as_deref())?;
     let meta = metadata_from_reader(reader);
-    let (timestamps_days, target_t) = synthetic_timestamps_from_bands(reader.band_count());
+    let (timestamps_days, target_t) = synthetic_geotiff_timestamps(reader.band_count());
     let target_t = args.shared.target_time.unwrap_or(target_t);
 
     reconstruct_hants_geotiff(
@@ -551,7 +553,7 @@ fn run_zhu2015_geotiff(
 ) -> Result<()> {
     let config = load_zhu2015_config(args.config.as_deref())?;
     let meta = metadata_from_reader(reader);
-    let (timestamps_days, target_t) = synthetic_timestamps_from_bands(reader.band_count());
+    let (timestamps_days, target_t) = synthetic_geotiff_timestamps(reader.band_count());
     let target_t = args.shared.target_time.unwrap_or(target_t);
 
     reconstruct_zhu2015_geotiff(reader, &timestamps_days, target_t, config.lasso_alpha, output, &meta)

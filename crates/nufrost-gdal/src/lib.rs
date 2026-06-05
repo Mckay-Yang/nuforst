@@ -1049,6 +1049,11 @@ mod tests {
         );
     }
 
+    #[allow(deprecated)]
+    fn synthetic_test_timestamps(n_bands: usize) -> (Vec<f64>, f64) {
+        synthetic_timestamps_from_bands(n_bands)
+    }
+
     #[test]
     fn reconstruct_nufrost_small_window_roundtrip() {
         let input = Path::new("test_ts_nufrost.tif");
@@ -1061,7 +1066,7 @@ mod tests {
             crs_wkt: None,
             nodata: Some(f64::NAN),
         };
-        let (t_days, target_t) = synthetic_timestamps_from_bands(reader.band_count());
+        let (t_days, target_t) = synthetic_test_timestamps(reader.band_count());
 
         let config = NufrostConfig {
             modes: 256,
@@ -1123,7 +1128,7 @@ mod tests {
             crs_wkt: None,
             nodata: Some(f64::NAN),
         };
-        let (t_days, target_t) = synthetic_timestamps_from_bands(reader.band_count());
+        let (t_days, target_t) = synthetic_test_timestamps(reader.band_count());
 
         reconstruct_hants_geotiff(
             &reader, &t_days, target_t,
@@ -1155,7 +1160,7 @@ mod tests {
             crs_wkt: None,
             nodata: Some(f64::NAN),
         };
-        let (t_days, target_t) = synthetic_timestamps_from_bands(reader.band_count());
+        let (t_days, target_t) = synthetic_test_timestamps(reader.band_count());
 
         reconstruct_zhu2015_geotiff(&reader, &t_days, target_t, 0.1, output, &meta).unwrap();
 
@@ -1183,7 +1188,7 @@ mod tests {
 
         let reader = RasterReader::open(path).unwrap();
         let meta = RasterMetadata { geo_transform: DEFAULT_GEO, crs_wkt: None, nodata: Some(f64::NAN) };
-        let (t_days, target_t) = synthetic_timestamps_from_bands(reader.band_count());
+        let (t_days, target_t) = synthetic_test_timestamps(reader.band_count());
 
         // 1 band with all-NaN values: algorithms should still run but output NaNs
         let output = Path::new("test_out_empty.tif");
