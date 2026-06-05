@@ -3,9 +3,11 @@
 // raster GeoTIFF input via gdal.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{bail, Context, Result};
 use clap::{Arg, ArgAction, Command};
@@ -13,24 +15,21 @@ use ndarray::Array3;
 use rayon::prelude::*;
 use serde::de::DeserializeOwned;
 
+use gdal::{
+    collapse_duplicate_timestamps, extract_raw_band_descriptions,
+    full_scene::{
+        self, build_ground_truth_output_path, build_scene_stack_output_path,
+        choose_shared_target_timestamp, discover_sentinel_band_stacks, make_masked_time_series,
+        mask_invalid_sentinel2, sorted_band_names, write_band_stack,
+    },
+    read_all_bands, read_all_bands_window_offset, RasterMetadata, RasterReader,
+};
+use hants_core::{hants_pixel, reconstruct_hants_geotiff, HantsConfig};
 use nufrost_core::{
     nufrost_pixel, nufrost_pixel_vector, parse_iso8601_to_epoch_seconds,
     reconstruct_nufrost_geotiff, NufrostConfig,
 };
-use hants_core::{hants_pixel, reconstruct_hants_geotiff, HantsConfig};
 use zhu2015_core::{fit_predict_pixel, reconstruct_zhu2015_geotiff, Zhu2015Config};
-use gdal::{
-    full_scene::{
-        self, build_ground_truth_output_path, build_scene_stack_output_path,
-        choose_shared_target_timestamp, discover_sentinel_band_stacks,
-        make_masked_time_series, mask_invalid_sentinel2,
-        sorted_band_names, write_band_stack,
-    },
-    collapse_duplicate_timestamps,
-    extract_raw_band_descriptions, read_all_bands,
-    read_all_bands_window_offset,
-    RasterMetadata, RasterReader,
-};
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  CLI definition
@@ -47,6 +46,7 @@ enum Algorithm {
     Hants(HantsArgs),
     Zhu2015(Zhu2015Args),
     FullScene(FullSceneArgs),
+    BatchFullScene(BatchFullSceneArgs),
 }
 
 #[derive(Debug)]
@@ -65,6 +65,20 @@ struct FullSceneArgs {
     late_fraction: f64,
     #[allow(dead_code)]
     frequency_selection: Option<String>,
+}
+
+#[derive(Debug)]
+struct BatchFullSceneArgs {
+    source_name: String,
+    output_root: PathBuf,
+    data_root: PathBuf,
+    methods: String,
+    n_jobs: Option<usize>,
+    window_size: Option<usize>,
+    min_valid_ratio: f64,
+    late_fraction: f64,
+    limit: Option<usize>,
+    continue_on_error: bool,
 }
 
 #[derive(Debug)]
@@ -137,6 +151,18 @@ impl Cli {
                 late_fraction: *sub.get_one::<f64>("late_fraction").unwrap(),
                 frequency_selection: sub.get_one::<String>("frequency_selection").cloned(),
             }),
+            "batch-full-scene" => Algorithm::BatchFullScene(BatchFullSceneArgs {
+                source_name: sub.get_one::<String>("source_name").cloned().unwrap(),
+                output_root: sub.get_one::<PathBuf>("output_root").cloned().unwrap(),
+                data_root: sub.get_one::<PathBuf>("data_root").cloned().unwrap(),
+                methods: sub.get_one::<String>("methods").cloned().unwrap(),
+                n_jobs: sub.get_one::<usize>("n_jobs").copied(),
+                window_size: sub.get_one::<usize>("window_size").copied(),
+                min_valid_ratio: *sub.get_one::<f64>("min_valid_ratio").unwrap(),
+                late_fraction: *sub.get_one::<f64>("late_fraction").unwrap(),
+                limit: sub.get_one::<usize>("limit").copied(),
+                continue_on_error: sub.get_flag("continue_on_error"),
+            }),
             _ => unreachable!("clap accepted an unknown subcommand: {name}"),
         };
         Ok(Self { algorithm })
@@ -161,6 +187,7 @@ impl Cli {
             .subcommand(algorithm_command("hants", "Run HANTS reconstruction."))
             .subcommand(algorithm_command("zhu2015", "Run Zhu2015 reconstruction."))
             .subcommand(full_scene_command())
+            .subcommand(batch_full_scene_command())
     }
 }
 
@@ -307,6 +334,76 @@ fn full_scene_command() -> Command {
         )
 }
 
+fn batch_full_scene_command() -> Command {
+    Command::new("batch-full-scene")
+        .about("Run full-scene reconstruction for every complete location.")
+        .arg(
+            Arg::new("source_name")
+                .long("source-name")
+                .required(true)
+                .value_name("NAME")
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("output_root")
+                .long("output-root")
+                .value_name("PATH")
+                .default_value("data/output")
+                .value_parser(clap::value_parser!(PathBuf)),
+        )
+        .arg(
+            Arg::new("data_root")
+                .long("data-root")
+                .value_name("PATH")
+                .default_value("data")
+                .value_parser(clap::value_parser!(PathBuf)),
+        )
+        .arg(
+            Arg::new("methods")
+                .long("methods")
+                .value_name("LIST")
+                .default_value("nufrost,hants,zhu2015")
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("n_jobs")
+                .long("n-jobs")
+                .value_name("N")
+                .value_parser(clap::value_parser!(usize)),
+        )
+        .arg(
+            Arg::new("window_size")
+                .long("window-size")
+                .value_name("PX")
+                .value_parser(clap::value_parser!(usize)),
+        )
+        .arg(
+            Arg::new("min_valid_ratio")
+                .long("min-valid-ratio")
+                .value_name("RATIO")
+                .default_value("0.9")
+                .value_parser(clap::value_parser!(f64)),
+        )
+        .arg(
+            Arg::new("late_fraction")
+                .long("late-fraction")
+                .value_name("RATIO")
+                .default_value("0.25")
+                .value_parser(clap::value_parser!(f64)),
+        )
+        .arg(
+            Arg::new("limit")
+                .long("limit")
+                .value_name("N")
+                .value_parser(clap::value_parser!(usize)),
+        )
+        .arg(
+            Arg::new("continue_on_error")
+                .long("continue-on-error")
+                .action(ArgAction::SetTrue),
+        )
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Fixture loading (single-pixel NPZ mode)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -323,8 +420,8 @@ struct FixtureData {
 fn load_fixture_npz(path: &std::path::Path) -> Result<FixtureData> {
     use ndarray::Array1;
 
-    let file = fs::File::open(path)
-        .with_context(|| format!("Cannot open fixture: {}", path.display()))?;
+    let file =
+        fs::File::open(path).with_context(|| format!("Cannot open fixture: {}", path.display()))?;
     let mut npz = ndarray_npy::NpzReader::new(file)
         .with_context(|| format!("Cannot parse NPZ: {}", path.display()))?;
 
@@ -378,7 +475,8 @@ fn default_hants_config() -> HantsConfig {
 
 /// Default Zhu2015 config matching Python `config/zhu2015.json`.
 fn default_zhu2015_config() -> Zhu2015Config {
-    serde_json::from_str(r#"{"lasso_alpha":0.1}"#).expect("hardcoded default Zhu2015 config must be valid")
+    serde_json::from_str(r#"{"lasso_alpha":0.1}"#)
+        .expect("hardcoded default Zhu2015 config must be valid")
 }
 
 fn parse_grouped_config_section<T: DeserializeOwned>(
@@ -397,8 +495,8 @@ fn synthetic_geotiff_timestamps(n_bands: usize) -> (Vec<f64>, f64) {
 fn load_nufrost_config(path: Option<&std::path::Path>) -> Result<NufrostConfig> {
     match path {
         Some(p) => {
-            let bytes = fs::read(p)
-                .with_context(|| format!("Cannot read config: {}", p.display()))?;
+            let bytes =
+                fs::read(p).with_context(|| format!("Cannot read config: {}", p.display()))?;
             parse_grouped_config_section(&bytes, "nufrost")
                 .or_else(|_| NufrostConfig::from_json(&bytes))
                 .with_context(|| format!("Invalid NUFROST config: {}", p.display()))
@@ -410,8 +508,8 @@ fn load_nufrost_config(path: Option<&std::path::Path>) -> Result<NufrostConfig> 
 fn load_hants_config(path: Option<&std::path::Path>) -> Result<HantsConfig> {
     match path {
         Some(p) => {
-            let bytes = fs::read(p)
-                .with_context(|| format!("Cannot read config: {}", p.display()))?;
+            let bytes =
+                fs::read(p).with_context(|| format!("Cannot read config: {}", p.display()))?;
             parse_grouped_config_section(&bytes, "hants")
                 .or_else(|_| HantsConfig::from_json(&bytes))
                 .with_context(|| format!("Invalid HANTS config: {}", p.display()))
@@ -423,8 +521,8 @@ fn load_hants_config(path: Option<&std::path::Path>) -> Result<HantsConfig> {
 fn load_zhu2015_config(path: Option<&std::path::Path>) -> Result<Zhu2015Config> {
     match path {
         Some(p) => {
-            let bytes = fs::read(p)
-                .with_context(|| format!("Cannot read config: {}", p.display()))?;
+            let bytes =
+                fs::read(p).with_context(|| format!("Cannot read config: {}", p.display()))?;
             parse_grouped_config_section(&bytes, "zhu2015")
                 .or_else(|_| Zhu2015Config::from_json(&bytes))
                 .with_context(|| format!("Invalid Zhu2015 config: {}", p.display()))
@@ -441,7 +539,10 @@ enum InputMode {
     /// Single-pixel NPZ fixture.
     NpzFixture(FixtureData),
     /// Raster GeoTIFF with per-pixel reconstruction.
-    GeoTiff { reader: RasterReader, output: PathBuf },
+    GeoTiff {
+        reader: RasterReader,
+        output: PathBuf,
+    },
 }
 
 fn detect_input_mode(shared: &SharedArgs) -> Result<InputMode> {
@@ -460,9 +561,10 @@ fn detect_input_mode(shared: &SharedArgs) -> Result<InputMode> {
             if rows == 0 || cols == 0 {
                 bail!("GeoTIFF has zero spatial dimensions ({rows}r × {cols}c)");
             }
-            let output = shared.output.clone().ok_or_else(|| {
-                anyhow::anyhow!("--output <PATH> is required in GeoTIFF mode")
-            })?;
+            let output = shared
+                .output
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("--output <PATH> is required in GeoTIFF mode"))?;
             Ok(InputMode::GeoTiff { reader, output })
         }
         (Some(_), Some(_)) => {
@@ -491,8 +593,7 @@ fn output_result(value: f64, output_path: Option<&PathBuf>, label: &str) -> Resu
     };
     match output_path {
         Some(p) => {
-            fs::write(p, &text)
-                .with_context(|| format!("Cannot write output: {}", p.display()))?;
+            fs::write(p, &text).with_context(|| format!("Cannot write output: {}", p.display()))?;
         }
         None => {
             print!("{text}");
@@ -505,7 +606,9 @@ fn output_result(value: f64, output_path: Option<&PathBuf>, label: &str) -> Resu
 
 fn metadata_from_reader(reader: &RasterReader) -> RasterMetadata {
     RasterMetadata {
-        geo_transform: reader.geo_transform().unwrap_or([0.0, 1.0, 0.0, 0.0, 0.0, -1.0]),
+        geo_transform: reader
+            .geo_transform()
+            .unwrap_or([0.0, 1.0, 0.0, 0.0, 0.0, -1.0]),
         crs_wkt: reader.crs_wkt(),
         nodata: reader.nodata(1),
     }
@@ -587,10 +690,7 @@ fn run_zhu2015_npz(args: &Zhu2015Args, fixture: &FixtureData) -> Result<()> {
         "zhu2015_prediction",
     )?;
 
-    eprintln!(
-        "Zhu2015 completed: pred={:.6}",
-        result.prediction
-    );
+    eprintln!("Zhu2015 completed: pred={:.6}", result.prediction);
     Ok(())
 }
 
@@ -598,11 +698,7 @@ fn run_zhu2015_npz(args: &Zhu2015Args, fixture: &FixtureData) -> Result<()> {
 //  GeoTIFF mode — full raster reconstruction
 // ═══════════════════════════════════════════════════════════════════════════
 
-fn run_nufrost_geotiff(
-    args: &NufrostArgs,
-    reader: &RasterReader,
-    output: &PathBuf,
-) -> Result<()> {
+fn run_nufrost_geotiff(args: &NufrostArgs, reader: &RasterReader, output: &PathBuf) -> Result<()> {
     let config = load_nufrost_config(args.config.as_deref())?;
     let meta = metadata_from_reader(reader);
     let (timestamps_days, target_t) = synthetic_geotiff_timestamps(reader.band_count());
@@ -611,15 +707,14 @@ fn run_nufrost_geotiff(
     reconstruct_nufrost_geotiff(reader, &timestamps_days, target_t, &config, output, &meta)
         .with_context(|| format!("NUFROST GeoTIFF reconstruction failed"))?;
 
-    eprintln!("NUFROST GeoTIFF reconstruction written to {}", output.display());
+    eprintln!(
+        "NUFROST GeoTIFF reconstruction written to {}",
+        output.display()
+    );
     Ok(())
 }
 
-fn run_hants_geotiff(
-    args: &HantsArgs,
-    reader: &RasterReader,
-    output: &PathBuf,
-) -> Result<()> {
+fn run_hants_geotiff(args: &HantsArgs, reader: &RasterReader, output: &PathBuf) -> Result<()> {
     let config = load_hants_config(args.config.as_deref())?;
     let meta = metadata_from_reader(reader);
     let (timestamps_days, target_t) = synthetic_geotiff_timestamps(reader.band_count());
@@ -641,22 +736,28 @@ fn run_hants_geotiff(
     )
     .with_context(|| "HANTS GeoTIFF reconstruction failed")?;
 
-    eprintln!("HANTS GeoTIFF reconstruction written to {}", output.display());
+    eprintln!(
+        "HANTS GeoTIFF reconstruction written to {}",
+        output.display()
+    );
     Ok(())
 }
 
-fn run_zhu2015_geotiff(
-    args: &Zhu2015Args,
-    reader: &RasterReader,
-    output: &PathBuf,
-) -> Result<()> {
+fn run_zhu2015_geotiff(args: &Zhu2015Args, reader: &RasterReader, output: &PathBuf) -> Result<()> {
     let config = load_zhu2015_config(args.config.as_deref())?;
     let meta = metadata_from_reader(reader);
     let (timestamps_days, target_t) = synthetic_geotiff_timestamps(reader.band_count());
     let target_t = args.shared.target_time.unwrap_or(target_t);
 
-    reconstruct_zhu2015_geotiff(reader, &timestamps_days, target_t, config.lasso_alpha, output, &meta)
-        .with_context(|| "Zhu2015 GeoTIFF reconstruction failed")?;
+    reconstruct_zhu2015_geotiff(
+        reader,
+        &timestamps_days,
+        target_t,
+        config.lasso_alpha,
+        output,
+        &meta,
+    )
+    .with_context(|| "Zhu2015 GeoTIFF reconstruction failed")?;
 
     eprintln!(
         "Zhu2015 GeoTIFF reconstruction written to {}",
@@ -747,10 +848,7 @@ fn reconstruct_nufrost_vector_scene(
         .collect();
     epochs.push(target_epoch);
     epochs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let ts_days: Vec<f64> = epochs
-        .iter()
-        .map(|&e| (e - epochs[0]) / 86400.0)
-        .collect();
+    let ts_days: Vec<f64> = epochs.iter().map(|&e| (e - epochs[0]) / 86400.0).collect();
     let target_day = (target_epoch - epochs[0]) / 86400.0;
     let masked_days: Vec<f64> = ts_days
         .iter()
@@ -767,14 +865,16 @@ fn reconstruct_nufrost_vector_scene(
 
     let n_bands = ordered_bands.len();
     let mut pred_cube = Array3::<f64>::from_elem((n_bands, rows, cols), f64::NAN);
+    eprintln!("NUFROST vector scene: {rows} rows x {cols} cols x {n_bands} bands");
+    let progress = AtomicUsize::new(0);
+    let progress_step = (rows / 10).max(1);
     pred_cube
         .axis_iter_mut(ndarray::Axis(1))
         .into_par_iter()
         .enumerate()
         .for_each(|(r, mut row_out)| {
-            let mut obs_by_band: Vec<Vec<f64>> = (0..n_bands)
-                .map(|_| Vec::with_capacity(n_times))
-                .collect();
+            let mut obs_by_band: Vec<Vec<f64>> =
+                (0..n_bands).map(|_| Vec::with_capacity(n_times)).collect();
             for c in 0..cols {
                 for obs in obs_by_band.iter_mut() {
                     obs.clear();
@@ -788,6 +888,10 @@ fn reconstruct_nufrost_vector_scene(
                 for (bi, &val) in pred.iter().enumerate() {
                     row_out[[bi, c]] = if val.is_finite() { val } else { f64::NAN };
                 }
+            }
+            let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
+            if done == rows || done % progress_step == 0 {
+                eprintln!("  NUFROST rows: {done}/{rows}");
             }
         });
 
@@ -803,6 +907,211 @@ fn reconstruct_nufrost_vector_scene(
         .collect())
 }
 
+fn validate_full_scene_methods(methods: &str) -> Result<Vec<String>> {
+    let parsed: Vec<String> = methods
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if parsed.is_empty() {
+        bail!("--methods must contain at least one method");
+    }
+    for method in &parsed {
+        match method.as_str() {
+            "nufrost" | "hants" | "zhu2015" => {}
+            _ => bail!(
+                "Unknown full-scene method '{method}'. Expected one of: nufrost,hants,zhu2015"
+            ),
+        }
+    }
+    Ok(parsed)
+}
+
+fn resolve_full_scene_band_stacks(
+    data_root: &Path,
+    source_name: &str,
+    lon: f64,
+    lat: f64,
+) -> Result<BTreeMap<String, Vec<PathBuf>>> {
+    let source_dir = data_root.join(source_name);
+    let mut band_stacks = discover_sentinel_band_stacks(&source_dir, lon, lat)?;
+    if band_stacks.is_empty() {
+        bail!(
+            "No band stacks found for lon={}, lat={} in {}",
+            lon,
+            lat,
+            source_dir.display()
+        );
+    }
+
+    let vrt_dir = data_root.join("cache").join("local").join("vrts");
+    let loc_token6 = full_scene::location_output_token(lon, lat);
+    for (band_name, paths) in band_stacks.iter_mut() {
+        if paths.len() <= 1 {
+            continue;
+        }
+
+        let vrt_path = vrt_dir.join(format!("sentinel_{band_name}_{loc_token6}.vrt"));
+        if vrt_path.exists() {
+            eprintln!(
+                "Band {band_name}: using cached mosaic VRT {} for {} source chunks",
+                vrt_path.display(),
+                paths.len()
+            );
+            *paths = vec![vrt_path];
+        } else {
+            bail!(
+                "Band {band_name} has {} source chunks but no cached mosaic VRT at {}. \
+                 Build or restore the VRT before full-scene reconstruction.",
+                paths.len(),
+                vrt_path.display()
+            );
+        }
+    }
+
+    Ok(band_stacks)
+}
+
+fn prediction_metrics_json(
+    predictions: &BTreeMap<String, ndarray::Array2<f64>>,
+    ground_truths: &BTreeMap<String, ndarray::Array2<f64>>,
+    ordered_bands: &[String],
+) -> Result<serde_json::Value> {
+    let mut bands = serde_json::Map::new();
+    let mut all_n = 0usize;
+    let mut all_sum_err = 0.0f64;
+    let mut all_sum_abs = 0.0f64;
+    let mut all_sum_sq = 0.0f64;
+
+    for band in ordered_bands {
+        let pred = predictions
+            .get(band)
+            .with_context(|| format!("Prediction missing for band {band}"))?;
+        let truth = ground_truths
+            .get(band)
+            .with_context(|| format!("Ground truth missing for band {band}"))?;
+        if pred.dim() != truth.dim() {
+            bail!(
+                "Prediction/ground truth shape mismatch for band {band}: {:?} vs {:?}",
+                pred.dim(),
+                truth.dim()
+            );
+        }
+
+        let mut n = 0usize;
+        let mut sum_err = 0.0f64;
+        let mut sum_abs = 0.0f64;
+        let mut sum_sq = 0.0f64;
+        for (&p, &t) in pred.iter().zip(truth.iter()) {
+            if p.is_finite() && t.is_finite() {
+                let err = p - t;
+                n += 1;
+                sum_err += err;
+                sum_abs += err.abs();
+                sum_sq += err * err;
+            }
+        }
+
+        all_n += n;
+        all_sum_err += sum_err;
+        all_sum_abs += sum_abs;
+        all_sum_sq += sum_sq;
+
+        let (bias, mae, rmse) = if n == 0 {
+            (f64::NAN, f64::NAN, f64::NAN)
+        } else {
+            (
+                sum_err / n as f64,
+                sum_abs / n as f64,
+                (sum_sq / n as f64).sqrt(),
+            )
+        };
+        bands.insert(
+            band.clone(),
+            serde_json::json!({
+                "n": n,
+                "bias": bias,
+                "mae": mae,
+                "rmse": rmse,
+            }),
+        );
+    }
+
+    let (overall_bias, overall_mae, overall_rmse) = if all_n == 0 {
+        (f64::NAN, f64::NAN, f64::NAN)
+    } else {
+        (
+            all_sum_err / all_n as f64,
+            all_sum_abs / all_n as f64,
+            (all_sum_sq / all_n as f64).sqrt(),
+        )
+    };
+
+    Ok(serde_json::json!({
+        "n": all_n,
+        "overall_bias": overall_bias,
+        "overall_mae": overall_mae,
+        "overall_rmse": overall_rmse,
+        "bands": bands,
+    }))
+}
+
+fn parse_sentinel_location_from_filename(name: &str) -> Option<(String, String, String)> {
+    let rest = name.strip_prefix("COPERNICUS_S2_HARMONIZED_")?;
+    let (band, rest) = rest.split_once("_lon")?;
+    let (lon, lat_with_suffix) = rest.split_once("_lat")?;
+    let lat_stem = lat_with_suffix.strip_suffix(".tif")?;
+    let lat = lat_stem.split('-').next().unwrap_or(lat_stem);
+    Some((band.to_string(), lon.to_string(), lat.to_string()))
+}
+
+fn discover_complete_sentinel_locations(
+    data_root: &Path,
+    source_name: &str,
+) -> Result<Vec<(f64, f64)>> {
+    let source_dir = data_root.join(source_name);
+    let entries = fs::read_dir(&source_dir)
+        .with_context(|| format!("cannot read data directory: {}", source_dir.display()))?;
+    let required: BTreeSet<String> = ["B2", "B3", "B4", "B8", "B11", "B12"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let mut by_location: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+
+    for entry in entries {
+        let path = entry?.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Some((band, lon, lat)) = parse_sentinel_location_from_filename(name) else {
+            continue;
+        };
+        by_location.entry((lon, lat)).or_default().insert(band);
+    }
+
+    let mut locations = Vec::new();
+    for ((lon, lat), bands) in by_location {
+        if required.is_subset(&bands) {
+            locations.push((
+                lon.parse::<f64>()
+                    .with_context(|| format!("invalid lon in source filename: {lon}"))?,
+                lat.parse::<f64>()
+                    .with_context(|| format!("invalid lat in source filename: {lat}"))?,
+            ));
+        }
+    }
+    locations.sort_by(|a, b| {
+        a.0.partial_cmp(&b.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    Ok(locations)
+}
+
 fn run_full_scene(args: &FullSceneArgs) -> Result<()> {
     if let Some(n) = args.n_jobs {
         rayon::ThreadPoolBuilder::new()
@@ -811,27 +1120,31 @@ fn run_full_scene(args: &FullSceneArgs) -> Result<()> {
             .context("Failed to build rayon thread pool")?;
     }
 
-    let methods: Vec<&str> = args.methods.split(',').map(|s| s.trim()).collect();
+    let methods = validate_full_scene_methods(&args.methods)?;
 
     // 1. Discover band stacks
-    let source_dir = args.data_root.join(&args.source_name);
-    let band_stacks = discover_sentinel_band_stacks(&source_dir, args.lon, args.lat)?;
-    if band_stacks.is_empty() {
-        bail!(
-            "No band stacks found for lon={}, lat={} in {}",
-            args.lon, args.lat, source_dir.display()
-        );
-    }
+    let band_stacks =
+        resolve_full_scene_band_stacks(&args.data_root, &args.source_name, args.lon, args.lat)?;
 
     // 2. Load per-band cubes and ISO timestamps
     let mut band_cubes: BTreeMap<String, Array3<f64>> = BTreeMap::new();
     let mut band_timestamps: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
     for (band_name, chunk_paths) in &band_stacks {
+        eprintln!(
+            "Loading band {band_name} from {} chunk(s)...",
+            chunk_paths.len()
+        );
         let mut cube_parts: Vec<Array3<f64>> = Vec::new();
         let mut ts_parts: Vec<String> = Vec::new();
 
-        for chunk_path in chunk_paths {
+        for (chunk_idx, chunk_path) in chunk_paths.iter().enumerate() {
+            eprintln!(
+                "  Reading {band_name} chunk {}/{}: {}",
+                chunk_idx + 1,
+                chunk_paths.len(),
+                chunk_path.display()
+            );
             let reader = RasterReader::open(chunk_path)?;
             let cube = if let Some(ws) = args.window_size {
                 let (row_off, col_off) =
@@ -851,6 +1164,7 @@ fn run_full_scene(args: &FullSceneArgs) -> Result<()> {
             let views: Vec<_> = cube_parts.iter().map(|c| c.view()).collect();
             ndarray::concatenate(ndarray::Axis(0), &views)?
         };
+        eprintln!("  Loaded band {band_name}: {:?}", cube_merged.dim());
         band_cubes.insert(band_name.clone(), cube_merged);
         band_timestamps.insert(band_name.clone(), ts_parts);
     }
@@ -861,6 +1175,7 @@ fn run_full_scene(args: &FullSceneArgs) -> Result<()> {
     }
 
     // 4. Target timestamp selection
+    eprintln!("Selecting shared target timestamp...");
     let (target_time_str, _completeness) = choose_shared_target_timestamp(
         &band_cubes,
         &band_timestamps,
@@ -906,7 +1221,9 @@ fn run_full_scene(args: &FullSceneArgs) -> Result<()> {
     let first_chunk = band_stacks.values().next().unwrap().first().unwrap();
     let first_reader = RasterReader::open(first_chunk)?;
     let meta = RasterMetadata {
-        geo_transform: first_reader.geo_transform().unwrap_or([0.0, 1.0, 0.0, 0.0, 0.0, -1.0]),
+        geo_transform: first_reader
+            .geo_transform()
+            .unwrap_or([0.0, 1.0, 0.0, 0.0, 0.0, -1.0]),
         crs_wkt: first_reader.crs_wkt(),
         nodata: first_reader.nodata(1),
     };
@@ -926,8 +1243,11 @@ fn run_full_scene(args: &FullSceneArgs) -> Result<()> {
     let output_root = &args.output_root;
     let loc_token = full_scene::location_token(args.lon, args.lat);
 
+    let mut prediction_outputs = serde_json::Map::new();
+    let mut metrics_by_method = serde_json::Map::new();
+
     for method in &methods {
-        let method_str = *method;
+        let method_str = method.as_str();
         eprintln!("Reconstructing with {method_str}...");
 
         let predictions: BTreeMap<String, ndarray::Array2<f64>> = if method_str == "nufrost" {
@@ -956,10 +1276,8 @@ fn run_full_scene(args: &FullSceneArgs) -> Result<()> {
                     epochs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
                     // Relative days from earliest epoch of this band+target set
-                    let ts_days: Vec<f64> = epochs
-                        .iter()
-                        .map(|&e| (e - epochs[0]) / 86400.0)
-                        .collect();
+                    let ts_days: Vec<f64> =
+                        epochs.iter().map(|&e| (e - epochs[0]) / 86400.0).collect();
                     let target_day = (target_epoch - epochs[0]) / 86400.0;
 
                     // The masked ts_days are all except the target
@@ -971,6 +1289,11 @@ fn run_full_scene(args: &FullSceneArgs) -> Result<()> {
 
                     let (n_bands, rows, cols) = cube.dim();
                     let mut pred = ndarray::Array2::<f64>::from_elem((rows, cols), f64::NAN);
+                    eprintln!(
+                        "  {method_str}/{band_name}: {rows} rows x {cols} cols, {n_bands} time slices"
+                    );
+                    let progress = AtomicUsize::new(0);
+                    let progress_step = (rows / 10).max(1);
 
                     // Parallel per-row reconstruction
                     pred.axis_iter_mut(ndarray::Axis(0))
@@ -992,21 +1315,37 @@ fn run_full_scene(args: &FullSceneArgs) -> Result<()> {
                                 if !ts_buf.is_empty() {
                                     match method_str {
                                         "nufrost" => {
-                                            let val = nufrost_pixel(&ts_buf, &obs_buf, target_day, &nufrost_conf).0;
-                                            row_out[c] = if val.is_finite() { val } else { f64::NAN };
+                                            let val = nufrost_pixel(
+                                                &ts_buf,
+                                                &obs_buf,
+                                                target_day,
+                                                &nufrost_conf,
+                                            )
+                                            .0;
+                                            row_out[c] =
+                                                if val.is_finite() { val } else { f64::NAN };
                                         }
                                         "hants" => {
                                             let val = hants_pixel(
-                                                &ts_buf, &obs_buf, target_day,
-                                                hants_conf.nof, &hants_conf.sf,
-                                                hants_conf.valid_min, hants_conf.valid_max,
-                                                hants_conf.fet, hants_conf.dod, hants_conf.period,
+                                                &ts_buf,
+                                                &obs_buf,
+                                                target_day,
+                                                hants_conf.nof,
+                                                &hants_conf.sf,
+                                                hants_conf.valid_min,
+                                                hants_conf.valid_max,
+                                                hants_conf.fet,
+                                                hants_conf.dod,
+                                                hants_conf.period,
                                             );
-                                            row_out[c] = if val.is_finite() { val } else { f64::NAN };
+                                            row_out[c] =
+                                                if val.is_finite() { val } else { f64::NAN };
                                         }
                                         "zhu2015" => {
                                             let result = fit_predict_pixel(
-                                                &ts_buf, &obs_buf, target_day,
+                                                &ts_buf,
+                                                &obs_buf,
+                                                target_day,
                                                 zhu2015_conf.lasso_alpha,
                                             );
                                             row_out[c] = if result.prediction.is_finite() {
@@ -1018,6 +1357,10 @@ fn run_full_scene(args: &FullSceneArgs) -> Result<()> {
                                         _ => {}
                                     }
                                 }
+                            }
+                            let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
+                            if done == rows || done % progress_step == 0 {
+                                eprintln!("    {method_str}/{band_name} rows: {done}/{rows}");
                             }
                         });
 
@@ -1038,6 +1381,16 @@ fn run_full_scene(args: &FullSceneArgs) -> Result<()> {
         );
         write_band_stack(&output_path, &predictions, &ordered_bands, &meta)?;
         eprintln!("  Wrote {}", output_path.display());
+
+        let metrics = prediction_metrics_json(&predictions, &ground_truths, &ordered_bands)?;
+        if let Some(rmse) = metrics.get("overall_rmse").and_then(|v| v.as_f64()) {
+            eprintln!("  Overall RMSE: {rmse:.6}");
+        }
+        prediction_outputs.insert(
+            method.clone(),
+            serde_json::Value::String(output_path.display().to_string()),
+        );
+        metrics_by_method.insert(method.clone(), metrics);
     }
 
     // 12. Write ground truth
@@ -1067,6 +1420,9 @@ fn run_full_scene(args: &FullSceneArgs) -> Result<()> {
         "window_size": args.window_size,
         "window_lon": args.window_lon,
         "window_lat": args.window_lat,
+        "prediction_outputs": prediction_outputs,
+        "ground_truth_output": gt_path.display().to_string(),
+        "metrics": metrics_by_method,
         "generated_at": now_iso,
     });
 
@@ -1084,6 +1440,109 @@ fn run_full_scene(args: &FullSceneArgs) -> Result<()> {
     Ok(())
 }
 
+fn run_batch_full_scene(args: &BatchFullSceneArgs) -> Result<()> {
+    validate_full_scene_methods(&args.methods)?;
+    if let Some(n) = args.n_jobs {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build_global()
+            .context("Failed to build rayon thread pool")?;
+    }
+
+    let mut locations = discover_complete_sentinel_locations(&args.data_root, &args.source_name)?;
+    if let Some(limit) = args.limit {
+        locations.truncate(limit);
+    }
+    if locations.is_empty() {
+        bail!(
+            "No complete Sentinel-2 locations found in {}",
+            args.data_root.join(&args.source_name).display()
+        );
+    }
+    eprintln!("Discovered {} complete locations.", locations.len());
+
+    let mut runs = Vec::new();
+    let mut failures = Vec::new();
+
+    for (idx, (lon, lat)) in locations.iter().copied().enumerate() {
+        eprintln!(
+            "Batch location {}/{}: lon={lon:.4}, lat={lat:.4}",
+            idx + 1,
+            locations.len()
+        );
+        let scene_args = FullSceneArgs {
+            source_name: args.source_name.clone(),
+            lon,
+            lat,
+            output_root: args.output_root.clone(),
+            data_root: args.data_root.clone(),
+            methods: args.methods.clone(),
+            n_jobs: None,
+            window_size: args.window_size,
+            window_lon: None,
+            window_lat: None,
+            min_valid_ratio: args.min_valid_ratio,
+            late_fraction: args.late_fraction,
+            frequency_selection: None,
+        };
+
+        match run_full_scene(&scene_args) {
+            Ok(()) => {
+                runs.push(serde_json::json!({
+                    "lon": lon,
+                    "lat": lat,
+                    "status": "ok",
+                }));
+            }
+            Err(err) => {
+                eprintln!("Location lon={lon:.4}, lat={lat:.4} failed: {err:#}");
+                failures.push(serde_json::json!({
+                    "lon": lon,
+                    "lat": lat,
+                    "status": "failed",
+                    "error": format!("{err:#}"),
+                }));
+                if !args.continue_on_error {
+                    bail!("Batch stopped after location lon={lon:.4}, lat={lat:.4} failed");
+                }
+            }
+        }
+    }
+
+    let summary_dir = args.output_root.join("run_summaries");
+    fs::create_dir_all(&summary_dir)?;
+    let summary_path = summary_dir.join(format!(
+        "batch_summary_{}_{}.json",
+        args.source_name,
+        chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
+    ));
+    let summary = serde_json::json!({
+        "source_name": args.source_name,
+        "data_root": args.data_root.display().to_string(),
+        "output_root": args.output_root.display().to_string(),
+        "methods": args.methods,
+        "window_size": args.window_size,
+        "min_valid_ratio": args.min_valid_ratio,
+        "late_fraction": args.late_fraction,
+        "n_locations": locations.len(),
+        "n_success": runs.len(),
+        "n_failed": failures.len(),
+        "runs": runs,
+        "failures": failures,
+    });
+    fs::write(&summary_path, serde_json::to_string_pretty(&summary)?)?;
+    eprintln!("Batch summary written to {}", summary_path.display());
+
+    if !failures.is_empty() {
+        bail!(
+            "Batch completed with {} failed locations; see {}",
+            failures.len(),
+            summary_path.display()
+        );
+    }
+    Ok(())
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Main
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1092,25 +1551,20 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match &cli.algorithm {
-        Algorithm::Nufrost(args) => {
-            match detect_input_mode(&args.shared)? {
-                InputMode::NpzFixture(fixture) => run_nufrost_npz(args, &fixture),
-                InputMode::GeoTiff { reader, output } => run_nufrost_geotiff(args, &reader, &output),
-            }
-        }
-        Algorithm::Hants(args) => {
-            match detect_input_mode(&args.shared)? {
-                InputMode::NpzFixture(fixture) => run_hants_npz(args, &fixture),
-                InputMode::GeoTiff { reader, output } => run_hants_geotiff(args, &reader, &output),
-            }
-        }
-        Algorithm::Zhu2015(args) => {
-            match detect_input_mode(&args.shared)? {
-                InputMode::NpzFixture(fixture) => run_zhu2015_npz(args, &fixture),
-                InputMode::GeoTiff { reader, output } => run_zhu2015_geotiff(args, &reader, &output),
-            }
-        }
+        Algorithm::Nufrost(args) => match detect_input_mode(&args.shared)? {
+            InputMode::NpzFixture(fixture) => run_nufrost_npz(args, &fixture),
+            InputMode::GeoTiff { reader, output } => run_nufrost_geotiff(args, &reader, &output),
+        },
+        Algorithm::Hants(args) => match detect_input_mode(&args.shared)? {
+            InputMode::NpzFixture(fixture) => run_hants_npz(args, &fixture),
+            InputMode::GeoTiff { reader, output } => run_hants_geotiff(args, &reader, &output),
+        },
+        Algorithm::Zhu2015(args) => match detect_input_mode(&args.shared)? {
+            InputMode::NpzFixture(fixture) => run_zhu2015_npz(args, &fixture),
+            InputMode::GeoTiff { reader, output } => run_zhu2015_geotiff(args, &reader, &output),
+        },
         Algorithm::FullScene(args) => run_full_scene(args),
+        Algorithm::BatchFullScene(args) => run_batch_full_scene(args),
     }
 }
 
@@ -1157,24 +1611,73 @@ mod tests {
         assert!(matches!(cli.algorithm, Algorithm::Zhu2015(_)));
     }
 
+    #[test]
+    fn batch_full_scene_options() {
+        let cli = parse(&[
+            "batch-full-scene",
+            "--source-name",
+            "sentinel-2",
+            "--data-root",
+            "data",
+            "--output-root",
+            "/tmp/out",
+            "--methods",
+            "nufrost,hants",
+            "--window-size",
+            "3",
+            "--n-jobs",
+            "4",
+            "--limit",
+            "2",
+            "--continue-on-error",
+        ]);
+        match &cli.algorithm {
+            Algorithm::BatchFullScene(args) => {
+                assert_eq!(args.source_name, "sentinel-2");
+                assert_eq!(args.data_root, std::path::PathBuf::from("data"));
+                assert_eq!(args.output_root, std::path::PathBuf::from("/tmp/out"));
+                assert_eq!(args.methods, "nufrost,hants");
+                assert_eq!(args.window_size, Some(3));
+                assert_eq!(args.n_jobs, Some(4));
+                assert_eq!(args.limit, Some(2));
+                assert!(args.continue_on_error);
+            }
+            _ => panic!("expected BatchFullScene"),
+        }
+    }
+
     // ── NPZ mode option parsing ─────────────────────────────────────────
 
     #[test]
     fn nufrost_all_options_npz() {
         let cli = parse(&[
             "nufrost",
-            "--config", "/tmp/cfg.json",
-            "--data", "/tmp/data.npz",
-            "--target-time", "372.7",
-            "--output", "/tmp/out.txt",
-            "--threads", "4",
+            "--config",
+            "/tmp/cfg.json",
+            "--data",
+            "/tmp/data.npz",
+            "--target-time",
+            "372.7",
+            "--output",
+            "/tmp/out.txt",
+            "--threads",
+            "4",
         ]);
         match &cli.algorithm {
             Algorithm::Nufrost(args) => {
-                assert_eq!(args.config.as_deref(), Some(std::path::Path::new("/tmp/cfg.json")));
-                assert_eq!(args.shared.data.as_deref(), Some(std::path::Path::new("/tmp/data.npz")));
+                assert_eq!(
+                    args.config.as_deref(),
+                    Some(std::path::Path::new("/tmp/cfg.json"))
+                );
+                assert_eq!(
+                    args.shared.data.as_deref(),
+                    Some(std::path::Path::new("/tmp/data.npz"))
+                );
                 assert_eq!(args.shared.target_time, Some(372.7));
-                assert_eq!(args.shared.output.as_deref(), Some(std::path::Path::new("/tmp/out.txt")));
+                assert_eq!(
+                    args.shared.output.as_deref(),
+                    Some(std::path::Path::new("/tmp/out.txt"))
+                );
                 assert_eq!(args.shared.threads, 4);
                 assert!(args.shared.input_geotiff.is_none());
             }
@@ -1186,15 +1689,23 @@ mod tests {
     fn nufrost_geotiff_options() {
         let cli = parse(&[
             "nufrost",
-            "--input-geotiff", "/tmp/input.tif",
-            "--output", "/tmp/out.tif",
+            "--input-geotiff",
+            "/tmp/input.tif",
+            "--output",
+            "/tmp/out.tif",
         ]);
         match &cli.algorithm {
             Algorithm::Nufrost(args) => {
                 assert!(args.config.is_none());
                 assert!(args.shared.data.is_none());
-                assert_eq!(args.shared.input_geotiff.as_deref(), Some(std::path::Path::new("/tmp/input.tif")));
-                assert_eq!(args.shared.output.as_deref(), Some(std::path::Path::new("/tmp/out.tif")));
+                assert_eq!(
+                    args.shared.input_geotiff.as_deref(),
+                    Some(std::path::Path::new("/tmp/input.tif"))
+                );
+                assert_eq!(
+                    args.shared.output.as_deref(),
+                    Some(std::path::Path::new("/tmp/out.tif"))
+                );
             }
             _ => panic!("expected Nufrost"),
         }
@@ -1204,16 +1715,26 @@ mod tests {
     fn hants_all_options() {
         let cli = parse(&[
             "hants",
-            "--config", "/tmp/ch.json",
-            "--data", "/tmp/d.npz",
-            "-t", "200.0",
-            "-o", "/tmp/o.txt",
+            "--config",
+            "/tmp/ch.json",
+            "--data",
+            "/tmp/d.npz",
+            "-t",
+            "200.0",
+            "-o",
+            "/tmp/o.txt",
         ]);
         match &cli.algorithm {
             Algorithm::Hants(args) => {
-                assert_eq!(args.config.as_deref(), Some(std::path::Path::new("/tmp/ch.json")));
+                assert_eq!(
+                    args.config.as_deref(),
+                    Some(std::path::Path::new("/tmp/ch.json"))
+                );
                 assert_eq!(args.shared.target_time, Some(200.0));
-                assert_eq!(args.shared.output.as_deref(), Some(std::path::Path::new("/tmp/o.txt")));
+                assert_eq!(
+                    args.shared.output.as_deref(),
+                    Some(std::path::Path::new("/tmp/o.txt"))
+                );
             }
             _ => panic!("expected Hants"),
         }
@@ -1223,13 +1744,19 @@ mod tests {
     fn zhu2015_all_options() {
         let cli = parse(&[
             "zhu2015",
-            "--config", "/tmp/cz.json",
-            "--data", "/tmp/dz.npz",
-            "-t", "500.0",
+            "--config",
+            "/tmp/cz.json",
+            "--data",
+            "/tmp/dz.npz",
+            "-t",
+            "500.0",
         ]);
         match &cli.algorithm {
             Algorithm::Zhu2015(args) => {
-                assert_eq!(args.config.as_deref(), Some(std::path::Path::new("/tmp/cz.json")));
+                assert_eq!(
+                    args.config.as_deref(),
+                    Some(std::path::Path::new("/tmp/cz.json"))
+                );
                 assert_eq!(args.shared.target_time, Some(500.0));
             }
             _ => panic!("expected Zhu2015"),
@@ -1289,10 +1816,14 @@ mod tests {
     fn full_scene_rejects_spectral_top_k() {
         let err = parse_fails(&[
             "full-scene",
-            "--source-name", "sentinel-2",
-            "--lon", "100.0",
-            "--lat", "25.0",
-            "--spectral-top-k", "4",
+            "--source-name",
+            "sentinel-2",
+            "--lon",
+            "100.0",
+            "--lat",
+            "25.0",
+            "--spectral-top-k",
+            "4",
         ]);
         assert!(
             err.contains("spectral-top-k")
@@ -1312,10 +1843,14 @@ mod tests {
     fn full_scene_rejects_preferred_top_k() {
         let err = parse_fails(&[
             "full-scene",
-            "--source-name", "sentinel-2",
-            "--lon", "100.0",
-            "--lat", "25.0",
-            "--preferred-top-k", "4",
+            "--source-name",
+            "sentinel-2",
+            "--lon",
+            "100.0",
+            "--lat",
+            "25.0",
+            "--preferred-top-k",
+            "4",
         ]);
         assert!(
             err.contains("preferred-top-k")
