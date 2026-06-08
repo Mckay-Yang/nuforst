@@ -8,6 +8,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use clap::{Arg, ArgAction, Command};
@@ -22,7 +23,7 @@ use gdal::{
         choose_shared_target_timestamp, discover_sentinel_band_stacks, make_masked_time_series,
         mask_invalid_sentinel2, sorted_band_names, write_band_stack,
     },
-    read_all_bands, read_all_bands_window_offset, RasterMetadata, RasterReader,
+    read_all_bands_window_offset, scene_cache, RasterMetadata, RasterReader,
 };
 use hants_core::{hants_pixel, reconstruct_hants_geotiff, HantsConfig};
 use nufrost_core::{
@@ -46,7 +47,9 @@ enum Algorithm {
     Hants(HantsArgs),
     Zhu2015(Zhu2015Args),
     FullScene(FullSceneArgs),
+    BuildSceneCache(BuildSceneCacheArgs),
     BatchFullScene(BatchFullSceneArgs),
+    PixelBench(PixelBenchArgs),
 }
 
 #[derive(Debug)]
@@ -63,8 +66,20 @@ struct FullSceneArgs {
     window_lat: Option<f64>,
     min_valid_ratio: f64,
     late_fraction: f64,
+    scene_cache: Option<PathBuf>,
+    nufrost_config: Option<PathBuf>,
     #[allow(dead_code)]
     frequency_selection: Option<String>,
+}
+
+#[derive(Debug)]
+struct BuildSceneCacheArgs {
+    source_name: String,
+    lon: f64,
+    lat: f64,
+    data_root: PathBuf,
+    cache_root: PathBuf,
+    output: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -79,6 +94,21 @@ struct BatchFullSceneArgs {
     late_fraction: f64,
     limit: Option<usize>,
     continue_on_error: bool,
+}
+
+#[derive(Debug)]
+struct PixelBenchArgs {
+    source_name: String,
+    lon: f64,
+    lat: f64,
+    data_root: PathBuf,
+    row: Option<usize>,
+    col: Option<usize>,
+    pixel_lon: Option<f64>,
+    pixel_lat: Option<f64>,
+    repeats: usize,
+    min_valid_ratio: f64,
+    late_fraction: f64,
 }
 
 #[derive(Debug)]
@@ -149,7 +179,17 @@ impl Cli {
                 window_lat: sub.get_one::<f64>("window_lat").copied(),
                 min_valid_ratio: *sub.get_one::<f64>("min_valid_ratio").unwrap(),
                 late_fraction: *sub.get_one::<f64>("late_fraction").unwrap(),
+                scene_cache: sub.get_one::<PathBuf>("scene_cache").cloned(),
+                nufrost_config: sub.get_one::<PathBuf>("nufrost_config").cloned(),
                 frequency_selection: sub.get_one::<String>("frequency_selection").cloned(),
+            }),
+            "build-scene-cache" => Algorithm::BuildSceneCache(BuildSceneCacheArgs {
+                source_name: sub.get_one::<String>("source_name").cloned().unwrap(),
+                lon: *sub.get_one::<f64>("lon").unwrap(),
+                lat: *sub.get_one::<f64>("lat").unwrap(),
+                data_root: sub.get_one::<PathBuf>("data_root").cloned().unwrap(),
+                cache_root: sub.get_one::<PathBuf>("cache_root").cloned().unwrap(),
+                output: sub.get_one::<PathBuf>("output").cloned(),
             }),
             "batch-full-scene" => Algorithm::BatchFullScene(BatchFullSceneArgs {
                 source_name: sub.get_one::<String>("source_name").cloned().unwrap(),
@@ -162,6 +202,19 @@ impl Cli {
                 late_fraction: *sub.get_one::<f64>("late_fraction").unwrap(),
                 limit: sub.get_one::<usize>("limit").copied(),
                 continue_on_error: sub.get_flag("continue_on_error"),
+            }),
+            "pixel-bench" => Algorithm::PixelBench(PixelBenchArgs {
+                source_name: sub.get_one::<String>("source_name").cloned().unwrap(),
+                lon: *sub.get_one::<f64>("lon").unwrap(),
+                lat: *sub.get_one::<f64>("lat").unwrap(),
+                data_root: sub.get_one::<PathBuf>("data_root").cloned().unwrap(),
+                row: sub.get_one::<usize>("row").copied(),
+                col: sub.get_one::<usize>("col").copied(),
+                pixel_lon: sub.get_one::<f64>("pixel_lon").copied(),
+                pixel_lat: sub.get_one::<f64>("pixel_lat").copied(),
+                repeats: *sub.get_one::<usize>("repeats").unwrap(),
+                min_valid_ratio: *sub.get_one::<f64>("min_valid_ratio").unwrap(),
+                late_fraction: *sub.get_one::<f64>("late_fraction").unwrap(),
             }),
             _ => unreachable!("clap accepted an unknown subcommand: {name}"),
         };
@@ -187,7 +240,9 @@ impl Cli {
             .subcommand(algorithm_command("hants", "Run HANTS reconstruction."))
             .subcommand(algorithm_command("zhu2015", "Run Zhu2015 reconstruction."))
             .subcommand(full_scene_command())
+            .subcommand(build_scene_cache_command())
             .subcommand(batch_full_scene_command())
+            .subcommand(pixel_bench_command())
     }
 }
 
@@ -285,7 +340,7 @@ fn full_scene_command() -> Command {
             Arg::new("methods")
                 .long("methods")
                 .value_name("LIST")
-                .default_value("nufrost,hants,zhu2015")
+                .default_value("nufrost")
                 .action(ArgAction::Set),
         )
         .arg(
@@ -327,10 +382,71 @@ fn full_scene_command() -> Command {
                 .value_parser(clap::value_parser!(f64)),
         )
         .arg(
+            Arg::new("scene_cache")
+                .long("scene-cache")
+                .value_name("DIR")
+                .help("Read full-scene cubes from a prebuilt mmap scene cache directory.")
+                .value_parser(clap::value_parser!(PathBuf)),
+        )
+        .arg(
+            Arg::new("nufrost_config")
+                .long("nufrost-config")
+                .value_name("PATH")
+                .help("NUFROST config JSON used by full-scene reconstruction.")
+                .value_parser(clap::value_parser!(PathBuf)),
+        )
+        .arg(
             Arg::new("frequency_selection")
                 .long("frequency-selection")
                 .value_name("MODE")
                 .action(ArgAction::Set),
+        )
+}
+
+fn build_scene_cache_command() -> Command {
+    Command::new("build-scene-cache")
+        .about("Build a mmap-ready full-scene cache from source GeoTIFF stacks.")
+        .arg(
+            Arg::new("source_name")
+                .long("source-name")
+                .required(true)
+                .value_name("NAME")
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("lon")
+                .long("lon")
+                .required(true)
+                .value_name("LON")
+                .value_parser(clap::value_parser!(f64)),
+        )
+        .arg(
+            Arg::new("lat")
+                .long("lat")
+                .required(true)
+                .value_name("LAT")
+                .value_parser(clap::value_parser!(f64)),
+        )
+        .arg(
+            Arg::new("data_root")
+                .long("data-root")
+                .value_name("PATH")
+                .default_value("data")
+                .value_parser(clap::value_parser!(PathBuf)),
+        )
+        .arg(
+            Arg::new("cache_root")
+                .long("cache-root")
+                .value_name("PATH")
+                .default_value("data/cache/scenes")
+                .value_parser(clap::value_parser!(PathBuf)),
+        )
+        .arg(
+            Arg::new("output")
+                .long("output")
+                .value_name("DIR")
+                .help("Explicit cache directory. Overrides --cache-root derived path.")
+                .value_parser(clap::value_parser!(PathBuf)),
         )
 }
 
@@ -362,7 +478,7 @@ fn batch_full_scene_command() -> Command {
             Arg::new("methods")
                 .long("methods")
                 .value_name("LIST")
-                .default_value("nufrost,hants,zhu2015")
+                .default_value("nufrost")
                 .action(ArgAction::Set),
         )
         .arg(
@@ -401,6 +517,84 @@ fn batch_full_scene_command() -> Command {
             Arg::new("continue_on_error")
                 .long("continue-on-error")
                 .action(ArgAction::SetTrue),
+        )
+}
+
+fn pixel_bench_command() -> Command {
+    Command::new("pixel-bench")
+        .about("Benchmark one real multi-band pixel time series with vector NUFROST.")
+        .arg(
+            Arg::new("source_name")
+                .long("source-name")
+                .required(true)
+                .value_name("NAME")
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("lon")
+                .long("lon")
+                .required(true)
+                .value_name("LON")
+                .value_parser(clap::value_parser!(f64)),
+        )
+        .arg(
+            Arg::new("lat")
+                .long("lat")
+                .required(true)
+                .value_name("LAT")
+                .value_parser(clap::value_parser!(f64)),
+        )
+        .arg(
+            Arg::new("data_root")
+                .long("data-root")
+                .value_name("PATH")
+                .default_value("data")
+                .value_parser(clap::value_parser!(PathBuf)),
+        )
+        .arg(
+            Arg::new("row")
+                .long("row")
+                .value_name("ROW")
+                .value_parser(clap::value_parser!(usize)),
+        )
+        .arg(
+            Arg::new("col")
+                .long("col")
+                .value_name("COL")
+                .value_parser(clap::value_parser!(usize)),
+        )
+        .arg(
+            Arg::new("pixel_lon")
+                .long("pixel-lon")
+                .value_name("LON")
+                .value_parser(clap::value_parser!(f64)),
+        )
+        .arg(
+            Arg::new("pixel_lat")
+                .long("pixel-lat")
+                .value_name("LAT")
+                .value_parser(clap::value_parser!(f64)),
+        )
+        .arg(
+            Arg::new("repeats")
+                .long("repeats")
+                .value_name("N")
+                .default_value("10")
+                .value_parser(clap::value_parser!(usize)),
+        )
+        .arg(
+            Arg::new("min_valid_ratio")
+                .long("min-valid-ratio")
+                .value_name("RATIO")
+                .default_value("0.9")
+                .value_parser(clap::value_parser!(f64)),
+        )
+        .arg(
+            Arg::new("late_fraction")
+                .long("late-fraction")
+                .value_name("RATIO")
+                .default_value("0.25")
+                .value_parser(clap::value_parser!(f64)),
         )
 }
 
@@ -457,7 +651,7 @@ fn load_fixture_npz(path: &std::path::Path) -> Result<FixtureData> {
 /// Default NUFROST config matching Python `config/nufrost.json`.
 fn default_nufrost_config() -> NufrostConfig {
     let full_json = r#"{
-        "nufrost":{"modes":4096,"eps":1e-12,"num_peaks":10,"power_cum":0.7,"ignore_dc_hz":1e-10,"frequency_selection":"shared_spectral","preferred_periods_days":"365.25,182.625,91.3125,30.4375","preferred_top_k":4,"spectral_top_k":8,"spectral_merge_tol":0.15,"refine_peaks":true,"include_trend":true,"ridge_lam":0.005,"freq_weight":2.0,"huber_iters":3,"huber_delta":0.05,"min_obs":12,"outlier_sigma":2.5,"lambda_step":0.05,"lambda_high":0.005,"low_freq_period_days":60.0,"step_dt_weighting":true,"max_outer_iter":5,"outer_tol":0.001,"joint_outlier":true,"joint_outlier_sigma":2.5,"admm_rho":1.0,"admm_max_iter":80,"admm_tol":0.0001,"private_top_k_per_band":2,"private_freq_penalty_mult":1.5},
+        "nufrost":{"modes":4096,"eps":1e-12,"num_peaks":10,"power_cum":0.7,"ignore_dc_hz":1e-10,"frequency_selection":"shared_spectral","preferred_periods_days":"365.25,182.625,91.3125,30.4375","preferred_top_k":4,"spectral_top_k":8,"spectral_merge_tol":0.15,"refine_peaks":true,"include_trend":true,"ridge_lam":0.005,"freq_weight":2.0,"huber_iters":3,"huber_delta":0.05,"min_obs":12,"outlier_sigma":2.5,"outlier_reject_iters":2,"outlier_reject_sigma":2.5,"outlier_reject_max_fraction":0.35,"lambda_step":0.05,"lambda_high":0.005,"low_freq_period_days":60.0,"step_dt_weighting":true,"max_outer_iter":5,"outer_tol":0.001,"joint_outlier":true,"joint_outlier_sigma":2.5,"admm_rho":1.0,"admm_max_iter":80,"admm_tol":0.0001,"private_top_k_per_band":2,"private_freq_penalty_mult":1.5},
         "hants":{"nof":3,"sf":"high","fet":500.0,"dod":5,"period":365.25,"valid_min":null,"valid_max":null},
         "zhu2015":{"lasso_alpha":0.1}
     }"#;
@@ -612,6 +806,21 @@ fn metadata_from_reader(reader: &RasterReader) -> RasterMetadata {
         crs_wkt: reader.crs_wkt(),
         nodata: reader.nodata(1),
     }
+}
+
+fn run_build_scene_cache(args: &BuildSceneCacheArgs) -> Result<()> {
+    let cache_dir = scene_cache::build_scene_cache(
+        &args.data_root,
+        &args.cache_root,
+        &args.source_name,
+        args.lon,
+        args.lat,
+        args.output.as_deref(),
+    )?;
+    eprintln!("Scene cache written to {}", cache_dir.display());
+    eprintln!("  data: {}", cache_dir.join("cube.f32.bin").display());
+    eprintln!("  meta: {}", cache_dir.join("meta.json").display());
+    Ok(())
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -821,9 +1030,39 @@ fn reconstruct_nufrost_vector_scene(
     let first_cube = masked_cubes
         .get(first_band)
         .with_context(|| format!("Cube missing for band {first_band}"))?;
-    let (n_times, rows, cols) = first_cube.dim();
+    let (_, rows, cols) = first_cube.dim();
 
-    let cube_refs: Vec<&Array3<f64>> = ordered_bands
+    let ts_sets: BTreeMap<&str, BTreeSet<&str>> = ordered_bands
+        .iter()
+        .map(|band_name| {
+            let ts = masked_ts
+                .get(band_name)
+                .with_context(|| format!("Timestamps missing for band {band_name}"))?;
+            Ok((band_name.as_str(), ts.iter().map(String::as_str).collect()))
+        })
+        .collect::<Result<_>>()?;
+    let common_ts: Vec<String> = ref_ts
+        .iter()
+        .filter(|ts| {
+            ts_sets
+                .values()
+                .all(|band_ts| band_ts.contains(ts.as_str()))
+        })
+        .cloned()
+        .collect();
+    if common_ts.is_empty() {
+        bail!("NUFROST vector reconstruction found no common masked timestamps across bands");
+    }
+    if common_ts.len() != ref_ts.len() {
+        eprintln!(
+            "NUFROST vector scene: using {} common masked timestamps out of {} in reference band {first_band}",
+            common_ts.len(),
+            ref_ts.len()
+        );
+    }
+    let n_times = common_ts.len();
+
+    let band_inputs: Vec<(&Array3<f64>, Vec<usize>)> = ordered_bands
         .iter()
         .map(|band_name| {
             let cube = masked_cubes
@@ -832,17 +1071,38 @@ fn reconstruct_nufrost_vector_scene(
             let ts = masked_ts
                 .get(band_name)
                 .with_context(|| format!("Timestamps missing for band {band_name}"))?;
-            if ts != ref_ts {
-                bail!("NUFROST vector reconstruction requires aligned timestamps; band {band_name} differs from {first_band}");
+            if cube.dim().1 != rows || cube.dim().2 != cols {
+                bail!(
+                    "NUFROST vector reconstruction requires aligned spatial shapes; band {band_name} has {:?}, expected rows={rows}, cols={cols}",
+                    cube.dim()
+                );
             }
-            if cube.dim() != (n_times, rows, cols) {
-                bail!("NUFROST vector reconstruction requires aligned cube shapes; band {band_name} has {:?}, expected {:?}", cube.dim(), (n_times, rows, cols));
+            if cube.dim().0 != ts.len() {
+                bail!(
+                    "NUFROST vector reconstruction timestamp count mismatch for band {band_name}: {} timestamps for {:?}",
+                    ts.len(),
+                    cube.dim()
+                );
             }
-            Ok(cube)
+            let index_by_ts: BTreeMap<&str, usize> = ts
+                .iter()
+                .enumerate()
+                .map(|(idx, value)| (value.as_str(), idx))
+                .collect();
+            let indices = common_ts
+                .iter()
+                .map(|value| {
+                    index_by_ts
+                        .get(value.as_str())
+                        .copied()
+                        .with_context(|| format!("Timestamp {value} missing for band {band_name}"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok((cube, indices))
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let mut epochs: Vec<f64> = ref_ts
+    let mut epochs: Vec<f64> = common_ts
         .iter()
         .filter_map(|s| parse_iso8601_to_epoch_seconds(s))
         .collect();
@@ -879,8 +1139,8 @@ fn reconstruct_nufrost_vector_scene(
                 for obs in obs_by_band.iter_mut() {
                     obs.clear();
                 }
-                for (bi, cube) in cube_refs.iter().enumerate() {
-                    for ti in 0..n_times {
+                for (bi, (cube, time_indices)) in band_inputs.iter().enumerate() {
+                    for &ti in time_indices {
                         obs_by_band[bi].push(cube[[ti, r, c]]);
                     }
                 }
@@ -1112,6 +1372,282 @@ fn discover_complete_sentinel_locations(
     Ok(locations)
 }
 
+fn finite_median(values: &[f64]) -> f64 {
+    let mut finite: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
+    if finite.is_empty() {
+        return f64::NAN;
+    }
+    finite.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = finite.len();
+    if n % 2 == 1 {
+        finite[n / 2]
+    } else {
+        0.5 * (finite[n / 2 - 1] + finite[n / 2])
+    }
+}
+
+fn robust_standardize(values: &[f64]) -> Vec<f64> {
+    let center = finite_median(values);
+    let abs_dev: Vec<f64> = values
+        .iter()
+        .map(|&v| {
+            if v.is_finite() {
+                (v - center).abs()
+            } else {
+                f64::NAN
+            }
+        })
+        .collect();
+    let mut scale = 1.4826 * finite_median(&abs_dev);
+    if !scale.is_finite() || scale <= 1e-6 {
+        let finite: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
+        let mean = finite.iter().copied().sum::<f64>() / finite.len().max(1) as f64;
+        let var = finite
+            .iter()
+            .map(|&v| {
+                let d = v - mean;
+                d * d
+            })
+            .sum::<f64>()
+            / finite.len().max(1) as f64;
+        scale = var.sqrt();
+    }
+    let center = if center.is_finite() {
+        center
+    } else {
+        values
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite())
+            .sum::<f64>()
+            / values.iter().filter(|v| v.is_finite()).count().max(1) as f64
+    };
+    let scale = scale.max(1e-6);
+    values.iter().map(|&v| (v - center) / scale).collect()
+}
+
+fn run_pixel_bench(args: &PixelBenchArgs) -> Result<()> {
+    if args.repeats == 0 {
+        bail!("--repeats must be > 0");
+    }
+    if (args.row.is_some() || args.col.is_some()) && (args.row.is_none() || args.col.is_none()) {
+        bail!("--row and --col must be provided together");
+    }
+    if (args.pixel_lon.is_some() || args.pixel_lat.is_some())
+        && (args.pixel_lon.is_none() || args.pixel_lat.is_none())
+    {
+        bail!("--pixel-lon and --pixel-lat must be provided together");
+    }
+
+    let band_stacks =
+        resolve_full_scene_band_stacks(&args.data_root, &args.source_name, args.lon, args.lat)?;
+    let ordered_bands: Vec<String> = sorted_band_names(&band_stacks)
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    let first_chunk = band_stacks.values().next().unwrap().first().unwrap();
+    let first_reader = RasterReader::open(first_chunk)?;
+    let (rows, cols) = first_reader.shape();
+    let (row_off, col_off) = if let (Some(r), Some(c)) = (args.row, args.col) {
+        if r >= rows || c >= cols {
+            bail!("pixel row/col out of bounds: row={r}, col={c}, shape=({rows}, {cols})");
+        }
+        (r, c)
+    } else if let (Some(lon), Some(lat)) = (args.pixel_lon, args.pixel_lat) {
+        full_scene_window_offset(&first_reader, 1, Some(lon), Some(lat))?
+    } else {
+        (rows / 2, cols / 2)
+    };
+
+    let mut band_cubes: BTreeMap<String, Array3<f64>> = BTreeMap::new();
+    let mut band_timestamps: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+    let load_start = Instant::now();
+    for (band_name, chunk_paths) in &band_stacks {
+        if chunk_paths.len() != 1 {
+            bail!(
+                "pixel-bench expects resolved one-path band stacks; got {} paths for {band_name}",
+                chunk_paths.len()
+            );
+        }
+        let chunk_path = &chunk_paths[0];
+        eprintln!(
+            "Loading {band_name} pixel row={row_off}, col={col_off} from {}",
+            chunk_path.display()
+        );
+        let reader = RasterReader::open(chunk_path)?;
+        let cube = read_all_bands_window_offset(&reader, row_off, col_off, 1, 1)?;
+        let descs = extract_raw_band_descriptions(&reader)?;
+        band_cubes.insert(band_name.clone(), cube);
+        band_timestamps.insert(band_name.clone(), descs);
+    }
+    for cube in band_cubes.values_mut() {
+        mask_invalid_sentinel2(cube);
+    }
+    let load_elapsed = load_start.elapsed();
+
+    let target_start = Instant::now();
+    let (target_time_str, _) = choose_shared_target_timestamp(
+        &band_cubes,
+        &band_timestamps,
+        args.min_valid_ratio,
+        args.late_fraction,
+    )?;
+    let target_elapsed = target_start.elapsed();
+    let target_epoch = parse_iso8601_to_epoch_seconds(&target_time_str)
+        .context("Failed to parse target timestamp")?;
+
+    let mut masked_series: Vec<Vec<f64>> = Vec::with_capacity(ordered_bands.len());
+    let mut ref_ts: Option<Vec<String>> = None;
+    let mut raw_slices = 0usize;
+    let mut collapsed_slices = 0usize;
+    let mut target_values = Vec::with_capacity(ordered_bands.len());
+
+    for band_name in &ordered_bands {
+        let cube = band_cubes
+            .get(band_name)
+            .with_context(|| format!("Cube missing for band {band_name}"))?;
+        let ts = band_timestamps
+            .get(band_name)
+            .with_context(|| format!("Timestamps missing for band {band_name}"))?;
+        raw_slices = raw_slices.max(ts.len());
+        let (collapsed_cube, collapsed_ts) = collapse_duplicate_timestamps(cube, ts);
+        collapsed_slices = collapsed_slices.max(collapsed_ts.len());
+        let (masked_cube, masked_ts, _target_idx, gt) =
+            make_masked_time_series(&collapsed_cube, &collapsed_ts, &target_time_str)?;
+        if let Some(existing) = &ref_ts {
+            if existing != &masked_ts {
+                bail!("pixel-bench requires aligned masked timestamps; band {band_name} differs");
+            }
+        } else {
+            ref_ts = Some(masked_ts.clone());
+        }
+        masked_series.push(masked_cube.iter().copied().collect());
+        target_values.push(gt[[0, 0]]);
+    }
+
+    let ref_ts = ref_ts.context("No masked timestamps built")?;
+    let mut epochs: Vec<f64> = ref_ts
+        .iter()
+        .filter_map(|s| parse_iso8601_to_epoch_seconds(s))
+        .collect();
+    epochs.push(target_epoch);
+    epochs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let ts_days: Vec<f64> = epochs.iter().map(|&e| (e - epochs[0]) / 86400.0).collect();
+    let target_day = (target_epoch - epochs[0]) / 86400.0;
+    let masked_days: Vec<f64> = ts_days
+        .iter()
+        .copied()
+        .filter(|&d| (d - target_day).abs() > 1e-9)
+        .collect();
+    if masked_days.len() != masked_series.first().map_or(0, Vec::len) {
+        bail!(
+            "masked timestamp count mismatch: {} days vs {} observations",
+            masked_days.len(),
+            masked_series.first().map_or(0, Vec::len)
+        );
+    }
+
+    let config = load_nufrost_config(Some(std::path::Path::new("config/nufrost.json")))
+        .unwrap_or_else(|_| default_nufrost_config());
+    let valid_joint = (0..masked_days.len())
+        .filter(|&i| masked_series.iter().all(|band| band[i].is_finite()))
+        .count();
+
+    let mut nufft_bins = 0usize;
+    let mut nufft_power_sum = 0.0f64;
+    let nufft_start = Instant::now();
+    for _ in 0..args.repeats {
+        let valid_idx: Vec<usize> = (0..masked_days.len())
+            .filter(|&i| {
+                masked_days[i].is_finite() && masked_series.iter().all(|b| b[i].is_finite())
+            })
+            .collect();
+        if valid_idx.len() < (config.min_obs as usize).max(3) {
+            continue;
+        }
+        let t_sec: Vec<f64> = valid_idx
+            .iter()
+            .map(|&i| masked_days[i] * 86400.0)
+            .collect();
+        let t_min = t_sec.iter().copied().fold(f64::INFINITY, f64::min);
+        let t_rel: Vec<f64> = t_sec.iter().map(|&t| t - t_min).collect();
+
+        let mut spectrum_dims = Vec::with_capacity(masked_series.len());
+        for band in &masked_series {
+            let col: Vec<f64> = valid_idx.iter().map(|&i| band[i]).collect();
+            spectrum_dims.push(robust_standardize(&col));
+        }
+
+        let (_freqs, power) = nufrost_core::nufft::type1_vector_power_kb(
+            &t_rel,
+            &spectrum_dims,
+            config.modes as usize,
+            nufrost_core::nufft::NufftOptions::default(),
+        );
+        nufft_bins = power.len();
+        nufft_power_sum = power.iter().copied().filter(|v| v.is_finite()).sum();
+    }
+    let nufft_elapsed = nufft_start.elapsed();
+    let nufft_per_call = nufft_elapsed.as_secs_f64() / args.repeats as f64;
+
+    let mut predictions = Vec::new();
+    let bench_start = Instant::now();
+    for _ in 0..args.repeats {
+        predictions = nufrost_pixel_vector(&masked_days, &masked_series, target_day, &config);
+    }
+    let bench_elapsed = bench_start.elapsed();
+    let per_call = bench_elapsed.as_secs_f64() / args.repeats as f64;
+
+    let rmse = {
+        let mut n = 0usize;
+        let mut sum_sq = 0.0;
+        for (&p, &t) in predictions.iter().zip(target_values.iter()) {
+            if p.is_finite() && t.is_finite() {
+                let d = p - t;
+                n += 1;
+                sum_sq += d * d;
+            }
+        }
+        if n == 0 {
+            f64::NAN
+        } else {
+            (sum_sq / n as f64).sqrt()
+        }
+    };
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "source_name": args.source_name,
+            "scene_lon": args.lon,
+            "scene_lat": args.lat,
+            "row": row_off,
+            "col": col_off,
+            "ordered_bands": ordered_bands,
+            "target_time": target_time_str,
+            "raw_slices": raw_slices,
+            "collapsed_slices": collapsed_slices,
+            "masked_slices": masked_days.len(),
+            "joint_valid_slices": valid_joint,
+            "repeats": args.repeats,
+            "load_seconds": load_elapsed.as_secs_f64(),
+            "target_select_seconds": target_elapsed.as_secs_f64(),
+            "nufft_prefix_total_seconds": nufft_elapsed.as_secs_f64(),
+            "nufft_prefix_seconds_per_call": nufft_per_call,
+            "nufft_bins": nufft_bins,
+            "nufft_power_sum": nufft_power_sum,
+            "bench_total_seconds": bench_elapsed.as_secs_f64(),
+            "bench_seconds_per_call": per_call,
+            "prediction": predictions,
+            "target": target_values,
+            "rmse": rmse,
+        }))?
+    );
+    Ok(())
+}
+
 fn run_full_scene(args: &FullSceneArgs) -> Result<()> {
     if let Some(n) = args.n_jobs {
         rayon::ThreadPoolBuilder::new()
@@ -1122,52 +1658,40 @@ fn run_full_scene(args: &FullSceneArgs) -> Result<()> {
 
     let methods = validate_full_scene_methods(&args.methods)?;
 
-    // 1. Discover band stacks
-    let band_stacks =
-        resolve_full_scene_band_stacks(&args.data_root, &args.source_name, args.lon, args.lat)?;
-
-    // 2. Load per-band cubes and ISO timestamps
-    let mut band_cubes: BTreeMap<String, Array3<f64>> = BTreeMap::new();
-    let mut band_timestamps: BTreeMap<String, Vec<String>> = BTreeMap::new();
-
-    for (band_name, chunk_paths) in &band_stacks {
-        eprintln!(
-            "Loading band {band_name} from {} chunk(s)...",
-            chunk_paths.len()
-        );
-        let mut cube_parts: Vec<Array3<f64>> = Vec::new();
-        let mut ts_parts: Vec<String> = Vec::new();
-
-        for (chunk_idx, chunk_path) in chunk_paths.iter().enumerate() {
-            eprintln!(
-                "  Reading {band_name} chunk {}/{}: {}",
-                chunk_idx + 1,
-                chunk_paths.len(),
-                chunk_path.display()
-            );
-            let reader = RasterReader::open(chunk_path)?;
-            let cube = if let Some(ws) = args.window_size {
-                let (row_off, col_off) =
-                    full_scene_window_offset(&reader, ws, args.window_lon, args.window_lat)?;
-                read_all_bands_window_offset(&reader, row_off, col_off, ws, ws)?
-            } else {
-                read_all_bands(&reader)?
-            };
-            let descs = extract_raw_band_descriptions(&reader)?;
-            cube_parts.push(cube);
-            ts_parts.extend(descs);
+    let load_start = Instant::now();
+    let scene_cache::LoadedScene {
+        ordered_bands,
+        mut band_cubes,
+        band_timestamps,
+        meta,
+        cache_dir,
+    } = if let Some(cache_dir) = &args.scene_cache {
+        if args.window_size.is_some() {
+            bail!("--scene-cache currently supports full-scene runs only, not --window-size");
         }
-
-        let cube_merged = if cube_parts.len() == 1 {
-            cube_parts.remove(0)
-        } else {
-            let views: Vec<_> = cube_parts.iter().map(|c| c.view()).collect();
-            ndarray::concatenate(ndarray::Axis(0), &views)?
-        };
-        eprintln!("  Loaded band {band_name}: {:?}", cube_merged.dim());
-        band_cubes.insert(band_name.clone(), cube_merged);
-        band_timestamps.insert(band_name.clone(), ts_parts);
-    }
+        eprintln!("Loading scene from mmap cache: {}", cache_dir.display());
+        scene_cache::load_scene_cache(cache_dir)?
+    } else if let Some(window_size) = args.window_size {
+        scene_cache::load_scene_from_geotiffs_window(
+            &args.data_root,
+            &args.source_name,
+            args.lon,
+            args.lat,
+            window_size,
+            args.window_lon,
+            args.window_lat,
+        )?
+    } else {
+        scene_cache::load_or_build_scene_cache(
+            &args.data_root,
+            &args.data_root.join("cache").join("scenes"),
+            &args.source_name,
+            args.lon,
+            args.lat,
+        )?
+    };
+    let scene_load_seconds = load_start.elapsed().as_secs_f64();
+    eprintln!("Scene load completed in {scene_load_seconds:.3}s");
 
     // 3. Mask invalid reflectance
     for cube in band_cubes.values_mut() {
@@ -1175,20 +1699,41 @@ fn run_full_scene(args: &FullSceneArgs) -> Result<()> {
     }
 
     // 4. Target timestamp selection
-    eprintln!("Selecting shared target timestamp...");
-    let (target_time_str, _completeness) = choose_shared_target_timestamp(
-        &band_cubes,
-        &band_timestamps,
-        args.min_valid_ratio,
-        args.late_fraction,
-    )?;
+    let target_time_str = if let Some(cache_dir) = &cache_dir {
+        if let Some(target) = scene_cache::load_cached_target_timestamp(
+            cache_dir,
+            args.min_valid_ratio,
+            args.late_fraction,
+        )? {
+            eprintln!("Using cached shared target timestamp: {target}");
+            target
+        } else {
+            eprintln!("Selecting shared target timestamp...");
+            let (target, _completeness) = choose_shared_target_timestamp(
+                &band_cubes,
+                &band_timestamps,
+                args.min_valid_ratio,
+                args.late_fraction,
+            )?;
+            scene_cache::store_cached_target_timestamp(
+                cache_dir,
+                args.min_valid_ratio,
+                args.late_fraction,
+                &target,
+            )?;
+            target
+        }
+    } else {
+        eprintln!("Selecting shared target timestamp...");
+        let (target, _completeness) = choose_shared_target_timestamp(
+            &band_cubes,
+            &band_timestamps,
+            args.min_valid_ratio,
+            args.late_fraction,
+        )?;
+        target
+    };
     eprintln!("Selected target timestamp: {target_time_str}");
-
-    // 5. Ordered band list
-    let ordered_bands: Vec<String> = sorted_band_names(&band_stacks)
-        .into_iter()
-        .map(|s| s.to_string())
-        .collect();
 
     // 6. Hold-out: make masked time series per band
     let mut masked_cubes: BTreeMap<String, Array3<f64>> = BTreeMap::new();
@@ -1217,24 +1762,20 @@ fn run_full_scene(args: &FullSceneArgs) -> Result<()> {
         ground_truths.insert(band_name.clone(), gt);
     }
 
-    // 7. Metadata from first chunk
-    let first_chunk = band_stacks.values().next().unwrap().first().unwrap();
-    let first_reader = RasterReader::open(first_chunk)?;
-    let meta = RasterMetadata {
-        geo_transform: first_reader
-            .geo_transform()
-            .unwrap_or([0.0, 1.0, 0.0, 0.0, 0.0, -1.0]),
-        crs_wkt: first_reader.crs_wkt(),
-        nodata: first_reader.nodata(1),
-    };
-
     // 8. Target time as epoch
     let target_epoch = parse_iso8601_to_epoch_seconds(&target_time_str)
         .context("Failed to parse target timestamp")?;
 
     // 10. Load configs
-    let nufrost_conf = load_nufrost_config(Some(std::path::Path::new("config/nufrost.json")))
-        .unwrap_or_else(|_| default_nufrost_config());
+    let nufrost_config_path = args
+        .nufrost_config
+        .as_deref()
+        .unwrap_or_else(|| std::path::Path::new("config/nufrost.json"));
+    let mut nufrost_conf =
+        load_nufrost_config(Some(nufrost_config_path)).unwrap_or_else(|_| default_nufrost_config());
+    if let Some(mode) = &args.frequency_selection {
+        nufrost_conf.frequency_selection = mode.clone();
+    }
     let hants_conf = default_hants_config();
     let zhu2015_conf = default_zhu2015_config();
 
@@ -1404,7 +1945,52 @@ fn run_full_scene(args: &FullSceneArgs) -> Result<()> {
     write_band_stack(&gt_path, &ground_truths, &ordered_bands, &meta)?;
     eprintln!("Ground truth written to {}", gt_path.display());
 
-    // 13. Write summary JSON
+    // 13. Write summary JSON. When rerunning only a subset of methods, merge
+    // into the existing summary so older baseline metrics remain available.
+    let summary_dir = output_root.join("run_summaries");
+    fs::create_dir_all(&summary_dir)?;
+    let safe_time = target_time_str.replace(':', "-");
+    let loc_token6 = full_scene::location_output_token(args.lon, args.lat);
+    let summary_path = summary_dir.join(format!(
+        "reconstruction_summary_{source_name}_{loc_token6}_{safe_time}.json"
+    ));
+
+    let mut merged_prediction_outputs = if let Ok(bytes) = fs::read(&summary_path) {
+        serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|v| {
+                v.get("prediction_outputs")
+                    .and_then(|m| m.as_object())
+                    .cloned()
+            })
+            .unwrap_or_default()
+    } else {
+        serde_json::Map::new()
+    };
+    for (method, output) in prediction_outputs {
+        merged_prediction_outputs.insert(method, output);
+    }
+
+    let mut merged_metrics = if let Ok(bytes) = fs::read(&summary_path) {
+        serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|v| v.get("metrics").and_then(|m| m.as_object()).cloned())
+            .unwrap_or_default()
+    } else {
+        serde_json::Map::new()
+    };
+    for (method, metric) in metrics_by_method {
+        merged_metrics.insert(method, metric);
+    }
+
+    let mut merged_methods: Vec<String> = merged_metrics.keys().cloned().collect();
+    for method in &methods {
+        if !merged_methods.iter().any(|m| m == method) {
+            merged_methods.push(method.clone());
+        }
+    }
+    merged_methods.sort();
+
     let now_iso = chrono::Utc::now().to_rfc3339();
     let summary: serde_json::Value = serde_json::json!({
         "source_name": source_name,
@@ -1413,26 +1999,21 @@ fn run_full_scene(args: &FullSceneArgs) -> Result<()> {
         "location_token": loc_token,
         "target_time": target_time_str,
         "target_epoch": target_epoch,
-        "methods_run": methods,
+        "methods_run": merged_methods,
+        "methods_updated": methods,
         "ordered_bands": ordered_bands,
         "min_valid_ratio": args.min_valid_ratio,
         "late_fraction": args.late_fraction,
         "window_size": args.window_size,
         "window_lon": args.window_lon,
         "window_lat": args.window_lat,
-        "prediction_outputs": prediction_outputs,
+        "scene_cache": cache_dir.as_ref().map(|p| p.display().to_string()),
+        "scene_load_seconds": scene_load_seconds,
+        "prediction_outputs": merged_prediction_outputs,
         "ground_truth_output": gt_path.display().to_string(),
-        "metrics": metrics_by_method,
+        "metrics": merged_metrics,
         "generated_at": now_iso,
     });
-
-    let summary_dir = output_root.join("run_summaries");
-    fs::create_dir_all(&summary_dir)?;
-    let safe_time = target_time_str.replace(':', "-");
-    let loc_token6 = full_scene::location_output_token(args.lon, args.lat);
-    let summary_path = summary_dir.join(format!(
-        "reconstruction_summary_{source_name}_{loc_token6}_{safe_time}.json"
-    ));
     fs::write(&summary_path, serde_json::to_string_pretty(&summary)?)?;
     eprintln!("Summary written to {}", summary_path.display());
 
@@ -1483,6 +2064,8 @@ fn run_batch_full_scene(args: &BatchFullSceneArgs) -> Result<()> {
             window_lat: None,
             min_valid_ratio: args.min_valid_ratio,
             late_fraction: args.late_fraction,
+            scene_cache: None,
+            nufrost_config: None,
             frequency_selection: None,
         };
 
@@ -1564,7 +2147,9 @@ fn main() -> Result<()> {
             InputMode::GeoTiff { reader, output } => run_zhu2015_geotiff(args, &reader, &output),
         },
         Algorithm::FullScene(args) => run_full_scene(args),
+        Algorithm::BuildSceneCache(args) => run_build_scene_cache(args),
         Algorithm::BatchFullScene(args) => run_batch_full_scene(args),
+        Algorithm::PixelBench(args) => run_pixel_bench(args),
     }
 }
 
@@ -1643,6 +2228,157 @@ mod tests {
                 assert!(args.continue_on_error);
             }
             _ => panic!("expected BatchFullScene"),
+        }
+    }
+
+    #[test]
+    fn build_scene_cache_options() {
+        let cli = parse(&[
+            "build-scene-cache",
+            "--source-name",
+            "sentinel-2",
+            "--lon",
+            "94.2605",
+            "--lat",
+            "29.7733",
+            "--data-root",
+            "data",
+            "--cache-root",
+            "data/cache/scenes",
+            "--output",
+            "/tmp/scene-cache",
+        ]);
+        match &cli.algorithm {
+            Algorithm::BuildSceneCache(args) => {
+                assert_eq!(args.source_name, "sentinel-2");
+                assert_eq!(args.lon, 94.2605);
+                assert_eq!(args.lat, 29.7733);
+                assert_eq!(args.data_root, std::path::PathBuf::from("data"));
+                assert_eq!(
+                    args.cache_root,
+                    std::path::PathBuf::from("data/cache/scenes")
+                );
+                assert_eq!(
+                    args.output,
+                    Some(std::path::PathBuf::from("/tmp/scene-cache"))
+                );
+            }
+            _ => panic!("expected BuildSceneCache"),
+        }
+    }
+
+    #[test]
+    fn full_scene_scene_cache_option() {
+        let cli = parse(&[
+            "full-scene",
+            "--source-name",
+            "sentinel-2",
+            "--lon",
+            "94.2605",
+            "--lat",
+            "29.7733",
+            "--scene-cache",
+            "data/cache/scenes/sentinel-2/lon94_260500_lat29_773300",
+        ]);
+        match &cli.algorithm {
+            Algorithm::FullScene(args) => {
+                assert_eq!(
+                    args.scene_cache,
+                    Some(std::path::PathBuf::from(
+                        "data/cache/scenes/sentinel-2/lon94_260500_lat29_773300"
+                    ))
+                );
+            }
+            _ => panic!("expected FullScene"),
+        }
+    }
+
+    #[test]
+    fn full_scene_test_data_runs_end_to_end_with_auto_cache() {
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let data_root = workspace.join("data/test_data");
+        let output_root = data_root.join("output/full_pipeline_test");
+        let cache_dir = data_root
+            .join("cache/scenes/sentinel-2")
+            .join("lon100.112000_lat25.654000");
+
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        let _ = std::fs::remove_dir_all(&output_root);
+
+        let args = FullSceneArgs {
+            source_name: "sentinel-2".to_string(),
+            lon: 100.1120,
+            lat: 25.6540,
+            output_root: output_root.clone(),
+            data_root: data_root.clone(),
+            methods: "nufrost".to_string(),
+            n_jobs: None,
+            window_size: None,
+            window_lon: None,
+            window_lat: None,
+            min_valid_ratio: 0.5,
+            late_fraction: 0.25,
+            scene_cache: None,
+            nufrost_config: None,
+            frequency_selection: None,
+        };
+
+        run_full_scene(&args).expect("test_data full-scene run should complete");
+        assert!(cache_dir.join("meta.json").is_file());
+        assert!(cache_dir.join("cube.f32.bin").is_file());
+
+        let summary_dir = output_root.join("run_summaries");
+        let summary_path = std::fs::read_dir(&summary_dir)
+            .expect("summary dir should exist")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("reconstruction_summary_sentinel-2_"))
+            })
+            .expect("summary file should be written");
+        let summary: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&summary_path).unwrap()).unwrap();
+        let rmse = summary["metrics"]["nufrost"]["overall_rmse"]
+            .as_f64()
+            .expect("nufrost rmse should be present");
+        assert!(rmse.is_finite());
+        assert_eq!(summary["methods_run"], serde_json::json!(["nufrost"]));
+    }
+
+    #[test]
+    fn pixel_bench_options() {
+        let cli = parse(&[
+            "pixel-bench",
+            "--source-name",
+            "sentinel-2",
+            "--lon",
+            "94.2605",
+            "--lat",
+            "29.7733",
+            "--row",
+            "10",
+            "--col",
+            "20",
+            "--repeats",
+            "3",
+        ]);
+        match &cli.algorithm {
+            Algorithm::PixelBench(args) => {
+                assert_eq!(args.source_name, "sentinel-2");
+                assert_eq!(args.lon, 94.2605);
+                assert_eq!(args.lat, 29.7733);
+                assert_eq!(args.row, Some(10));
+                assert_eq!(args.col, Some(20));
+                assert_eq!(args.repeats, 3);
+            }
+            _ => panic!("expected PixelBench"),
         }
     }
 

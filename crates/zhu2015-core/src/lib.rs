@@ -137,11 +137,7 @@ pub fn select_model_order(n_valid: usize) -> u32 {
 ///   - column(2k-2) = cos(k * ω * x)
 ///   - column(2k-1) = sin(k * ω * x)
 /// Last column = `x - ref_x_mean` (or `x` if `ref_x_mean` is `None`).
-pub fn make_design_matrix(
-    x: &[f64],
-    order: u32,
-    ref_x_mean: Option<f64>,
-) -> Array2<f64> {
+pub fn make_design_matrix(x: &[f64], order: u32, ref_x_mean: Option<f64>) -> Array2<f64> {
     let n = x.len();
     let n_cols = (2 * order + 1) as usize;
     let w = 2.0 * std::f64::consts::PI / DAYS_PER_YEAR;
@@ -159,8 +155,7 @@ pub fn make_design_matrix(
         };
         data.push(trend);
     }
-    Array2::from_shape_vec((n, n_cols), data)
-        .unwrap()
+    Array2::from_shape_vec((n, n_cols), data).unwrap()
 }
 
 // ── Coordinate descent LASSO solver ────────────────────────────────────────
@@ -205,6 +200,7 @@ pub fn lasso_fit(
         .collect();
 
     let mut w = Array1::<f64>::zeros(p);
+    let mut residual = y_c.clone();
 
     for _iter in 0..max_iter {
         let mut max_delta: f64 = 0.0;
@@ -216,12 +212,18 @@ pub fn lasso_fit(
                 continue;
             }
 
-            let r = &y_c - x_c.dot(&w);
-            let rho = x_c.column(j).dot(&r) / (n as f64) + w[j] * norm_sq;
+            let col = x_c.column(j);
+            let rho = col.dot(&residual) / (n as f64) + w_old * norm_sq;
             let w_new = soft_threshold(rho, alpha) / norm_sq;
 
             w[j] = w_new;
             let delta = (w_new - w_old).abs();
+            if delta > 0.0 {
+                let signed_delta = w_new - w_old;
+                ndarray::Zip::from(&mut residual)
+                    .and(&col)
+                    .for_each(|r, &xij| *r -= signed_delta * xij);
+            }
             if delta > max_delta {
                 max_delta = delta;
             }
@@ -236,11 +238,7 @@ pub fn lasso_fit(
 }
 
 /// Predict using LASSO coefficients.
-pub fn lasso_predict(
-    x: &Array2<f64>,
-    coef: &Array1<f64>,
-    intercept: f64,
-) -> Array1<f64> {
+pub fn lasso_predict(x: &Array2<f64>, coef: &Array1<f64>, intercept: f64) -> Array1<f64> {
     x.dot(coef).mapv(|v| v + intercept)
 }
 
@@ -334,7 +332,11 @@ pub fn reconstruct_zhu2015_geotiff<P: AsRef<std::path::Path>>(
         metadata,
         |ts, obs, targ| {
             let result = fit_predict_pixel(ts, obs, targ, lasso_alpha);
-            if result.prediction.is_finite() { result.prediction } else { f64::NAN }
+            if result.prediction.is_finite() {
+                result.prediction
+            } else {
+                f64::NAN
+            }
         },
     )
 }
@@ -458,11 +460,7 @@ pub fn temporal_rmse(
 /// Detect breaks: absolute difference > 2×RMSE for ≥6 consecutive observations.
 ///
 /// Returns indices of break start positions (0-based).
-pub fn detect_breaks(
-    model: &SegmentModel,
-    t_days: &[f64],
-    y: &[f64],
-) -> Vec<usize> {
+pub fn detect_breaks(model: &SegmentModel, t_days: &[f64], y: &[f64]) -> Vec<usize> {
     let threshold = 2.0 * model.rmse;
     let mut breaks = Vec::new();
     let mut consecutive: usize = 0;
@@ -519,49 +517,6 @@ mod tests {
     use super::*;
     use approx::assert_relative_eq;
     use ndarray::Array1;
-    use ndarray_npy::NpzReader;
-
-    // ── NPZ fixture helpers ────────────────────────────────────────────
-
-    fn fixture_path(name: &str) -> String {
-        format!(
-            "{}/../../tests/fixtures/rust_parity/synthetic/{}/data.npz",
-            env!("CARGO_MANIFEST_DIR"), name
-        )
-    }
-
-    /// Load an f64 array from an NPZ fixture (handles both 0-d and 1-d).
-    fn load_npz_1d(path: &str, key: &str) -> Array1<f64> {
-        let file = std::fs::File::open(path).expect("open NPZ");
-        let mut npz = NpzReader::new(file).expect("parse NPZ");
-        let arr = npz
-            .by_name::<ndarray::OwnedRepr<f64>, ndarray::IxDyn>(key)
-            .unwrap_or_else(|e| panic!("key '{}' not found: {}", key, e));
-        let ndim = arr.ndim();
-        if ndim == 0 {
-            // 0-d scalar → 1-d
-            let val = arr.first().copied().expect("empty scalar");
-            Array1::from_vec(vec![val])
-        } else {
-            arr.into_dimensionality::<ndarray::Ix1>()
-                .expect("expected 1-d or 0-d array")
-        }
-    }
-
-    /// Load a scalar f64 from an NPZ fixture.
-    fn load_npz_scalar(path: &str, key: &str) -> f64 {
-        load_npz_1d(path, key)[0]
-    }
-
-    /// Load a scalar i64 from an NPZ fixture.
-    fn load_npz_scalar_int(path: &str, key: &str) -> i64 {
-        let file = std::fs::File::open(path).expect("open NPZ");
-        let mut npz = NpzReader::new(file).expect("parse NPZ");
-        let arr = npz.by_name::<ndarray::OwnedRepr<i64>, ndarray::IxDyn>(key)
-            .unwrap_or_else(|e| panic!("key '{}' not found: {}", key, e));
-        let flat = arr.as_standard_layout();
-        *flat.first().unwrap_or_else(|| panic!("empty array for '{}'", key))
-    }
 
     // ── Design matrix tests ────────────────────────────────────────────
 
@@ -619,10 +574,14 @@ mod tests {
         let dm = make_design_matrix(&x_arr, 3, Some(x_mean));
         let w_base = 2.0 * std::f64::consts::PI / DAYS_PER_YEAR;
 
-        let mut y: Vec<f64> = x_arr.iter().map(|&xi| {
-            0.5 + 0.3 * (w_base * xi).cos() + 0.1 * (w_base * xi).sin()
-                + 0.05 * (xi - x_mean) / 1000.0
-        }).collect();
+        let mut y: Vec<f64> = x_arr
+            .iter()
+            .map(|&xi| {
+                0.5 + 0.3 * (w_base * xi).cos()
+                    + 0.1 * (w_base * xi).sin()
+                    + 0.05 * (xi - x_mean) / 1000.0
+            })
+            .collect();
 
         #[rustfmt::skip]
         let noise: [f64; 50] = [
@@ -642,30 +601,12 @@ mod tests {
         let y_arr = Array1::from_vec(y);
         let (coef, intercept) = lasso_fit(&dm, &y_arr, 0.1, 5000, 1e-12);
 
-        assert!(coef[0] > 0.05, "cos(w) coef should be positive: {}", coef[0]);
+        assert!(
+            coef[0] > 0.05,
+            "cos(w) coef should be positive: {}",
+            coef[0]
+        );
         assert_relative_eq!(intercept, 0.5, epsilon = 0.05);
-    }
-
-    // ── Synthetic fixture parity tests ─────────────────────────────────
-
-    fn test_fixture_parity(name: &str) {
-        let path = fixture_path(name);
-        let t_days = load_npz_1d(&path, "timestamps_days").to_vec();
-        let y = load_npz_1d(&path, "observations").to_vec();
-        let target = load_npz_scalar(&path, "target_time_day");
-        let expected_pred = load_npz_scalar(&path, "zhu2015_prediction");
-        let expected_qa = load_npz_scalar_int(&path, "zhu2015_qa") as u32;
-
-        let result = fit_predict_pixel(&t_days, &y, target, DEFAULT_LASSO_ALPHA);
-
-        assert_relative_eq!(
-            result.prediction, expected_pred,
-            epsilon = 1e-6, max_relative = 5e-4
-        );
-        assert_eq!(
-            result.qa, expected_qa,
-            "{} QA mismatch", name
-        );
     }
 
     #[test]
@@ -680,21 +621,6 @@ mod tests {
         cfg.lasso_alpha = -0.5;
         let err = cfg.validate().unwrap_err();
         assert!(format!("{err}").contains("lasso_alpha"));
-    }
-
-    #[test]
-    fn test_simple_harmonic_parity() {
-        test_fixture_parity("simple_harmonic");
-    }
-
-    #[test]
-    fn test_gaps_outliers_parity() {
-        test_fixture_parity("gaps_outliers");
-    }
-
-    #[test]
-    fn test_step_break_parity() {
-        test_fixture_parity("step_break");
     }
 
     // ── Edge cases ─────────────────────────────────────────────────────

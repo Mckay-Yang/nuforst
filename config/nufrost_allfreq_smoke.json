@@ -1,15 +1,15 @@
 {
-  "modes": 4096,
+  "modes": 64,
   "eps": 1e-12,
   "num_peaks": 10,
-  "power_cum": 0.7,
+  "power_cum": 1.0,
   "ignore_dc_hz": 1e-10,
-  "frequency_selection": "shared_spectral",
-  "preferred_periods_days": "365.25,182.625,91.3125,30.4375",
-  "preferred_top_k": 4,
-  "spectral_top_k": 8,
-  "spectral_merge_tol": 0.15,
-  "refine_peaks": true,
+  "frequency_selection": "all",
+  "preferred_periods_days": "",
+  "preferred_top_k": 0,
+  "spectral_top_k": 0,
+  "spectral_merge_tol": 0.0,
+  "refine_peaks": false,
   "include_trend": true,
   "ridge": 0.005,
   "freq_weight": 2.0,
@@ -30,5 +30,7 @@
   "joint_outlier_sigma": 2.5,
   "admm_rho": 1.0,
   "admm_max_iter": 80,
-  "admm_tol": 1e-4
+  "admm_tol": 1e-4,
+  "private_top_k_per_band": 2,
+  "private_freq_penalty_mult": 1.5
 }

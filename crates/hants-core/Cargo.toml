@@ -15,4 +15,3 @@ serde_json.workspace = true
 
 [dev-dependencies]
 approx.workspace = true
-ndarray-npy = { version = "0.9", features = ["npz"] }

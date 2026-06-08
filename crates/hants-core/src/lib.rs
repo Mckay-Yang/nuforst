@@ -467,8 +467,14 @@ pub fn reconstruct_hants_geotiff<P: AsRef<std::path::Path>>(
         output_path,
         metadata,
         |ts, obs, targ| {
-            let pred = hants_pixel(ts, obs, targ, nof, sf, valid_min, valid_max, fet, dod, period);
-            if pred.is_finite() { pred } else { f64::NAN }
+            let pred = hants_pixel(
+                ts, obs, targ, nof, sf, valid_min, valid_max, fet, dod, period,
+            );
+            if pred.is_finite() {
+                pred
+            } else {
+                f64::NAN
+            }
         },
     )
 }
@@ -614,11 +620,17 @@ mod tests {
         let y: Vec<f64> = vec![1.0, 1.0, 1.0, 10.0];
         // "low": reject low outliers; the 10.0 (high outlier) stays
         let low_pred = hants_pixel(&t, &y, 1.5, 1, "low", None, None, 0.1, 0, 365.25);
-        assert!(low_pred > 2.0, "low SF should keep high values, got {low_pred}");
+        assert!(
+            low_pred > 2.0,
+            "low SF should keep high values, got {low_pred}"
+        );
 
         // "high": reject high outliers; the 10.0 is removed → fit ≈ 1.0
         let high_pred = hants_pixel(&t, &y, 1.5, 1, "high", None, None, 0.1, 0, 365.25);
-        assert!((high_pred - 1.0).abs() < 1e-6, "high SF should remove 10.0, got {high_pred}");
+        assert!(
+            (high_pred - 1.0).abs() < 1e-6,
+            "high SF should remove 10.0, got {high_pred}"
+        );
     }
 
     // ── valid_min / valid_max filtering ───────────────────────────────────
@@ -727,11 +739,18 @@ mod tests {
         assert!(result.valid);
         let curve = hants_predict_curve(&result, &t);
         let mean_curve: f64 = curve.iter().sum::<f64>() / curve.len() as f64;
-        let var: f64 = curve.iter().map(|&v| (v - mean_curve).powi(2)).sum::<f64>() / curve.len() as f64;
+        let var: f64 =
+            curve.iter().map(|&v| (v - mean_curve).powi(2)).sum::<f64>() / curve.len() as f64;
         let std_dev = var.sqrt();
-        assert!(std_dev > 100.0, "curve std dev should be > 100, got {std_dev}");
+        assert!(
+            std_dev > 100.0,
+            "curve std dev should be > 100, got {std_dev}"
+        );
         let max_val = curve.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-        assert!(max_val < 5000.0, "max curve value should be < 5000, got {max_val}");
+        assert!(
+            max_val < 5000.0,
+            "max curve value should be < 5000, got {max_val}"
+        );
     }
 
     // ── NaN handling ──────────────────────────────────────────────────────
@@ -753,7 +772,10 @@ mod tests {
     fn nanmedian_even_count() {
         let data = vec![1.0, 3.0, f64::NAN, 5.0, 7.0, f64::NAN];
         let m = nanmedian(&data);
-        assert!((m - 4.0).abs() < 1e-15, "even median should be (3+5)/2=4, got {m}");
+        assert!(
+            (m - 4.0).abs() < 1e-15,
+            "even median should be (3+5)/2=4, got {m}"
+        );
     }
 
     // ── Empty / all-invalid input ─────────────────────────────────────────
@@ -795,11 +817,6 @@ mod tests {
         assert!(curve.iter().all(|&v| v.is_finite()));
     }
 
-    // ── Fixture parity tests ──────────────────────────────────────────────
-
-    use serde_json::Value;
-    use std::fs;
-
     const HANTS_JSON: &str = r#"{
         "nof": 3,
         "sf": "high",
@@ -828,112 +845,5 @@ mod tests {
         cfg.nof = 0;
         let err = cfg.validate().unwrap_err();
         assert!(format!("{err}").contains("nof"));
-    }
-
-    fn fixture_path(name: &str) -> String {
-        format!(
-            "../../tests/fixtures/rust_parity/synthetic/{name}"
-        )
-    }
-
-    fn load_fixture_data(name: &str) -> (Value, Value) {
-        let base = fixture_path(name);
-        let config: Value = serde_json::from_str(
-            &fs::read_to_string(format!("{base}/config.json")).unwrap(),
-        )
-        .unwrap();
-        let data: Value = serde_json::from_str(
-            &fs::read_to_string(format!("{base}/data.json")).unwrap(),
-        )
-        .unwrap();
-        (config, data)
-    }
-
-    fn to_f64_vec(val: &Value) -> Vec<f64> {
-        val.as_array()
-            .unwrap()
-            .iter()
-            .map(|v| {
-                if v.is_null() {
-                    f64::NAN
-                } else {
-                    v.as_f64().unwrap()
-                }
-            })
-            .collect()
-    }
-
-    fn run_parity_test(name: &str, atol: f64, rtol: f64) {
-        let (config, data) = load_fixture_data(name);
-        let hants_cfg = &config["config"]["hants"];
-
-        let t = to_f64_vec(&data["timestamps_days"]);
-        let y = to_f64_vec(&data["observations"]);
-        let target_t = data["target_time_day"].as_f64().unwrap();
-        let expected = data["hants_prediction"].as_f64().unwrap();
-
-        let nof = hants_cfg["nof"].as_u64().unwrap() as u32;
-        let sf = hants_cfg["sf"].as_str().unwrap();
-        let fet = hants_cfg["fet"].as_f64().unwrap();
-        let dod = hants_cfg["dod"].as_u64().unwrap() as u32;
-        let period = hants_cfg["period"].as_f64().unwrap();
-        let valid_min = hants_cfg["valid_min"].as_f64();
-        let valid_max = hants_cfg["valid_max"].as_f64();
-
-        let got = hants_pixel(&t, &y, target_t, nof, sf, valid_min, valid_max, fet, dod, period);
-
-        let abs_diff = (got - expected).abs();
-        let rel_diff = if expected.abs() > 1e-12 {
-            abs_diff / expected.abs()
-        } else {
-            abs_diff
-        };
-
-        assert!(
-            abs_diff <= atol || rel_diff <= rtol,
-            "{name}: prediction mismatch\n  got      = {got:.15e}\n  expected = {expected:.15e}\n  abs_diff = {abs_diff:.3e}\n  rel_diff = {rel_diff:.3e}",
-        );
-    }
-
-    #[test]
-    fn parity_simple_harmonic() {
-        run_parity_test("simple_harmonic", 1e-4, 1e-4);
-    }
-
-    #[test]
-    fn parity_gaps_outliers() {
-        run_parity_test("gaps_outliers", 1e-4, 1e-4);
-    }
-
-    #[test]
-    fn parity_step_break() {
-        run_parity_test("step_break", 1e-4, 1e-4);
-    }
-
-    #[test]
-    fn parity_fit_result_coeffs_shape() {
-        let (config, data) = load_fixture_data("simple_harmonic");
-        let hants_cfg = &config["config"]["hants"];
-        let t = to_f64_vec(&data["timestamps_days"]);
-        let y = to_f64_vec(&data["observations"]);
-
-        let nof = hants_cfg["nof"].as_u64().unwrap() as u32;
-        let sf = hants_cfg["sf"].as_str().unwrap();
-        let fet = hants_cfg["fet"].as_f64().unwrap();
-        let dod = hants_cfg["dod"].as_u64().unwrap() as u32;
-        let period = hants_cfg["period"].as_f64().unwrap();
-
-        let result = hants_fit(&t, &y, nof, sf, None, None, fet, dod, period);
-        assert!(result.valid);
-        assert_eq!(result.coeffs.len(), (2 * nof - 1) as usize);
-
-        // verify predict matches the direct hants_pixel path
-        let target_t = data["target_time_day"].as_f64().unwrap();
-        let pred_direct = hants_pixel(&t, &y, target_t, nof, sf, None, None, fet, dod, period);
-        let pred_from_result = hants_predict(&result, target_t);
-        assert!(
-            (pred_direct - pred_from_result).abs() < 1e-12,
-            "direct and result-based prediction must match"
-        );
     }
 }

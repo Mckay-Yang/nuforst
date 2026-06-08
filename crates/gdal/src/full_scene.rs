@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use ndarray::Array2;
 use regex::Regex;
 
-use crate::{RasterMetadata, RasterWriter, RasterReader};
+use crate::{RasterMetadata, RasterReader, RasterWriter};
 
 // ---------------------------------------------------------------------------
 // Location token helpers
@@ -45,7 +45,9 @@ pub fn sentinel_band_sort_key(name: &str) -> (u32, String) {
     let re = Regex::new(r"^B(\d+)([A-Z]?)$").unwrap();
     if let Some(caps) = re.captures(name) {
         let num: u32 = caps.get(1).unwrap().as_str().parse().unwrap_or(10_000);
-        let suffix = caps.get(2).map_or(String::new(), |m| m.as_str().to_string());
+        let suffix = caps
+            .get(2)
+            .map_or(String::new(), |m| m.as_str().to_string());
         (num, suffix)
     } else {
         (10_000, name.to_string())
@@ -107,10 +109,7 @@ pub fn discover_sentinel_band_stacks(
         if !path.is_file() {
             continue;
         }
-        let fname = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
+        let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
         if !fname.contains(&token) {
             continue;
@@ -146,9 +145,7 @@ pub fn discover_sentinel_band_stacks(
 ///
 /// Returns `(timestamps_days, target_time_day)` where `target_time_day` is
 /// the last timestamp (hold‑out convention matching Python pipeline).
-pub fn extract_full_scene_timestamps(
-    path: &Path,
-) -> anyhow::Result<(Vec<f64>, f64)> {
+pub fn extract_full_scene_timestamps(path: &Path) -> anyhow::Result<(Vec<f64>, f64)> {
     let reader = RasterReader::open(path)?;
     Ok(crate::extract_timestamps_from_band_descriptions(&reader)?)
 }
@@ -271,11 +268,7 @@ pub fn write_band_stack(
 ///
 /// Sentinel-2 defaults are `valid_min=0.0`, `valid_max=10000.0`, so only
 /// `(0.0, 10000.0)` is treated as valid.
-pub fn mask_invalid_reflectance(
-    cube: &mut ndarray::Array3<f64>,
-    valid_min: f64,
-    valid_max: f64,
-) {
+pub fn mask_invalid_reflectance(cube: &mut ndarray::Array3<f64>, valid_min: f64, valid_max: f64) {
     for v in cube.iter_mut() {
         if v.is_finite() && (*v <= valid_min || *v >= valid_max) {
             *v = f64::NAN;
@@ -430,17 +423,13 @@ pub fn choose_shared_target_timestamp(
     // Intersect timestamps across all bands
     let mut shared: Option<std::collections::HashSet<String>> = None;
     for timestamps in band_to_timestamps.values() {
-        let current: std::collections::HashSet<String> =
-            timestamps.iter().cloned().collect();
+        let current: std::collections::HashSet<String> = timestamps.iter().cloned().collect();
         shared = match shared {
             None => Some(current),
             Some(s) => Some(s.intersection(&current).cloned().collect()),
         };
     }
-    let mut candidates: Vec<String> = shared
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
+    let mut candidates: Vec<String> = shared.unwrap_or_default().into_iter().collect();
     candidates.sort();
 
     if candidates.is_empty() {
@@ -456,12 +445,8 @@ pub fn choose_shared_target_timestamp(
         VALID_RATIO_SUBSAMPLE_STEP,
     )?;
 
-    let chosen = select_shared_target_timestamp(
-        &candidates,
-        &completeness,
-        min_valid_ratio,
-        late_fraction,
-    )?;
+    let chosen =
+        select_shared_target_timestamp(&candidates, &completeness, min_valid_ratio, late_fraction)?;
 
     Ok((chosen, completeness))
 }
@@ -485,7 +470,12 @@ pub fn make_masked_time_series(
     cube: &ndarray::Array3<f64>,
     timestamps: &[String],
     target_time: &str,
-) -> Result<(ndarray::Array3<f64>, Vec<String>, usize, ndarray::Array2<f64>)> {
+) -> Result<(
+    ndarray::Array3<f64>,
+    Vec<String>,
+    usize,
+    ndarray::Array2<f64>,
+)> {
     let matching: Vec<usize> = timestamps
         .iter()
         .enumerate()
@@ -505,9 +495,7 @@ pub fn make_masked_time_series(
     let target_idx = matching[0];
     let (_t, rows, cols) = cube.dim();
 
-    let ground_truth = cube
-        .index_axis(ndarray::Axis(0), target_idx)
-        .to_owned();
+    let ground_truth = cube.index_axis(ndarray::Axis(0), target_idx).to_owned();
 
     // Input already deduplicated — exclude only the single target index.
     let keep_n = timestamps.len() - 1;
@@ -543,8 +531,8 @@ pub fn make_masked_time_series(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
     use gdal_rs::Metadata;
+    use std::path::Path;
 
     // -----------------------------------------------------------------------
     // location_token / location_output_token
@@ -552,14 +540,8 @@ mod tests {
 
     #[test]
     fn test_location_token_format() {
-        assert_eq!(
-            location_token(104.2595, 31.2170),
-            "lon104.2595_lat31.2170"
-        );
-        assert_eq!(
-            location_token(-100.1234, 0.0),
-            "lon-100.1234_lat0.0000"
-        );
+        assert_eq!(location_token(104.2595, 31.2170), "lon104.2595_lat31.2170");
+        assert_eq!(location_token(-100.1234, 0.0), "lon-100.1234_lat0.0000");
     }
 
     #[test]
@@ -626,10 +608,8 @@ mod tests {
         let found: Vec<&str> = stacks.keys().map(String::as_str).collect();
 
         // Verify set equality (all expected bands present, no extras).
-        let found_set: std::collections::HashSet<&str> =
-            found.iter().copied().collect();
-        let expected_set: std::collections::HashSet<&str> =
-            expected.iter().copied().collect();
+        let found_set: std::collections::HashSet<&str> = found.iter().copied().collect();
+        let expected_set: std::collections::HashSet<&str> = expected.iter().copied().collect();
         assert_eq!(
             found_set, expected_set,
             "band set mismatch: got {found_set:?}, expected {expected_set:?}"
@@ -688,8 +668,13 @@ mod tests {
     fn test_output_path_safe_time_colon_replacement() {
         let root = Path::new("/out");
         let path = build_scene_stack_output_path(
-            root, "HANTS", "hls", 10.0, 20.0,
-            "2024-01-15T12:30:45", "eval",
+            root,
+            "HANTS",
+            "hls",
+            10.0,
+            20.0,
+            "2024-01-15T12:30:45",
+            "eval",
         );
         let s = path.to_str().unwrap();
         assert!(s.contains("_2024-01-15T12-30-45_"));
@@ -731,8 +716,7 @@ mod tests {
             .collect();
         let meta = test_meta();
 
-        write_band_stack(&tmp, &arrays, &ordered, &meta)
-            .expect("write_band_stack should succeed");
+        write_band_stack(&tmp, &arrays, &ordered, &meta).expect("write_band_stack should succeed");
 
         // Verify with GDAL.
         use gdal_rs::Metadata;
@@ -802,9 +786,8 @@ mod tests {
         }
 
         let reader = crate::RasterReader::open(&path).expect("should open real file");
-        let (days, target) =
-            crate::extract_timestamps_from_band_descriptions(&reader)
-                .expect("should parse timestamps");
+        let (days, target) = crate::extract_timestamps_from_band_descriptions(&reader)
+            .expect("should parse timestamps");
 
         let n = reader.band_count();
         assert_eq!(days.len(), n, "days count should match band count");
@@ -814,11 +797,20 @@ mod tests {
         // Allow tiny negative jitter from float arithmetic by checking
         // that adjacent diffs are >= -1e-6.
         for w in days.windows(2) {
-            assert!(w[1] - w[0] >= -1e-6, "timestamps must be non-decreasing: {} -> {}", w[0], w[1]);
+            assert!(
+                w[1] - w[0] >= -1e-6,
+                "timestamps must be non-decreasing: {} -> {}",
+                w[0],
+                w[1]
+            );
         }
 
         // First day should be ~0
-        assert!(days[0].abs() < 1.0, "first day should be near 0, got {}", days[0]);
+        assert!(
+            days[0].abs() < 1.0,
+            "first day should be near 0, got {}",
+            days[0]
+        );
 
         // Target should be the last element
         assert!((target - days[days.len() - 1]).abs() < 1e-10);
@@ -847,13 +839,14 @@ mod tests {
     fn test_collapse_duplicate_timestamps_no_dups() {
         let cube = ndarray::Array3::from_shape_vec(
             (3, 2, 2),
-            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+            vec![
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+            ],
         )
         .unwrap();
         let timestamps: Vec<String> = vec!["A", "B", "C"].into_iter().map(String::from).collect();
 
-        let (deduped, deduped_ts) =
-            crate::collapse_duplicate_timestamps(&cube, &timestamps);
+        let (deduped, deduped_ts) = crate::collapse_duplicate_timestamps(&cube, &timestamps);
 
         assert_eq!(deduped.shape(), &[3, 2, 2]);
         assert_eq!(deduped_ts, vec!["A", "B", "C"]);
@@ -870,11 +863,12 @@ mod tests {
         )
         .unwrap();
         // Bands 0 and 2 share timestamp "A", bands 1 and 3 share "B"
-        let timestamps: Vec<String> =
-            vec!["A", "B", "A", "B"].into_iter().map(String::from).collect();
+        let timestamps: Vec<String> = vec!["A", "B", "A", "B"]
+            .into_iter()
+            .map(String::from)
+            .collect();
 
-        let (deduped, deduped_ts) =
-            crate::collapse_duplicate_timestamps(&cube, &timestamps);
+        let (deduped, deduped_ts) = crate::collapse_duplicate_timestamps(&cube, &timestamps);
 
         assert_eq!(deduped.shape(), &[2, 1, 2], "should collapse to 2 bands");
         assert_eq!(deduped_ts, vec!["A", "B"], "timestamps should be deduped");
@@ -893,23 +887,31 @@ mod tests {
         let mut cube = ndarray::Array3::from_shape_vec(
             (3, 1, 2),
             vec![
-                f64::NAN, 100.0,  // band 0: "A"
-                50.0, f64::NAN,    // band 1: "A" (same timestamp)
-                1.0, 2.0           // band 2: "B"
+                f64::NAN,
+                100.0, // band 0: "A"
+                50.0,
+                f64::NAN, // band 1: "A" (same timestamp)
+                1.0,
+                2.0, // band 2: "B"
             ],
         )
         .unwrap();
         cube[[1, 0, 0]] = 50.0; // already set
         cube[[1, 0, 1]] = f64::NAN;
 
-        let timestamps: Vec<String> =
-            vec!["A", "A", "B"].into_iter().map(String::from).collect();
+        let timestamps: Vec<String> = vec!["A", "A", "B"].into_iter().map(String::from).collect();
 
         let (deduped, _) = crate::collapse_duplicate_timestamps(&cube, &timestamps);
 
         // Band A: nanmean of (NaN, 100) and (50, NaN) = (50, 100)
-        assert!((deduped[[0, 0, 0]] - 50.0).abs() < 1e-10, "nanmean(50, NaN) = 50");
-        assert!((deduped[[0, 0, 1]] - 100.0).abs() < 1e-10, "nanmean(100, NaN) = 100");
+        assert!(
+            (deduped[[0, 0, 0]] - 50.0).abs() < 1e-10,
+            "nanmean(50, NaN) = 50"
+        );
+        assert!(
+            (deduped[[0, 0, 1]] - 100.0).abs() < 1e-10,
+            "nanmean(100, NaN) = 100"
+        );
 
         // Band B: unchanged = (1, 2)
         assert!((deduped[[1, 0, 0]] - 1.0).abs() < 1e-10);
@@ -925,10 +927,18 @@ mod tests {
         let mut cube = ndarray::Array3::from_shape_vec(
             (2, 2, 3),
             vec![
-                -1.0, 0.0, 500.0,
-                9999.0, 10000.0, 15000.0,
-                f64::NAN, 1.0, 100.0,
-                50.0, -0.5, 10001.0,
+                -1.0,
+                0.0,
+                500.0,
+                9999.0,
+                10000.0,
+                15000.0,
+                f64::NAN,
+                1.0,
+                100.0,
+                50.0,
+                -0.5,
+                10001.0,
             ],
         )
         .unwrap();
@@ -936,31 +946,28 @@ mod tests {
         mask_invalid_reflectance(&mut cube, 0.0, 10000.0);
 
         // Valid values (0 < v < 10000) stay unchanged
-        assert!((cube[[0, 0, 2]] - 500.0).abs() < 1e-10);  // was 500
+        assert!((cube[[0, 0, 2]] - 500.0).abs() < 1e-10); // was 500
         assert!((cube[[0, 1, 0]] - 9999.0).abs() < 1e-10); // was 9999
-        assert!((cube[[1, 0, 1]] - 1.0).abs() < 1e-10);    // was 1
-        assert!((cube[[1, 0, 2]] - 100.0).abs() < 1e-10);  // was 100
-        assert!((cube[[1, 1, 0]] - 50.0).abs() < 1e-10);   // was 50
+        assert!((cube[[1, 0, 1]] - 1.0).abs() < 1e-10); // was 1
+        assert!((cube[[1, 0, 2]] - 100.0).abs() < 1e-10); // was 100
+        assert!((cube[[1, 1, 0]] - 50.0).abs() < 1e-10); // was 50
 
         // Invalid values become NaN
-        assert!(cube[[0, 0, 0]].is_nan());  // was -1.0
-        assert!(cube[[0, 0, 1]].is_nan());  // was 0.0
-        assert!(cube[[0, 1, 1]].is_nan());  // was 10000.0
-        assert!(cube[[0, 1, 2]].is_nan());  // was 15000.0
-        assert!(cube[[1, 1, 1]].is_nan());  // was -0.5
-        assert!(cube[[1, 1, 2]].is_nan());  // was 10001.0
+        assert!(cube[[0, 0, 0]].is_nan()); // was -1.0
+        assert!(cube[[0, 0, 1]].is_nan()); // was 0.0
+        assert!(cube[[0, 1, 1]].is_nan()); // was 10000.0
+        assert!(cube[[0, 1, 2]].is_nan()); // was 15000.0
+        assert!(cube[[1, 1, 1]].is_nan()); // was -0.5
+        assert!(cube[[1, 1, 2]].is_nan()); // was 10001.0
 
         // Already NaN stays NaN
-        assert!(cube[[1, 0, 0]].is_nan());  // was already NaN
+        assert!(cube[[1, 0, 0]].is_nan()); // was already NaN
     }
 
     #[test]
     fn test_mask_invalid_with_custom_range() {
-        let mut cube = ndarray::Array3::from_shape_vec(
-            (1, 1, 4),
-            vec![0.0, 1.0, 2.0, f64::NAN],
-        )
-        .unwrap();
+        let mut cube =
+            ndarray::Array3::from_shape_vec((1, 1, 4), vec![0.0, 1.0, 2.0, f64::NAN]).unwrap();
 
         mask_invalid_reflectance(&mut cube, 1.0, 2.0);
 
@@ -987,20 +994,15 @@ mod tests {
         completeness.insert("band_a".to_string(), band_a);
 
         let mut band_b = BTreeMap::new();
-        band_b.insert("A".to_string(), 0.5);  // below min
-        band_b.insert("B".to_string(), 0.5);  // below min
+        band_b.insert("A".to_string(), 0.5); // below min
+        band_b.insert("B".to_string(), 0.5); // below min
         band_b.insert("C".to_string(), 0.95); // passes
         completeness.insert("band_b".to_string(), band_b);
 
         let candidates: Vec<String> = vec!["A", "B", "C"].into_iter().map(String::from).collect();
 
-        let chosen = select_shared_target_timestamp(
-            &candidates,
-            &completeness,
-            0.9,
-            0.5,
-        )
-        .expect("should find a timestamp");
+        let chosen = select_shared_target_timestamp(&candidates, &completeness, 0.9, 0.5)
+            .expect("should find a timestamp");
 
         // With late_fraction=0.5 and 3 candidates, tail=ceil(3*0.5)=2, preferred=[B,C].
         // Reversed: check C, then B. C passes all bands, so C is chosen.
@@ -1087,8 +1089,8 @@ mod tests {
 
         let lon = 104.2595;
         let lat = 31.217;
-        let stacks = discover_sentinel_band_stacks(data_dir, lon, lat)
-            .expect("should discover band stacks");
+        let stacks =
+            discover_sentinel_band_stacks(data_dir, lon, lat).expect("should discover band stacks");
 
         // Load B2 data only (contract is per-band, and we need at least B2 to
         // verify the selection behavior). The full contract uses all bands.
@@ -1107,8 +1109,12 @@ mod tests {
         // Read the B2 cube through a bounded 512×512 window.
         let mut b2_cube = ndarray::Array3::<f64>::zeros((n_bands, rows, cols));
         for b in 1..=n_bands {
-            let band_data = reader.read_band_window(b, win, win).expect("should read band");
-            b2_cube.index_axis_mut(ndarray::Axis(0), b - 1).assign(&band_data);
+            let band_data = reader
+                .read_band_window(b, win, win)
+                .expect("should read band");
+            b2_cube
+                .index_axis_mut(ndarray::Axis(0), b - 1)
+                .assign(&band_data);
         }
 
         // Build timestamp strings from the band descriptions (use the descriptions directly)
@@ -1129,13 +1135,9 @@ mod tests {
         band_to_cubes.insert("B2".to_string(), b2_cube);
         band_to_timestamps.insert("B2".to_string(), band_timestamps);
 
-        let (chosen, completeness) = choose_shared_target_timestamp(
-            &band_to_cubes,
-            &band_to_timestamps,
-            0.9,
-            0.25,
-        )
-        .expect("should select a target timestamp");
+        let (chosen, completeness) =
+            choose_shared_target_timestamp(&band_to_cubes, &band_to_timestamps, 0.9, 0.25)
+                .expect("should select a target timestamp");
 
         // Verify: the contract expects "2025-05-20T03:52:01"
         assert_eq!(
@@ -1144,7 +1146,9 @@ mod tests {
         );
 
         // Verify: counts match contract
-        let b2_completeness = completeness.get("B2").expect("B2 completeness should exist");
+        let b2_completeness = completeness
+            .get("B2")
+            .expect("B2 completeness should exist");
         let contract_target = "2025-05-20T03:52:01";
         let b2_score = b2_completeness
             .get(contract_target)
@@ -1172,11 +1176,8 @@ mod tests {
 
     #[test]
     fn test_make_masked_time_series_basic() {
-        let cube = ndarray::Array3::from_shape_vec(
-            (5, 2, 3),
-            (0..30).map(|i| i as f64).collect(),
-        )
-        .unwrap();
+        let cube = ndarray::Array3::from_shape_vec((5, 2, 3), (0..30).map(|i| i as f64).collect())
+            .unwrap();
         let timestamps: Vec<String> = vec!["A", "B", "C", "D", "E"]
             .into_iter()
             .map(String::from)
@@ -1184,8 +1185,7 @@ mod tests {
         let target = "C";
 
         let (masked_cube, masked_ts, target_idx, ground_truth) =
-            make_masked_time_series(&cube, &timestamps, target)
-                .expect("should find target");
+            make_masked_time_series(&cube, &timestamps, target).expect("should find target");
 
         assert_eq!(target_idx, 2);
         assert_eq!(masked_cube.shape(), &[4, 2, 3]);
@@ -1243,11 +1243,9 @@ mod tests {
     #[test]
     fn test_make_masked_time_series_deduped_ok() {
         // Pre-deduplicated timestamps → correct GT and masked cube
-        let cube = ndarray::Array3::from_shape_vec(
-            (3, 1, 2),
-            vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0],
-        )
-        .unwrap();
+        let cube =
+            ndarray::Array3::from_shape_vec((3, 1, 2), vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0])
+                .unwrap();
         let timestamps: Vec<String> = vec!["A", "B", "C"].into_iter().map(String::from).collect();
         let (masked, mts, target_idx, gt) =
             make_masked_time_series(&cube, &timestamps, "B").unwrap();
@@ -1290,8 +1288,11 @@ mod tests {
         // Read full cube (windowed to 512×512)
         let mut cube = ndarray::Array3::<f64>::zeros((n_bands, rows, cols));
         for b in 1..=n_bands {
-            let band_data = reader.read_band_window(b, win, win).expect("should read band");
-            cube.index_axis_mut(ndarray::Axis(0), b - 1).assign(&band_data);
+            let band_data = reader
+                .read_band_window(b, win, win)
+                .expect("should read band");
+            cube.index_axis_mut(ndarray::Axis(0), b - 1)
+                .assign(&band_data);
         }
 
         // Build ISO timestamp strings from band descriptions
@@ -1310,17 +1311,27 @@ mod tests {
         // Deduplicate — Python pipeline collapses duplicate timestamps before
         // target hold-out. The contract's counts_before=201 reflects this.
         let (cube, timestamps) = crate::collapse_duplicate_timestamps(&cube, &timestamps);
-        assert_eq!(cube.shape()[0], 201, "deduplicated band count must match contract counts_before");
+        assert_eq!(
+            cube.shape()[0],
+            201,
+            "deduplicated band count must match contract counts_before"
+        );
 
         let target = "2025-05-20T03:52:01";
         let (masked_cube, masked_ts, target_idx, ground_truth) =
-            make_masked_time_series(&cube, &timestamps, target)
-                .expect("should find target in B2");
+            make_masked_time_series(&cube, &timestamps, target).expect("should find target in B2");
 
         // Contract verifications
-        assert_eq!(masked_cube.shape()[0], 200, "masked should have 200 bands (counts_after)");
+        assert_eq!(
+            masked_cube.shape()[0],
+            200,
+            "masked should have 200 bands (counts_after)"
+        );
         assert_eq!(masked_ts.len(), 200);
-        assert_eq!(target_idx, 181, "B2 target_idx should match contract mask_index");
+        assert_eq!(
+            target_idx, 181,
+            "B2 target_idx should match contract mask_index"
+        );
 
         // Ground truth shape
         assert_eq!(ground_truth.shape(), &[rows, cols]);
@@ -1402,7 +1413,11 @@ mod tests {
     fn test_nufrost_full_scene_ground_truth_output_naming() {
         let root = Path::new("/tmp/test_fs");
         let path = build_ground_truth_output_path(
-            root, "sentinel-2", 104.2595, 31.2170, "2025-05-20T03:52:01",
+            root,
+            "sentinel-2",
+            104.2595,
+            31.2170,
+            "2025-05-20T03:52:01",
         );
         let s = path.to_str().unwrap();
         assert!(s.contains("[ground_truth]"), "{s}");
@@ -1414,8 +1429,13 @@ mod tests {
     fn test_nufrost_full_scene_prediction_output_naming() {
         let root = Path::new("/tmp/test_fs");
         let path = build_scene_stack_output_path(
-            root, "nufrost", "sentinel-2",
-            104.2595, 31.2170, "2025-05-20T03:52:01", "prediction",
+            root,
+            "nufrost",
+            "sentinel-2",
+            104.2595,
+            31.2170,
+            "2025-05-20T03:52:01",
+            "prediction",
         );
         let s = path.to_str().unwrap();
         assert!(s.contains("[nufrost]"), "{s}");
@@ -1427,8 +1447,13 @@ mod tests {
     fn test_hants_full_scene_output_naming_unchanged() {
         let root = Path::new("/tmp/test_fs");
         let path = build_scene_stack_output_path(
-            root, "hants", "sentinel-2",
-            104.2595, 31.2170, "2025-05-20T03:52:01", "prediction",
+            root,
+            "hants",
+            "sentinel-2",
+            104.2595,
+            31.2170,
+            "2025-05-20T03:52:01",
+            "prediction",
         );
         let s = path.to_str().unwrap();
         assert!(s.contains("[hants]"), "{s}");
@@ -1438,8 +1463,13 @@ mod tests {
     fn test_zhu2015_full_scene_output_naming_unchanged() {
         let root = Path::new("/tmp/test_fs");
         let path = build_scene_stack_output_path(
-            root, "zhu2015", "sentinel-2",
-            104.2595, 31.2170, "2025-05-20T03:52:01", "prediction",
+            root,
+            "zhu2015",
+            "sentinel-2",
+            104.2595,
+            31.2170,
+            "2025-05-20T03:52:01",
+            "prediction",
         );
         let s = path.to_str().unwrap();
         assert!(s.contains("[zhu2015]"), "{s}");

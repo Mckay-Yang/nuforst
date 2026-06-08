@@ -1,8 +1,8 @@
 use numpy::PyArray1;
 use pyo3::prelude::*;
 
-use nufrost_core::{nufrost_pixel, NufrostConfig};
 use hants_core::{hants_pixel, HantsConfig};
+use nufrost_core::{nufrost_pixel, NufrostConfig};
 use zhu2015_core::{fit_predict_pixel, Zhu2015Config};
 
 // ── Config merge helpers ─────────────────────────────────────────────────
@@ -26,7 +26,8 @@ fn default_nufrost_config() -> NufrostConfig {
             "admm_rho": 1.0, "admm_max_iter": 80, "admm_tol": 1e-4,
             "private_top_k_per_band": 2, "private_freq_penalty_mult": 1.5
         }"#,
-    ).expect("hardcoded default config must be valid")
+    )
+    .expect("hardcoded default config must be valid")
 }
 
 fn merge_nufrost_config(json_str: &str) -> Result<NufrostConfig, String> {
@@ -34,15 +35,29 @@ fn merge_nufrost_config(json_str: &str) -> Result<NufrostConfig, String> {
         serde_json::from_str(json_str).map_err(|e| format!("Invalid JSON: {}", e))?;
     let mut cfg = default_nufrost_config();
     if let serde_json::Value::Object(map) = &overrides {
-        macro_rules! set_num { ($f:ident, $k:expr, $t:ty, $d:expr) => {
-            if let Some(v) = map.get($k) { cfg.$f = v.as_f64().unwrap_or($d as f64) as $t; }
-        }}
-        macro_rules! set_bool { ($f:ident, $k:expr) => {
-            if let Some(v) = map.get($k) { cfg.$f = v.as_bool().unwrap_or(cfg.$f); }
-        }}
-        macro_rules! set_str { ($f:ident, $k:expr) => {
-            if let Some(v) = map.get($k) { if let Some(s) = v.as_str() { cfg.$f = s.to_string(); } }
-        }}
+        macro_rules! set_num {
+            ($f:ident, $k:expr, $t:ty, $d:expr) => {
+                if let Some(v) = map.get($k) {
+                    cfg.$f = v.as_f64().unwrap_or($d as f64) as $t;
+                }
+            };
+        }
+        macro_rules! set_bool {
+            ($f:ident, $k:expr) => {
+                if let Some(v) = map.get($k) {
+                    cfg.$f = v.as_bool().unwrap_or(cfg.$f);
+                }
+            };
+        }
+        macro_rules! set_str {
+            ($f:ident, $k:expr) => {
+                if let Some(v) = map.get($k) {
+                    if let Some(s) = v.as_str() {
+                        cfg.$f = s.to_string();
+                    }
+                }
+            };
+        }
         set_num!(modes, "modes", u32, 4096);
         set_num!(eps, "eps", f64, 1e-12);
         set_num!(num_peaks, "num_peaks", u32, 10);
@@ -68,7 +83,12 @@ fn merge_nufrost_config(json_str: &str) -> Result<NufrostConfig, String> {
         set_num!(admm_tol, "admm_tol", f64, 1e-4);
         set_num!(joint_outlier_sigma, "joint_outlier_sigma", f64, 2.5);
         set_num!(private_top_k_per_band, "private_top_k_per_band", usize, 2);
-        set_num!(private_freq_penalty_mult, "private_freq_penalty_mult", f64, 1.5);
+        set_num!(
+            private_freq_penalty_mult,
+            "private_freq_penalty_mult",
+            f64,
+            1.5
+        );
         set_bool!(refine_peaks, "refine_peaks");
         set_bool!(include_trend, "include_trend");
         set_bool!(step_dt_weighting, "step_dt_weighting");
@@ -88,14 +108,15 @@ fn nufrost_pixel_rust(
     target_t: f64,
     config_json: &str,
 ) -> PyResult<f64> {
-    let config = merge_nufrost_config(config_json).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyValueError, _>(e)
-    })?;
+    let config = merge_nufrost_config(config_json)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e))?;
 
     if t_sec.len() != y.len() {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            format!("t_sec and y must have the same length (got {} vs {})", t_sec.len(), y.len()),
-        ));
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "t_sec and y must have the same length (got {} vs {})",
+            t_sec.len(),
+            y.len()
+        )));
     }
 
     let (pred, _n_freqs) = nufrost_pixel(&t_sec, &y, target_t, &config);
@@ -128,9 +149,11 @@ fn hants_pixel_rust(
     })?;
 
     if t_days.len() != y.len() {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            format!("t_days and y must have the same length (got {} vs {})", t_days.len(), y.len()),
-        ));
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "t_days and y must have the same length (got {} vs {})",
+            t_days.len(),
+            y.len()
+        )));
     }
 
     let pred = hants_pixel(
@@ -172,13 +195,18 @@ fn zhu2015_pixel_rust(
     config_json: &str,
 ) -> PyResult<(f64, u32)> {
     let config: Zhu2015Config = serde_json::from_str(config_json).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid Zhu2015 config JSON: {}", e))
+        PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "Invalid Zhu2015 config JSON: {}",
+            e
+        ))
     })?;
 
     if t_days.len() != y.len() {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            format!("t_days and y must have the same length (got {} vs {})", t_days.len(), y.len()),
-        ));
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "t_days and y must have the same length (got {} vs {})",
+            t_days.len(),
+            y.len()
+        )));
     }
 
     let result = fit_predict_pixel(&t_days, &y, target_t, config.lasso_alpha);
@@ -210,27 +238,31 @@ fn nufrost_raster_rust<'py>(
     target_t: f64,
     config_json: &str,
 ) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let config = merge_nufrost_config(config_json).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyValueError, _>(e)
-    })?;
+    let config = merge_nufrost_config(config_json)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e))?;
 
     let cube_view = cube.as_array();
     let n_time = cube_view.nrows();
     let n_pixels = cube_view.ncols();
 
     if n_time != t_sec.len() {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            format!("cube rows ({}) != t_sec length ({})", n_time, t_sec.len()),
-        ));
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "cube rows ({}) != t_sec length ({})",
+            n_time,
+            t_sec.len()
+        )));
     }
 
     let mut predictions = vec![f64::NAN; n_pixels];
     use rayon::prelude::*;
-    predictions.par_iter_mut().enumerate().for_each(|(p, pred)| {
-        let y: Vec<f64> = cube_view.column(p).to_vec();
-        let (val, _n_freqs) = nufrost_pixel(&t_sec, &y, target_t, &config);
-        *pred = val;
-    });
+    predictions
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(p, pred)| {
+            let y: Vec<f64> = cube_view.column(p).to_vec();
+            let (val, _n_freqs) = nufrost_pixel(&t_sec, &y, target_t, &config);
+            *pred = val;
+        });
 
     Ok(PyArray1::from_vec(py, predictions))
 }
@@ -255,9 +287,11 @@ fn hants_raster_rust<'py>(
     let n_pixels = cube_view.ncols();
 
     if n_time != t_days.len() {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            format!("cube rows ({}) != t_days length ({})", n_time, t_days.len()),
-        ));
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "cube rows ({}) != t_days length ({})",
+            n_time,
+            t_days.len()
+        )));
     }
 
     let mut predictions = vec![f64::NAN; n_pixels];
@@ -268,21 +302,21 @@ fn hants_raster_rust<'py>(
         .par_iter_mut()
         .enumerate()
         .for_each(|(p, pred)| {
-        let y: Vec<f64> = cube_view.column(p).to_vec();
-        let val = hants_pixel(
-            &t_days,
-            &y,
-            target_t,
-            config.nof,
-            &config.sf,
-            config.valid_min,
-            config.valid_max,
-            config.fet,
-            config.dod,
-            config.period,
-        );
-        *pred = val;
-    });
+            let y: Vec<f64> = cube_view.column(p).to_vec();
+            let val = hants_pixel(
+                &t_days,
+                &y,
+                target_t,
+                config.nof,
+                &config.sf,
+                config.valid_min,
+                config.valid_max,
+                config.fet,
+                config.dod,
+                config.period,
+            );
+            *pred = val;
+        });
 
     Ok(PyArray1::from_vec(py, predictions))
 }
@@ -297,7 +331,10 @@ fn zhu2015_raster_rust<'py>(
     config_json: &str,
 ) -> PyResult<Bound<'py, PyArray1<f64>>> {
     let config: Zhu2015Config = serde_json::from_str(config_json).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid Zhu2015 config JSON: {}", e))
+        PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "Invalid Zhu2015 config JSON: {}",
+            e
+        ))
     })?;
 
     let cube_view = cube.as_array();
@@ -305,9 +342,11 @@ fn zhu2015_raster_rust<'py>(
     let n_pixels = cube_view.ncols();
 
     if n_time != t_days.len() {
-        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            format!("cube rows ({}) != t_days length ({})", n_time, t_days.len()),
-        ));
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "cube rows ({}) != t_days length ({})",
+            n_time,
+            t_days.len()
+        )));
     }
 
     let mut predictions = vec![f64::NAN; n_pixels];
@@ -318,10 +357,10 @@ fn zhu2015_raster_rust<'py>(
         .par_iter_mut()
         .enumerate()
         .for_each(|(p, pred)| {
-        let y: Vec<f64> = cube_view.column(p).to_vec();
-        let result = fit_predict_pixel(&t_days, &y, target_t, config.lasso_alpha);
-        *pred = result.prediction;
-    });
+            let y: Vec<f64> = cube_view.column(p).to_vec();
+            let result = fit_predict_pixel(&t_days, &y, target_t, config.lasso_alpha);
+            *pred = result.prediction;
+        });
 
     Ok(PyArray1::from_vec(py, predictions))
 }

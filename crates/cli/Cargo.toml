@@ -18,3 +18,4 @@ serde_json.workspace = true
 serde.workspace = true
 rayon.workspace = true
 chrono.workspace = true
+memmap2 = "0.9"

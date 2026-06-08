@@ -43,6 +43,12 @@ pub struct NufrostConfig {
     pub min_obs: u32,
     #[serde(default = "default_outlier_sigma")]
     pub outlier_sigma: f64,
+    #[serde(default = "default_outlier_reject_iters")]
+    pub outlier_reject_iters: u32,
+    #[serde(default = "default_outlier_sigma")]
+    pub outlier_reject_sigma: f64,
+    #[serde(default = "default_outlier_reject_max_fraction")]
+    pub outlier_reject_max_fraction: f64,
     #[serde(default = "default_lambda_step")]
     pub lambda_step: f64,
     #[serde(default = "default_lambda_high")]
@@ -68,25 +74,67 @@ pub struct NufrostConfig {
 }
 
 // Default helpers — match Python config/nufrost.json defaults.
-fn default_frequency_selection() -> String { "spectral".into() }
+fn default_frequency_selection() -> String {
+    "spectral".into()
+}
 
-fn default_empty_string() -> String { String::new() }
-fn default_preferred_top_k() -> u32 { 4 }
-fn default_spectral_top_k() -> u32 { 8 }
-fn default_spectral_merge_tol() -> f64 { 0.15 }
-fn default_private_top_k_per_band() -> usize { 2 }
-fn default_private_freq_penalty_mult() -> f64 { 1.5 }
-fn default_outlier_sigma() -> f64 { 2.5 }
-fn default_lambda_step() -> f64 { 1e30 }
-fn default_lambda_high() -> f64 { 0.005 }
-fn default_max_outer_iter() -> u32 { 5 }
-fn default_outer_tol() -> f64 { 1e-3 }
-fn default_admm_rho() -> f64 { 1.0 }
-fn default_admm_max_iter() -> u32 { 80 }
-fn default_admm_tol() -> f64 { 1e-4 }
-fn default_low_freq_period_days() -> f64 { 60.0 }
-fn default_step_dt_weighting() -> bool { true }
-fn default_joint_outlier() -> bool { true }
+fn default_empty_string() -> String {
+    String::new()
+}
+fn default_preferred_top_k() -> u32 {
+    4
+}
+fn default_spectral_top_k() -> u32 {
+    8
+}
+fn default_spectral_merge_tol() -> f64 {
+    0.15
+}
+fn default_private_top_k_per_band() -> usize {
+    2
+}
+fn default_private_freq_penalty_mult() -> f64 {
+    1.5
+}
+fn default_outlier_sigma() -> f64 {
+    2.5
+}
+fn default_outlier_reject_iters() -> u32 {
+    2
+}
+fn default_outlier_reject_max_fraction() -> f64 {
+    0.35
+}
+fn default_lambda_step() -> f64 {
+    1e30
+}
+fn default_lambda_high() -> f64 {
+    0.005
+}
+fn default_max_outer_iter() -> u32 {
+    5
+}
+fn default_outer_tol() -> f64 {
+    1e-3
+}
+fn default_admm_rho() -> f64 {
+    1.0
+}
+fn default_admm_max_iter() -> u32 {
+    80
+}
+fn default_admm_tol() -> f64 {
+    1e-4
+}
+fn default_low_freq_period_days() -> f64 {
+    60.0
+}
+fn default_step_dt_weighting() -> bool {
+    true
+}
+fn default_joint_outlier() -> bool {
+    true
+}
 
 impl NufrostConfig {
     /// Load from a JSON byte slice.
@@ -114,6 +162,12 @@ impl NufrostConfig {
             return Err(NufrostError::InvalidConfigValue {
                 field: "eps".into(),
                 reason: "must be > 0".into(),
+            });
+        }
+        if self.outlier_reject_max_fraction < 0.0 || self.outlier_reject_max_fraction >= 1.0 {
+            return Err(NufrostError::InvalidConfigValue {
+                field: "outlier_reject_max_fraction".into(),
+                reason: "must be in [0, 1)".into(),
             });
         }
         Ok(())
@@ -152,6 +206,7 @@ mod tests {
         // Defaults kick in for omitted fields
         assert_eq!(cfg.frequency_selection, "spectral");
         assert_eq!(cfg.outlier_sigma, 2.5);
+        assert_eq!(cfg.outlier_reject_iters, 2);
     }
 
     #[test]
@@ -171,7 +226,10 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("missing"), "expected missing field error, got: {msg}");
+        assert!(
+            msg.contains("missing"),
+            "expected missing field error, got: {msg}"
+        );
     }
 
     #[test]
