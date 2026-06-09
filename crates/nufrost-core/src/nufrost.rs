@@ -681,23 +681,71 @@ fn maybe_days_to_seconds(t: &[f64], target_t: f64) -> (Vec<f64>, f64) {
     }
 }
 
-/// Snap a target frequency to the nearest spectral peak within `rel_tol`.
+fn normalized_sinc(x: f64) -> f64 {
+    if !x.is_finite() {
+        return 0.0;
+    }
+    if x.abs() < 1e-8 {
+        1.0
+    } else {
+        let pix = PI * x;
+        pix.sin() / pix
+    }
+}
+
+fn median_positive_frequency_spacing(f_pos: &[f64]) -> Option<f64> {
+    let mut diffs: Vec<f64> = f_pos
+        .windows(2)
+        .filter_map(|w| {
+            let d = w[1] - w[0];
+            if d.is_finite() && d > 0.0 {
+                Some(d)
+            } else {
+                None
+            }
+        })
+        .collect();
+    if diffs.is_empty() {
+        return None;
+    }
+    diffs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Some(diffs[diffs.len() / 2])
+}
+
+/// Snap a target frequency to the local finite-window sinc main lobe.
+///
+/// The NUFFT grid spacing is approximately `1 / tspan`. A preferred phenology
+/// frequency is therefore matched by maximizing `power * sinc^2((f-f0)/df)`
+/// inside the first main lobe (`|f-f0| <= df`), which avoids snapping to a
+/// distant high-energy peak.
 fn snap_frequency_to_spectrum(target_freq: f64, f_pos: &[f64], p_pos: &[f64], rel_tol: f64) -> f64 {
     if !target_freq.is_finite() || target_freq <= 0.0 {
         return target_freq;
     }
-    let rel_tol = rel_tol.max(0.0);
+    let Some(df) = median_positive_frequency_spacing(f_pos) else {
+        return target_freq;
+    };
+    if df <= 0.0 || !df.is_finite() {
+        return target_freq;
+    }
+    let _rel_tol = rel_tol.max(0.0);
+    let abs_window = df;
 
     let mut best_idx: Option<usize> = None;
-    let mut best_power = f64::NEG_INFINITY;
+    let mut best_score = f64::NEG_INFINITY;
 
     for (i, (&f, &p)) in f_pos.iter().zip(p_pos.iter()).enumerate() {
         if !f.is_finite() || !p.is_finite() || f <= 0.0 {
             continue;
         }
-        let rel_err = (f - target_freq).abs() / target_freq.max(1e-12);
-        if rel_err <= rel_tol && p > best_power {
-            best_power = p;
+        let abs_err = (f - target_freq).abs();
+        if abs_err > abs_window {
+            continue;
+        }
+        let s = normalized_sinc(abs_err / df);
+        let score = p * s * s;
+        if score > best_score {
+            best_score = score;
             best_idx = Some(i);
         }
     }
@@ -706,6 +754,25 @@ fn snap_frequency_to_spectrum(target_freq: f64, f_pos: &[f64], p_pos: &[f64], re
         Some(i) => f_pos[i],
         None => target_freq,
     }
+}
+
+fn select_phenology_frequencies(
+    f_pos: &[f64],
+    p_pos: &[f64],
+    fmax: f64,
+    preferred_freqs: &[f64],
+    preferred_top_k: usize,
+    ignore_dc_hz: f64,
+    spectral_merge_tol: f64,
+) -> Vec<f64> {
+    preferred_freqs
+        .iter()
+        .copied()
+        .filter(|&f| f.is_finite() && f > ignore_dc_hz && f <= fmax)
+        .take(preferred_top_k)
+        .map(|f| snap_frequency_to_spectrum(f, f_pos, p_pos, spectral_merge_tol))
+        .filter(|&f| f.is_finite() && f > ignore_dc_hz && f <= fmax)
+        .collect()
 }
 
 /// Select harmonic frequencies for NUFROST fitting.
@@ -739,16 +806,16 @@ pub fn select_frequencies(
     }
 
     // Preferred frequencies (snapped to spectrum)
-    if (mode == "preferred" || mode == "hybrid") && !preferred_freqs.is_empty() {
-        let pref_valid: Vec<f64> = preferred_freqs
-            .iter()
-            .copied()
-            .filter(|&f| f.is_finite() && f > ignore_dc_hz && f <= fmax)
-            .collect();
-        for f in pref_valid.iter().take(preferred_top_k) {
-            let snapped = snap_frequency_to_spectrum(*f, f_pos, p_pos, spectral_merge_tol);
-            selected.push(snapped);
-        }
+    if (mode == "preferred" || mode == "hybrid" || mode == "all") && !preferred_freqs.is_empty() {
+        selected.extend(select_phenology_frequencies(
+            f_pos,
+            p_pos,
+            fmax,
+            preferred_freqs,
+            preferred_top_k,
+            ignore_dc_hz,
+            spectral_merge_tol,
+        ));
     }
 
     // Spectral peaks
@@ -774,6 +841,13 @@ pub fn select_frequencies(
 
     if selected.is_empty() {
         return Vec::new();
+    }
+
+    if mode == "all" {
+        selected.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        selected.retain(|&f| f.is_finite() && f > ignore_dc_hz && f <= fmax);
+        selected.dedup_by(|a, b| (*a - *b).abs() <= 1e-18);
+        return selected;
     }
 
     // Sort, deduplicate, merge nearby frequencies
@@ -835,6 +909,15 @@ fn build_ridge_diag(
         }
     }
     r
+}
+
+fn frequency_matches_any(freq: f64, targets: &[f64]) -> bool {
+    targets.iter().any(|&target| {
+        if !freq.is_finite() || !target.is_finite() || target <= 0.0 {
+            return false;
+        }
+        (freq - target).abs() <= (target.abs() * 1e-10).max(1e-18)
+    })
 }
 
 /// Ridge diagonal with separate penalty multipliers for shared vs private frequencies.
@@ -986,6 +1069,7 @@ fn tiered_lambda_diag(
     freq_weight: f64,
     include_dc: bool,
     include_trend: bool,
+    unpenalized_freqs: &[f64],
 ) -> Vec<f64> {
     let r = build_ridge_diag(freqs, p, include_dc, include_trend, freq_weight);
     let mut lam_diag: Vec<f64> = r.iter().map(|&ri| lambda_beta * ri * ri).collect();
@@ -1009,6 +1093,21 @@ fn tiered_lambda_diag(
 
     for d in &mut lam_diag {
         *d = d.max(0.0);
+    }
+
+    if !unpenalized_freqs.is_empty() {
+        let col_start = (if include_dc { 1 } else { 0 }) + (if include_trend { 1 } else { 0 });
+        for (k, &freq) in freqs.iter().enumerate() {
+            if frequency_matches_any(freq, unpenalized_freqs) {
+                let c = col_start + 2 * k;
+                if c < p {
+                    lam_diag[c] = 0.0;
+                }
+                if c + 1 < p {
+                    lam_diag[c + 1] = 0.0;
+                }
+            }
+        }
     }
     lam_diag
 }
@@ -1079,6 +1178,7 @@ fn multi_output_tiered_ridge_solve(
     freq_weight: f64,
     include_dc: bool,
     include_trend: bool,
+    unpenalized_freqs: &[f64],
 ) -> Option<Array2<f64>> {
     let n = x.nrows();
     let p = x.ncols();
@@ -1096,6 +1196,7 @@ fn multi_output_tiered_ridge_solve(
         freq_weight,
         include_dc,
         include_trend,
+        unpenalized_freqs,
     );
 
     let mut a = Array2::<f64>::zeros((p, p));
@@ -2119,6 +2220,15 @@ pub fn nufrost_pixel_vector(
             _ => "spectral",
         };
         let preferred_freqs = parse_preferred_frequencies(&config.preferred_periods_days);
+        let phenology_freqs = select_phenology_frequencies(
+            &vector_freqs,
+            &vector_power,
+            fmax,
+            &preferred_freqs,
+            config.preferred_top_k as usize,
+            config.ignore_dc_hz,
+            config.spectral_merge_tol,
+        );
         let freqs_sel = select_frequencies(
             &vector_freqs,
             &vector_power,
@@ -2158,6 +2268,7 @@ pub fn nufrost_pixel_vector(
             config.freq_weight,
             true,
             config.include_trend,
+            &phenology_freqs,
         )?;
 
         for _ in 0..iters {
@@ -2194,6 +2305,7 @@ pub fn nufrost_pixel_vector(
                 config.freq_weight,
                 true,
                 config.include_trend,
+                &phenology_freqs,
             ) {
                 theta = next_theta;
             }
@@ -3429,6 +3541,25 @@ mod tests {
         // Higher freqs get larger penalty
         assert!(penalty[2] > penalty[1]);
         assert!(penalty[1] >= penalty[0]);
+    }
+
+    #[test]
+    fn test_phenology_frequency_has_no_ridge_penalty() {
+        let freqs = vec![0.0001, 0.0002, 0.0005];
+        let p = 2 + 2 * freqs.len();
+        let lam = tiered_lambda_diag(&freqs, p, 0.005, 0.02, 60.0, 2.0, true, true, &[0.0002]);
+
+        // DC/trend still have the base penalty.
+        assert!(lam[0] > 0.0);
+        assert!(lam[1] > 0.0);
+        // The second harmonic pair corresponds to 0.0002 and is unpenalized.
+        assert_eq!(lam[4], 0.0);
+        assert_eq!(lam[5], 0.0);
+        // Neighboring frequencies remain penalized.
+        assert!(lam[2] > 0.0);
+        assert!(lam[3] > 0.0);
+        assert!(lam[6] > 0.0);
+        assert!(lam[7] > 0.0);
     }
 
     #[test]

@@ -1,4 +1,5 @@
 pub mod full_scene;
+pub mod sample_cache;
 pub mod scene_cache;
 
 // gdal — raster I/O via GDAL bindings.

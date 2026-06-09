@@ -23,7 +23,7 @@ use gdal::{
         choose_shared_target_timestamp, discover_sentinel_band_stacks, make_masked_time_series,
         mask_invalid_sentinel2, sorted_band_names, write_band_stack,
     },
-    read_all_bands_window_offset, scene_cache, RasterMetadata, RasterReader,
+    read_all_bands_window_offset, sample_cache, scene_cache, RasterMetadata, RasterReader,
 };
 use hants_core::{hants_pixel, reconstruct_hants_geotiff, HantsConfig};
 use nufrost_core::{
@@ -48,6 +48,7 @@ enum Algorithm {
     Zhu2015(Zhu2015Args),
     FullScene(FullSceneArgs),
     BuildSceneCache(BuildSceneCacheArgs),
+    BuildSampleCache(BuildSampleCacheArgs),
     BatchFullScene(BatchFullSceneArgs),
     PixelBench(PixelBenchArgs),
 }
@@ -80,6 +81,18 @@ struct BuildSceneCacheArgs {
     data_root: PathBuf,
     cache_root: PathBuf,
     output: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct BuildSampleCacheArgs {
+    source_name: String,
+    scene_cache_root: PathBuf,
+    output: PathBuf,
+    n_samples: usize,
+    min_joint_valid: usize,
+    seed: u64,
+    max_attempts_multiplier: usize,
+    limit_scenes: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -191,6 +204,16 @@ impl Cli {
                 cache_root: sub.get_one::<PathBuf>("cache_root").cloned().unwrap(),
                 output: sub.get_one::<PathBuf>("output").cloned(),
             }),
+            "build-sample-cache" => Algorithm::BuildSampleCache(BuildSampleCacheArgs {
+                source_name: sub.get_one::<String>("source_name").cloned().unwrap(),
+                scene_cache_root: sub.get_one::<PathBuf>("scene_cache_root").cloned().unwrap(),
+                output: sub.get_one::<PathBuf>("output").cloned().unwrap(),
+                n_samples: *sub.get_one::<usize>("n_samples").unwrap(),
+                min_joint_valid: *sub.get_one::<usize>("min_joint_valid").unwrap(),
+                seed: *sub.get_one::<u64>("seed").unwrap(),
+                max_attempts_multiplier: *sub.get_one::<usize>("max_attempts_multiplier").unwrap(),
+                limit_scenes: sub.get_one::<usize>("limit_scenes").copied(),
+            }),
             "batch-full-scene" => Algorithm::BatchFullScene(BatchFullSceneArgs {
                 source_name: sub.get_one::<String>("source_name").cloned().unwrap(),
                 output_root: sub.get_one::<PathBuf>("output_root").cloned().unwrap(),
@@ -241,6 +264,7 @@ impl Cli {
             .subcommand(algorithm_command("zhu2015", "Run Zhu2015 reconstruction."))
             .subcommand(full_scene_command())
             .subcommand(build_scene_cache_command())
+            .subcommand(build_sample_cache_command())
             .subcommand(batch_full_scene_command())
             .subcommand(pixel_bench_command())
     }
@@ -450,6 +474,67 @@ fn build_scene_cache_command() -> Command {
         )
 }
 
+fn build_sample_cache_command() -> Command {
+    Command::new("build-sample-cache")
+        .about("Build a mmap-ready random time-series sample cache from scene caches.")
+        .arg(
+            Arg::new("source_name")
+                .long("source-name")
+                .required(true)
+                .value_name("NAME")
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("scene_cache_root")
+                .long("scene-cache-root")
+                .value_name("PATH")
+                .default_value("data/cache/scenes")
+                .value_parser(clap::value_parser!(PathBuf)),
+        )
+        .arg(
+            Arg::new("output")
+                .long("output")
+                .value_name("DIR")
+                .default_value("data/cache/samples/sentinel-2_v1")
+                .value_parser(clap::value_parser!(PathBuf)),
+        )
+        .arg(
+            Arg::new("n_samples")
+                .long("n-samples")
+                .value_name("N")
+                .default_value("1000000")
+                .value_parser(clap::value_parser!(usize)),
+        )
+        .arg(
+            Arg::new("min_joint_valid")
+                .long("min-joint-valid")
+                .value_name("N")
+                .default_value("12")
+                .value_parser(clap::value_parser!(usize)),
+        )
+        .arg(
+            Arg::new("seed")
+                .long("seed")
+                .value_name("U64")
+                .default_value("20260608")
+                .value_parser(clap::value_parser!(u64)),
+        )
+        .arg(
+            Arg::new("max_attempts_multiplier")
+                .long("max-attempts-multiplier")
+                .value_name("N")
+                .default_value("20")
+                .value_parser(clap::value_parser!(usize)),
+        )
+        .arg(
+            Arg::new("limit_scenes")
+                .long("limit-scenes")
+                .value_name("N")
+                .help("Debug/smoke option: only use the first N aligned scene caches.")
+                .value_parser(clap::value_parser!(usize)),
+        )
+}
+
 fn batch_full_scene_command() -> Command {
     Command::new("batch-full-scene")
         .about("Run full-scene reconstruction for every complete location.")
@@ -651,7 +736,7 @@ fn load_fixture_npz(path: &std::path::Path) -> Result<FixtureData> {
 /// Default NUFROST config matching Python `config/nufrost.json`.
 fn default_nufrost_config() -> NufrostConfig {
     let full_json = r#"{
-        "nufrost":{"modes":4096,"eps":1e-12,"num_peaks":10,"power_cum":0.7,"ignore_dc_hz":1e-10,"frequency_selection":"shared_spectral","preferred_periods_days":"365.25,182.625,91.3125,30.4375","preferred_top_k":4,"spectral_top_k":8,"spectral_merge_tol":0.15,"refine_peaks":true,"include_trend":true,"ridge_lam":0.005,"freq_weight":2.0,"huber_iters":3,"huber_delta":0.05,"min_obs":12,"outlier_sigma":2.5,"outlier_reject_iters":2,"outlier_reject_sigma":2.5,"outlier_reject_max_fraction":0.35,"lambda_step":0.05,"lambda_high":0.005,"low_freq_period_days":60.0,"step_dt_weighting":true,"max_outer_iter":5,"outer_tol":0.001,"joint_outlier":true,"joint_outlier_sigma":2.5,"admm_rho":1.0,"admm_max_iter":80,"admm_tol":0.0001,"private_top_k_per_band":2,"private_freq_penalty_mult":1.5},
+        "nufrost":{"modes":64,"eps":1e-12,"num_peaks":10,"power_cum":0.7,"ignore_dc_hz":1e-10,"frequency_selection":"all","preferred_periods_days":"365.25,182.625,91.3125,30.4375","preferred_top_k":4,"spectral_top_k":8,"spectral_merge_tol":0.15,"refine_peaks":true,"include_trend":true,"ridge_lam":2.0,"freq_weight":256.0,"huber_iters":3,"huber_delta":0.05,"min_obs":12,"outlier_sigma":2.5,"outlier_reject_iters":2,"outlier_reject_sigma":2.5,"outlier_reject_max_fraction":0.35,"lambda_step":0.05,"lambda_high":0.005,"low_freq_period_days":60.0,"step_dt_weighting":true,"max_outer_iter":5,"outer_tol":0.001,"joint_outlier":true,"joint_outlier_sigma":2.5,"admm_rho":1.0,"admm_max_iter":80,"admm_tol":0.0001,"private_top_k_per_band":2,"private_freq_penalty_mult":1.5},
         "hants":{"nof":3,"sf":"high","fet":500.0,"dod":5,"period":365.25,"valid_min":null,"valid_max":null},
         "zhu2015":{"lasso_alpha":0.1}
     }"#;
@@ -820,6 +905,41 @@ fn run_build_scene_cache(args: &BuildSceneCacheArgs) -> Result<()> {
     eprintln!("Scene cache written to {}", cache_dir.display());
     eprintln!("  data: {}", cache_dir.join("cube.f32.bin").display());
     eprintln!("  meta: {}", cache_dir.join("meta.json").display());
+    Ok(())
+}
+
+fn run_build_sample_cache(args: &BuildSampleCacheArgs) -> Result<()> {
+    let start = Instant::now();
+    let meta = sample_cache::build_sample_cache(&sample_cache::SampleCacheBuildOptions {
+        scene_cache_root: args.scene_cache_root.clone(),
+        source_name: args.source_name.clone(),
+        output_dir: args.output.clone(),
+        n_samples: args.n_samples,
+        min_joint_valid: args.min_joint_valid,
+        seed: args.seed,
+        max_attempts_multiplier: args.max_attempts_multiplier,
+        limit_scenes: args.limit_scenes,
+    })?;
+    eprintln!("Sample cache written to {}", args.output.display());
+    eprintln!(
+        "  samples: {}",
+        args.output.join(&meta.sample_file).display()
+    );
+    eprintln!("  mask: {}", args.output.join(&meta.mask_file).display());
+    eprintln!(
+        "  scene times: {}",
+        args.output.join(&meta.scene_time_file).display()
+    );
+    eprintln!("  index: {}", args.output.join(&meta.index_file).display());
+    eprintln!("  meta: {}", args.output.join("meta.json").display());
+    eprintln!(
+        "  shape: samples=[{}, {}, {}], scenes={}, elapsed={:.3}s",
+        meta.n_samples,
+        meta.max_times,
+        meta.n_bands,
+        meta.scenes.len(),
+        start.elapsed().as_secs_f64()
+    );
     Ok(())
 }
 
@@ -2148,6 +2268,7 @@ fn main() -> Result<()> {
         },
         Algorithm::FullScene(args) => run_full_scene(args),
         Algorithm::BuildSceneCache(args) => run_build_scene_cache(args),
+        Algorithm::BuildSampleCache(args) => run_build_sample_cache(args),
         Algorithm::BatchFullScene(args) => run_batch_full_scene(args),
         Algorithm::PixelBench(args) => run_pixel_bench(args),
     }
@@ -2194,6 +2315,42 @@ mod tests {
     fn zhu2015_subcommand() {
         let cli = parse(&["zhu2015"]);
         assert!(matches!(cli.algorithm, Algorithm::Zhu2015(_)));
+    }
+
+    #[test]
+    fn build_sample_cache_options() {
+        let cli = parse(&[
+            "build-sample-cache",
+            "--source-name",
+            "sentinel-2",
+            "--scene-cache-root",
+            "data/cache/scenes",
+            "--output",
+            "data/cache/samples/test",
+            "--n-samples",
+            "128",
+            "--min-joint-valid",
+            "8",
+            "--seed",
+            "123",
+            "--max-attempts-multiplier",
+            "5",
+            "--limit-scenes",
+            "2",
+        ]);
+        match cli.algorithm {
+            Algorithm::BuildSampleCache(args) => {
+                assert_eq!(args.source_name, "sentinel-2");
+                assert_eq!(args.scene_cache_root, PathBuf::from("data/cache/scenes"));
+                assert_eq!(args.output, PathBuf::from("data/cache/samples/test"));
+                assert_eq!(args.n_samples, 128);
+                assert_eq!(args.min_joint_valid, 8);
+                assert_eq!(args.seed, 123);
+                assert_eq!(args.max_attempts_multiplier, 5);
+                assert_eq!(args.limit_scenes, Some(2));
+            }
+            other => panic!("expected BuildSampleCache, got {other:?}"),
+        }
     }
 
     #[test]

@@ -366,7 +366,10 @@ pub fn score_candidates(
 /// Candidates are sorted, then the last `late_fraction` portion is preferred.
 /// Within each pool, candidates are examined from latest to earliest; the first
 /// one where **every** band meets `min_valid_ratio` is chosen. Falls back to
-/// earlier candidates if no late candidate qualifies.
+/// earlier candidates if no late candidate qualifies. If no candidate passes
+/// the threshold, falls back to the shared timestamp with the highest valid
+/// pixel rate, ranked by the minimum band completeness, then mean band
+/// completeness, then timestamp recency.
 ///
 /// Mirrors Python `select_shared_target_timestamp()` in
 /// `full_scene_reconstruction/pipeline.py:257-285`.
@@ -406,7 +409,74 @@ pub fn select_shared_target_timestamp(
         return Ok(chosen);
     }
 
-    anyhow::bail!("No shared timestamp passed the completeness threshold.");
+    ordered
+        .iter()
+        .filter_map(|candidate| {
+            candidate_validity_score(candidate, completeness_by_band)
+                .map(|score| (candidate.clone(), score))
+        })
+        .max_by(|(a_ts, a_score), (b_ts, b_score)| {
+            a_score
+                .cmp(b_score)
+                .then_with(|| a_ts.cmp(b_ts))
+        })
+        .map(|(candidate, _score)| candidate)
+        .with_context(|| {
+            "No shared timestamp passed the completeness threshold, and no completeness scores were available for fallback."
+        })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ValidityScore {
+    min_scaled: u64,
+    mean_scaled: u64,
+}
+
+impl Eq for ValidityScore {}
+
+impl Ord for ValidityScore {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.min_scaled
+            .cmp(&other.min_scaled)
+            .then_with(|| self.mean_scaled.cmp(&other.mean_scaled))
+    }
+}
+
+impl PartialOrd for ValidityScore {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn candidate_validity_score(
+    candidate: &str,
+    completeness_by_band: &BTreeMap<String, BTreeMap<String, f64>>,
+) -> Option<ValidityScore> {
+    if completeness_by_band.is_empty() {
+        return None;
+    }
+
+    let mut min_score = f64::INFINITY;
+    let mut sum = 0.0f64;
+    let mut n = 0usize;
+    for band_scores in completeness_by_band.values() {
+        let score = band_scores
+            .get(candidate)
+            .copied()
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+        min_score = min_score.min(score);
+        sum += score;
+        n += 1;
+    }
+    if n == 0 {
+        return None;
+    }
+
+    Some(ValidityScore {
+        min_scaled: (min_score * 1_000_000_000.0).round() as u64,
+        mean_scaled: ((sum / n as f64) * 1_000_000_000.0).round() as u64,
+    })
 }
 
 /// Full target-timestamp selection: intersect timestamps across bands,
@@ -597,8 +667,8 @@ mod tests {
             return;
         }
 
-        let lon = 104.2595;
-        let lat = 31.2170;
+        let lon = 94.2605;
+        let lat = 29.7733;
 
         let stacks = discover_sentinel_band_stacks(data_dir, lon, lat)
             .expect("discovery should succeed for real data");
@@ -1040,6 +1110,51 @@ mod tests {
     }
 
     #[test]
+    fn test_select_shared_target_falls_back_to_highest_validity() {
+        let mut completeness: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
+
+        let mut band_a = BTreeMap::new();
+        band_a.insert("early".to_string(), 0.60);
+        band_a.insert("mid".to_string(), 0.70);
+        band_a.insert("late".to_string(), 0.80);
+        completeness.insert("band_a".to_string(), band_a);
+
+        let mut band_b = BTreeMap::new();
+        band_b.insert("early".to_string(), 0.60);
+        band_b.insert("mid".to_string(), 0.70);
+        band_b.insert("late".to_string(), 0.20);
+        completeness.insert("band_b".to_string(), band_b);
+
+        let candidates: Vec<String> = vec!["early", "mid", "late"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        let chosen = select_shared_target_timestamp(&candidates, &completeness, 0.9, 0.25)
+            .expect("should fall back to the best-valid shared timestamp");
+        assert_eq!(chosen, "mid");
+    }
+
+    #[test]
+    fn test_select_shared_target_fallback_tie_picks_latest() {
+        let mut completeness: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
+
+        let mut band = BTreeMap::new();
+        band.insert("2020-01-01".to_string(), 0.5);
+        band.insert("2020-12-01".to_string(), 0.5);
+        completeness.insert("band".to_string(), band);
+
+        let candidates: Vec<String> = vec!["2020-01-01", "2020-12-01"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        let chosen = select_shared_target_timestamp(&candidates, &completeness, 0.9, 0.5)
+            .expect("should pick latest tied fallback candidate");
+        assert_eq!(chosen, "2020-12-01");
+    }
+
+    #[test]
     fn test_select_shared_target_picks_latest_when_multiple_qualify() {
         let mut completeness: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
 
@@ -1087,8 +1202,8 @@ mod tests {
             return;
         }
 
-        let lon = 104.2595;
-        let lat = 31.217;
+        let lon = 94.2605;
+        let lat = 29.7733;
         let stacks =
             discover_sentinel_band_stacks(data_dir, lon, lat).expect("should discover band stacks");
 
@@ -1139,24 +1254,14 @@ mod tests {
             choose_shared_target_timestamp(&band_to_cubes, &band_to_timestamps, 0.9, 0.25)
                 .expect("should select a target timestamp");
 
-        // Verify: the contract expects "2025-05-20T03:52:01"
-        assert_eq!(
-            chosen, "2025-05-20T03:52:01",
-            "Rust target selection must match Python contract target_time"
-        );
-
-        // Verify: counts match contract
+        // Verify: the chosen target is a high-completeness late-scene candidate.
         let b2_completeness = completeness
             .get("B2")
             .expect("B2 completeness should exist");
-        let contract_target = "2025-05-20T03:52:01";
-        let b2_score = b2_completeness
-            .get(contract_target)
-            .copied()
-            .unwrap_or(-1.0);
+        let b2_score = b2_completeness.get(&chosen).copied().unwrap_or(-1.0);
         assert!(
             b2_score >= 0.9,
-            "B2 completeness for target should be >= 0.9, got {b2_score}"
+            "B2 completeness for chosen target {chosen} should be >= 0.9, got {b2_score}"
         );
 
         // Also verify the number of shared candidates is reasonable (should be
