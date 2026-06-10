@@ -2478,6 +2478,7 @@ impl EvalStats {
 #[derive(Debug, Clone)]
 struct IndexEvalStats {
     ndvi: ScalarErrorStats,
+    evi: ScalarErrorStats,
     ndwi: ScalarErrorStats,
     ndsi: ScalarErrorStats,
     ndmi: ScalarErrorStats,
@@ -2488,6 +2489,7 @@ impl IndexEvalStats {
     fn new() -> Self {
         Self {
             ndvi: ScalarErrorStats::new(),
+            evi: ScalarErrorStats::new(),
             ndwi: ScalarErrorStats::new(),
             ndsi: ScalarErrorStats::new(),
             ndmi: ScalarErrorStats::new(),
@@ -2497,6 +2499,7 @@ impl IndexEvalStats {
 
     fn add(&mut self, truth: &[f64], pred: &[f64]) {
         add_index_error(&mut self.ndvi, truth, pred, ndvi_from_bands);
+        add_index_error(&mut self.evi, truth, pred, evi_from_bands);
         add_index_error(&mut self.ndwi, truth, pred, ndwi_from_bands);
         add_index_error(&mut self.ndsi, truth, pred, ndsi_from_bands);
         add_index_error(&mut self.ndmi, truth, pred, ndmi_from_bands);
@@ -2505,6 +2508,7 @@ impl IndexEvalStats {
 
     fn merge(&mut self, other: Self) {
         self.ndvi.merge(other.ndvi);
+        self.evi.merge(other.evi);
         self.ndwi.merge(other.ndwi);
         self.ndsi.merge(other.ndsi);
         self.ndmi.merge(other.ndmi);
@@ -2514,6 +2518,7 @@ impl IndexEvalStats {
     fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "NDVI": self.ndvi.to_json(),
+            "EVI": self.evi.to_json(),
             "NDWI": self.ndwi.to_json(),
             "NDSI": self.ndsi.to_json(),
             "NDMI": self.ndmi.to_json(),
@@ -2521,6 +2526,7 @@ impl IndexEvalStats {
             "definition": {
                 "scale": "Input Sentinel-2 reflectance bands are divided by 10000 before computing indices.",
                 "NDVI": "(B8 - B4) / (B8 + B4)",
+                "EVI": "2.5 * (B8 - B4) / (B8 + 6 * B4 - 7.5 * B2 + 1)",
                 "NDWI": "(B3 - B8) / (B3 + B8)",
                 "NDSI": "(B3 - B11) / (B3 + B11)",
                 "NDMI": "(B8 - B11) / (B8 + B11)",
@@ -3273,6 +3279,12 @@ fn ndvi_from_bands(bands: &[f64]) -> Option<f64> {
     normalized_difference(s2.b8, s2.b4)
 }
 
+fn evi_from_bands(bands: &[f64]) -> Option<f64> {
+    let s2 = sentinel2_reflectance(bands)?;
+    valid_ratio_denominator(s2.b8 + 6.0 * s2.b4 - 7.5 * s2.b2 + 1.0)
+        .map(|denom| 2.5 * (s2.b8 - s2.b4) / denom)
+}
+
 fn ndwi_from_bands(bands: &[f64]) -> Option<f64> {
     let s2 = sentinel2_reflectance(bands)?;
     normalized_difference(s2.b3, s2.b8)
@@ -3295,6 +3307,7 @@ fn nbr_from_bands(bands: &[f64]) -> Option<f64> {
 
 #[derive(Debug, Clone, Copy)]
 struct Sentinel2Reflectance {
+    b2: f64,
     b3: f64,
     b4: f64,
     b8: f64,
@@ -3307,6 +3320,7 @@ fn sentinel2_reflectance(bands: &[f64]) -> Option<Sentinel2Reflectance> {
         return None;
     }
     let reflectance = Sentinel2Reflectance {
+        b2: bands[0] / 10000.0,
         b3: bands[1] / 10000.0,
         b4: bands[2] / 10000.0,
         b8: bands[3] / 10000.0,
@@ -3314,6 +3328,7 @@ fn sentinel2_reflectance(bands: &[f64]) -> Option<Sentinel2Reflectance> {
         b12: bands[5] / 10000.0,
     };
     if [
+        reflectance.b2,
         reflectance.b3,
         reflectance.b4,
         reflectance.b8,
