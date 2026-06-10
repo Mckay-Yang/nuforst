@@ -6,8 +6,10 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs::{self, File};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
@@ -109,6 +111,7 @@ struct EvalSampleCacheArgs {
     config: Option<PathBuf>,
     output_json: Option<PathBuf>,
     output_gap_csv: Option<PathBuf>,
+    output_prediction_csv: Option<PathBuf>,
     gap_bins: usize,
     threads: Option<usize>,
 }
@@ -241,6 +244,7 @@ impl Cli {
                 config: sub.get_one::<PathBuf>("config").cloned(),
                 output_json: sub.get_one::<PathBuf>("output_json").cloned(),
                 output_gap_csv: sub.get_one::<PathBuf>("output_gap_csv").cloned(),
+                output_prediction_csv: sub.get_one::<PathBuf>("output_prediction_csv").cloned(),
                 gap_bins: *sub.get_one::<usize>("gap_bins").unwrap(),
                 threads: sub.get_one::<usize>("threads").copied(),
             }),
@@ -625,6 +629,13 @@ fn eval_sample_cache_command() -> Command {
                 .long("output-gap-csv")
                 .value_name("PATH")
                 .help("Optional CSV path for RMSE/MAE curves binned by gap indices.")
+                .value_parser(clap::value_parser!(PathBuf)),
+        )
+        .arg(
+            Arg::new("output_prediction_csv")
+                .long("output-prediction-csv")
+                .value_name("PATH")
+                .help("Optional per-sample holdout prediction CSV with truth and prediction bands.")
                 .value_parser(clap::value_parser!(PathBuf)),
         )
         .arg(
@@ -2380,6 +2391,7 @@ struct EvalStats {
     sum_sq: Vec<f64>,
     sum_abs: Vec<f64>,
     count: Vec<usize>,
+    indices: IndexEvalStats,
     gap_regular: GapCurveStats,
     gap_periodic: GapCurveStats,
 }
@@ -2407,6 +2419,7 @@ impl EvalStats {
             sum_sq: vec![0.0; n_bands],
             sum_abs: vec![0.0; n_bands],
             count: vec![0; n_bands],
+            indices: IndexEvalStats::new(),
             gap_regular: GapCurveStats::new(gap_bins, n_bands),
             gap_periodic: GapCurveStats::new(gap_bins, n_bands),
         }
@@ -2429,6 +2442,7 @@ impl EvalStats {
                     }
                 }
                 if any {
+                    self.indices.add(&eval.truth, &eval.pred);
                     self.gap_regular
                         .add(eval.gap_regular, &eval.truth, &eval.pred);
                     self.gap_periodic
@@ -2454,9 +2468,135 @@ impl EvalStats {
             self.sum_abs[b] += other.sum_abs[b];
             self.count[b] += other.count[b];
         }
+        self.indices.merge(other.indices);
         self.gap_regular.merge(other.gap_regular);
         self.gap_periodic.merge(other.gap_periodic);
         self
+    }
+}
+
+#[derive(Debug, Clone)]
+struct IndexEvalStats {
+    ndvi: ScalarErrorStats,
+    ndwi: ScalarErrorStats,
+    ndsi: ScalarErrorStats,
+    ndmi: ScalarErrorStats,
+    nbr: ScalarErrorStats,
+}
+
+impl IndexEvalStats {
+    fn new() -> Self {
+        Self {
+            ndvi: ScalarErrorStats::new(),
+            ndwi: ScalarErrorStats::new(),
+            ndsi: ScalarErrorStats::new(),
+            ndmi: ScalarErrorStats::new(),
+            nbr: ScalarErrorStats::new(),
+        }
+    }
+
+    fn add(&mut self, truth: &[f64], pred: &[f64]) {
+        add_index_error(&mut self.ndvi, truth, pred, ndvi_from_bands);
+        add_index_error(&mut self.ndwi, truth, pred, ndwi_from_bands);
+        add_index_error(&mut self.ndsi, truth, pred, ndsi_from_bands);
+        add_index_error(&mut self.ndmi, truth, pred, ndmi_from_bands);
+        add_index_error(&mut self.nbr, truth, pred, nbr_from_bands);
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.ndvi.merge(other.ndvi);
+        self.ndwi.merge(other.ndwi);
+        self.ndsi.merge(other.ndsi);
+        self.ndmi.merge(other.ndmi);
+        self.nbr.merge(other.nbr);
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "NDVI": self.ndvi.to_json(),
+            "NDWI": self.ndwi.to_json(),
+            "NDSI": self.ndsi.to_json(),
+            "NDMI": self.ndmi.to_json(),
+            "NBR": self.nbr.to_json(),
+            "definition": {
+                "scale": "Input Sentinel-2 reflectance bands are divided by 10000 before computing indices.",
+                "NDVI": "(B8 - B4) / (B8 + B4)",
+                "NDWI": "(B3 - B8) / (B3 + B8)",
+                "NDSI": "(B3 - B11) / (B3 + B11)",
+                "NDMI": "(B8 - B11) / (B8 + B11)",
+                "NBR": "(B8 - B12) / (B8 + B12)",
+                "validity": "Index is skipped when the denominator is not finite or has absolute value <= 1e-6."
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScalarErrorStats {
+    sum_sq: f64,
+    sum_abs: f64,
+    sum: f64,
+    count: usize,
+}
+
+impl ScalarErrorStats {
+    fn new() -> Self {
+        Self {
+            sum_sq: 0.0,
+            sum_abs: 0.0,
+            sum: 0.0,
+            count: 0,
+        }
+    }
+
+    fn add(&mut self, err: f64) {
+        if !err.is_finite() {
+            return;
+        }
+        self.sum_sq += err * err;
+        self.sum_abs += err.abs();
+        self.sum += err;
+        self.count += 1;
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.sum_sq += other.sum_sq;
+        self.sum_abs += other.sum_abs;
+        self.sum += other.sum;
+        self.count += other.count;
+    }
+
+    fn rmse(&self) -> f64 {
+        if self.count > 0 {
+            (self.sum_sq / self.count as f64).sqrt()
+        } else {
+            f64::NAN
+        }
+    }
+
+    fn mae(&self) -> f64 {
+        if self.count > 0 {
+            self.sum_abs / self.count as f64
+        } else {
+            f64::NAN
+        }
+    }
+
+    fn bias(&self) -> f64 {
+        if self.count > 0 {
+            self.sum / self.count as f64
+        } else {
+            f64::NAN
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "rmse": self.rmse(),
+            "mae": self.mae(),
+            "bias": self.bias(),
+            "count": self.count,
+        })
     }
 }
 
@@ -2646,6 +2786,15 @@ fn run_eval_sample_cache(args: &EvalSampleCacheArgs) -> Result<()> {
         rayon::current_num_threads()
     );
 
+    let prediction_writer = if let Some(path) = &args.output_prediction_csv {
+        Some(Arc::new(Mutex::new(create_prediction_csv_writer(
+            path,
+            &cache.meta.bands,
+        )?)))
+    } else {
+        None
+    };
+
     let started = Instant::now();
     let progress = AtomicUsize::new(0);
     let stats = tasks
@@ -2658,6 +2807,11 @@ fn run_eval_sample_cache(args: &EvalSampleCacheArgs) -> Result<()> {
                 })
                 .ok()
                 .flatten();
+            if let (Some(writer), Some(eval)) = (&prediction_writer, &result) {
+                if let Ok(mut writer) = writer.lock() {
+                    let _ = write_prediction_csv_row(&mut writer, task, eval);
+                }
+            }
             let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
             if done % SAMPLE_CACHE_EVAL_PROGRESS_INTERVAL == 0 || done == n_eval {
                 let elapsed = started.elapsed().as_secs_f64();
@@ -2736,6 +2890,7 @@ fn run_eval_sample_cache(args: &EvalSampleCacheArgs) -> Result<()> {
             "count": total_count,
         },
         "bands": band_metrics,
+        "indices": stats.indices.to_json(),
         "gap_indices": {
             "definition": {
                 "gap_regular": "I_gap = sum(l_i^2) / N^2 over adjacent valid-observation gaps after holdout",
@@ -2764,7 +2919,54 @@ fn run_eval_sample_cache(args: &EvalSampleCacheArgs) -> Result<()> {
         write_gap_curve_csv(path, &args.method, &cache.meta.bands, &stats)?;
         eprintln!("Sample cache gap curves written to {}", path.display());
     }
+    if let Some(path) = &args.output_prediction_csv {
+        if let Some(writer) = prediction_writer {
+            if let Ok(mut writer) = writer.lock() {
+                writer.flush()?;
+            }
+        }
+        eprintln!("Sample cache prediction CSV written to {}", path.display());
+    }
     Ok(())
+}
+
+fn create_prediction_csv_writer(path: &Path, bands: &[String]) -> Result<BufWriter<File>> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let mut writer = BufWriter::new(
+        File::create(path).with_context(|| format!("Cannot create {}", path.display()))?,
+    );
+    write!(writer, "sample_idx,holdout_seed,gap_regular,gap_periodic")?;
+    for band in bands {
+        write!(writer, ",truth_{band}")?;
+    }
+    for band in bands {
+        write!(writer, ",pred_{band}")?;
+    }
+    writeln!(writer)?;
+    Ok(writer)
+}
+
+fn write_prediction_csv_row(
+    writer: &mut BufWriter<File>,
+    task: &EvalTask,
+    eval: &EvalOne,
+) -> std::io::Result<()> {
+    write!(
+        writer,
+        "{},{},{:.12},{:.12}",
+        task.sample_idx, task.holdout_seed, eval.gap_regular, eval.gap_periodic
+    )?;
+    for value in &eval.truth {
+        write!(writer, ",{value:.8}")?;
+    }
+    for value in &eval.pred {
+        write!(writer, ",{value:.8}")?;
+    }
+    writeln!(writer)
 }
 
 fn write_gap_curve_csv(
@@ -3052,6 +3254,90 @@ fn predict_eval_holdout(
                 fit_predict_pixel(times, band_obs, target_time, cfg.lasso_alpha).prediction
             })
             .collect(),
+    }
+}
+
+fn add_index_error(
+    stats: &mut ScalarErrorStats,
+    truth: &[f64],
+    pred: &[f64],
+    index_fn: fn(&[f64]) -> Option<f64>,
+) {
+    if let (Some(truth_index), Some(pred_index)) = (index_fn(truth), index_fn(pred)) {
+        stats.add(pred_index - truth_index);
+    }
+}
+
+fn ndvi_from_bands(bands: &[f64]) -> Option<f64> {
+    let s2 = sentinel2_reflectance(bands)?;
+    normalized_difference(s2.b8, s2.b4)
+}
+
+fn ndwi_from_bands(bands: &[f64]) -> Option<f64> {
+    let s2 = sentinel2_reflectance(bands)?;
+    normalized_difference(s2.b3, s2.b8)
+}
+
+fn ndsi_from_bands(bands: &[f64]) -> Option<f64> {
+    let s2 = sentinel2_reflectance(bands)?;
+    normalized_difference(s2.b3, s2.b11)
+}
+
+fn ndmi_from_bands(bands: &[f64]) -> Option<f64> {
+    let s2 = sentinel2_reflectance(bands)?;
+    normalized_difference(s2.b8, s2.b11)
+}
+
+fn nbr_from_bands(bands: &[f64]) -> Option<f64> {
+    let s2 = sentinel2_reflectance(bands)?;
+    normalized_difference(s2.b8, s2.b12)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Sentinel2Reflectance {
+    b3: f64,
+    b4: f64,
+    b8: f64,
+    b11: f64,
+    b12: f64,
+}
+
+fn sentinel2_reflectance(bands: &[f64]) -> Option<Sentinel2Reflectance> {
+    if bands.len() < 6 {
+        return None;
+    }
+    let reflectance = Sentinel2Reflectance {
+        b3: bands[1] / 10000.0,
+        b4: bands[2] / 10000.0,
+        b8: bands[3] / 10000.0,
+        b11: bands[4] / 10000.0,
+        b12: bands[5] / 10000.0,
+    };
+    if [
+        reflectance.b3,
+        reflectance.b4,
+        reflectance.b8,
+        reflectance.b11,
+        reflectance.b12,
+    ]
+    .iter()
+    .all(|v| v.is_finite())
+    {
+        Some(reflectance)
+    } else {
+        None
+    }
+}
+
+fn normalized_difference(a: f64, b: f64) -> Option<f64> {
+    valid_ratio_denominator(a + b).map(|denom| (a - b) / denom)
+}
+
+fn valid_ratio_denominator(value: f64) -> Option<f64> {
+    if value.is_finite() && value.abs() > 1.0e-6 {
+        Some(value)
+    } else {
+        None
     }
 }
 
