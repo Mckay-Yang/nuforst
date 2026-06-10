@@ -1,7 +1,7 @@
 # Rust Workspace — NUFROST Rewrite
 
 This workspace bootstraps a Rust rewrite of the reconstruction pipeline.
-It contains six crates under `crates/`, using the standard Cargo workspace
+It contains five crates under `crates/`, using the standard Cargo workspace
 layout where each crate keeps its Rust sources under its own `src/` directory:
 
 | Crate            | Type        | Purpose                                      |
@@ -10,8 +10,7 @@ layout where each crate keeps its Rust sources under its own `src/` directory:
 | `nufrost-core`   | lib         | NUFROST algorithm, NUFFT, shared time/types   |
 | `hants-core`     | lib         | HANTS baseline algorithm                      |
 | `zhu2015-core`   | lib         | Zhu2015 baseline algorithm                    |
-| `cli`            | binary      | CLI entrypoint for reconstruction            |
-| `nufrost-py`     | cdylib      | Python bindings via PyO3 + maturin           |
+| `nufrost-cli`    | binary      | CLI entrypoint for reconstruction            |
 
 ## System Dependencies
 

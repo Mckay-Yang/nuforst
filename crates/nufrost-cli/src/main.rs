@@ -1,4 +1,4 @@
-// cli — command-line entrypoint for NUFROST, HANTS, and Zhu2015
+// nufrost-cli — command-line entrypoint for NUFROST, HANTS, and Zhu2015
 // reconstruction algorithms.  Supports single-pixel fixture NPZ input and
 // raster GeoTIFF input via gdal.
 
@@ -101,12 +101,15 @@ struct BuildSampleCacheArgs {
 
 #[derive(Debug)]
 struct EvalSampleCacheArgs {
+    method: String,
     cache_dir: PathBuf,
     n_eval: usize,
     seed: u64,
     min_joint_valid: usize,
     config: Option<PathBuf>,
     output_json: Option<PathBuf>,
+    output_gap_csv: Option<PathBuf>,
+    gap_bins: usize,
     threads: Option<usize>,
 }
 
@@ -230,12 +233,15 @@ impl Cli {
                 limit_scenes: sub.get_one::<usize>("limit_scenes").copied(),
             }),
             "eval-sample-cache" => Algorithm::EvalSampleCache(EvalSampleCacheArgs {
+                method: sub.get_one::<String>("method").cloned().unwrap(),
                 cache_dir: sub.get_one::<PathBuf>("cache_dir").cloned().unwrap(),
                 n_eval: *sub.get_one::<usize>("n_eval").unwrap(),
                 seed: *sub.get_one::<u64>("seed").unwrap(),
                 min_joint_valid: *sub.get_one::<usize>("min_joint_valid").unwrap(),
                 config: sub.get_one::<PathBuf>("config").cloned(),
                 output_json: sub.get_one::<PathBuf>("output_json").cloned(),
+                output_gap_csv: sub.get_one::<PathBuf>("output_gap_csv").cloned(),
+                gap_bins: *sub.get_one::<usize>("gap_bins").unwrap(),
                 threads: sub.get_one::<usize>("threads").copied(),
             }),
             "batch-full-scene" => Algorithm::BatchFullScene(BatchFullSceneArgs {
@@ -269,17 +275,17 @@ impl Cli {
     }
 
     fn command() -> Command {
-        Command::new("cli")
+        Command::new("nufrost-cli")
             .version(env!("CARGO_PKG_VERSION"))
             .about("NUFROST / HANTS / Zhu2015 time-series reconstruction CLI")
             .after_help(
                 "Examples:\n  \
-                 cli nufrost --data fixture.npz --target-time 372.7\n  \
-                 cli hants --config hants.json --data fixture.npz\n  \
-                 cli zhu2015 --data fixture.npz -t 372.7 -o pred.txt\n  \
-                 cli nufrost --input-geotiff input.tif --output pred.tif\n  \
-                 cli hants --input-geotiff input.tif -o pred.tif\n  \
-                 cli zhu2015 --input-geotiff input.tif -o pred.tif",
+                 nufrost-cli nufrost --data fixture.npz --target-time 372.7\n  \
+                 nufrost-cli hants --config hants.json --data fixture.npz\n  \
+                 nufrost-cli zhu2015 --data fixture.npz -t 372.7 -o pred.txt\n  \
+                 nufrost-cli nufrost --input-geotiff input.tif --output pred.tif\n  \
+                 nufrost-cli hants --input-geotiff input.tif -o pred.tif\n  \
+                 nufrost-cli zhu2015 --input-geotiff input.tif -o pred.tif",
             )
             .subcommand_required(true)
             .arg_required_else_help(true)
@@ -562,7 +568,15 @@ fn build_sample_cache_command() -> Command {
 
 fn eval_sample_cache_command() -> Command {
     Command::new("eval-sample-cache")
-        .about("Evaluate NUFROST holdout RMSE on a mmap-ready sample cache.")
+        .about("Evaluate holdout RMSE on a mmap-ready sample cache.")
+        .arg(
+            Arg::new("method")
+                .long("method")
+                .value_name("NAME")
+                .default_value("nufrost")
+                .help("Evaluation method: nufrost, hants, or zhu2015.")
+                .value_parser(["nufrost", "hants", "zhu2015"]),
+        )
         .arg(
             Arg::new("cache_dir")
                 .long("cache-dir")
@@ -605,6 +619,21 @@ fn eval_sample_cache_command() -> Command {
                 .long("output-json")
                 .value_name("PATH")
                 .value_parser(clap::value_parser!(PathBuf)),
+        )
+        .arg(
+            Arg::new("output_gap_csv")
+                .long("output-gap-csv")
+                .value_name("PATH")
+                .help("Optional CSV path for RMSE/MAE curves binned by gap indices.")
+                .value_parser(clap::value_parser!(PathBuf)),
+        )
+        .arg(
+            Arg::new("gap_bins")
+                .long("gap-bins")
+                .value_name("N")
+                .default_value("20")
+                .help("Number of value-range bins used for each gap-index RMSE curve.")
+                .value_parser(clap::value_parser!(usize)),
         )
         .arg(
             Arg::new("threads")
@@ -2351,15 +2380,25 @@ struct EvalStats {
     sum_sq: Vec<f64>,
     sum_abs: Vec<f64>,
     count: Vec<usize>,
+    gap_regular: GapCurveStats,
+    gap_periodic: GapCurveStats,
 }
 
 struct EvalOne {
     truth: Vec<f64>,
     pred: Vec<f64>,
+    gap_regular: f64,
+    gap_periodic: f64,
+}
+
+enum EvalMethodConfig {
+    Nufrost(NufrostConfig),
+    Hants(HantsConfig),
+    Zhu2015(Zhu2015Config),
 }
 
 impl EvalStats {
-    fn new(n_bands: usize) -> Self {
+    fn new(n_bands: usize, gap_bins: usize) -> Self {
         Self {
             attempted: 0,
             evaluated: 0,
@@ -2368,6 +2407,8 @@ impl EvalStats {
             sum_sq: vec![0.0; n_bands],
             sum_abs: vec![0.0; n_bands],
             count: vec![0; n_bands],
+            gap_regular: GapCurveStats::new(gap_bins, n_bands),
+            gap_periodic: GapCurveStats::new(gap_bins, n_bands),
         }
     }
 
@@ -2388,6 +2429,10 @@ impl EvalStats {
                     }
                 }
                 if any {
+                    self.gap_regular
+                        .add(eval.gap_regular, &eval.truth, &eval.pred);
+                    self.gap_periodic
+                        .add(eval.gap_periodic, &eval.truth, &eval.pred);
                     self.evaluated += 1;
                 } else {
                     self.failed += 1;
@@ -2409,7 +2454,157 @@ impl EvalStats {
             self.sum_abs[b] += other.sum_abs[b];
             self.count[b] += other.count[b];
         }
+        self.gap_regular.merge(other.gap_regular);
+        self.gap_periodic.merge(other.gap_periodic);
         self
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GapCurveStats {
+    n_bins: usize,
+    n_bands: usize,
+    min: f64,
+    max: f64,
+    sum_sq: Vec<Vec<f64>>,
+    sum_abs: Vec<Vec<f64>>,
+    count: Vec<Vec<usize>>,
+    sample_count: Vec<usize>,
+}
+
+impl GapCurveStats {
+    fn new(n_bins: usize, n_bands: usize) -> Self {
+        let n_bins = n_bins.max(1);
+        Self {
+            n_bins,
+            n_bands,
+            min: 0.0,
+            max: 0.2,
+            sum_sq: vec![vec![0.0; n_bands]; n_bins],
+            sum_abs: vec![vec![0.0; n_bands]; n_bins],
+            count: vec![vec![0; n_bands]; n_bins],
+            sample_count: vec![0; n_bins],
+        }
+    }
+
+    fn add(&mut self, gap_value: f64, truth: &[f64], pred: &[f64]) {
+        if !gap_value.is_finite() {
+            return;
+        }
+        let bin = self.bin_index(gap_value);
+        let mut any = false;
+        for b in 0..self.n_bands {
+            let truth = truth[b];
+            let pred = pred[b];
+            if truth.is_finite() && pred.is_finite() {
+                let err = pred - truth;
+                self.sum_sq[bin][b] += err * err;
+                self.sum_abs[bin][b] += err.abs();
+                self.count[bin][b] += 1;
+                any = true;
+            }
+        }
+        if any {
+            self.sample_count[bin] += 1;
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        debug_assert_eq!(self.n_bins, other.n_bins);
+        debug_assert_eq!(self.n_bands, other.n_bands);
+        for i in 0..self.n_bins {
+            self.sample_count[i] += other.sample_count[i];
+            for b in 0..self.n_bands {
+                self.sum_sq[i][b] += other.sum_sq[i][b];
+                self.sum_abs[i][b] += other.sum_abs[i][b];
+                self.count[i][b] += other.count[i][b];
+            }
+        }
+    }
+
+    fn bin_index(&self, value: f64) -> usize {
+        let clamped = value.max(self.min);
+        if clamped >= self.max {
+            return self.n_bins - 1;
+        }
+        let width = (self.max - self.min) / self.n_bins as f64;
+        ((clamped - self.min) / width).floor() as usize
+    }
+
+    fn bin_bounds(&self, bin: usize) -> (f64, f64) {
+        let width = (self.max - self.min) / self.n_bins as f64;
+        let start = self.min + width * bin as f64;
+        let end = if bin + 1 == self.n_bins {
+            self.max
+        } else {
+            start + width
+        };
+        (start, end)
+    }
+
+    fn rows_json(&self, name: &str, bands: &[String]) -> serde_json::Value {
+        let rows: Vec<_> = (0..self.n_bins)
+            .map(|bin| {
+                let (start, end) = self.bin_bounds(bin);
+                let mut band_metrics = serde_json::Map::new();
+                let mut total_sq = 0.0;
+                let mut total_abs = 0.0;
+                let mut total_count = 0usize;
+                for (b, band) in bands.iter().enumerate() {
+                    let count = self.count[bin][b];
+                    let rmse = if count > 0 {
+                        (self.sum_sq[bin][b] / count as f64).sqrt()
+                    } else {
+                        f64::NAN
+                    };
+                    let mae = if count > 0 {
+                        self.sum_abs[bin][b] / count as f64
+                    } else {
+                        f64::NAN
+                    };
+                    total_sq += self.sum_sq[bin][b];
+                    total_abs += self.sum_abs[bin][b];
+                    total_count += count;
+                    band_metrics.insert(
+                        band.clone(),
+                        serde_json::json!({
+                            "rmse": rmse,
+                            "mae": mae,
+                            "count": count,
+                        }),
+                    );
+                }
+                let overall_rmse = if total_count > 0 {
+                    (total_sq / total_count as f64).sqrt()
+                } else {
+                    f64::NAN
+                };
+                let overall_mae = if total_count > 0 {
+                    total_abs / total_count as f64
+                } else {
+                    f64::NAN
+                };
+                serde_json::json!({
+                    "gap_index": name,
+                    "bin": bin,
+                    "range_start": start,
+                    "range_end": end,
+                    "range_label": if bin + 1 == self.n_bins {
+                        format!("[{start:.3},+inf)")
+                    } else {
+                        format!("[{start:.3},{end:.3})")
+                    },
+                    "sample_count": self.sample_count[bin],
+                    "overall": {
+                        "rmse": overall_rmse,
+                        "mae": overall_mae,
+                        "count": total_count,
+                    },
+                    "bands": band_metrics,
+                })
+            })
+            .collect();
+        serde_json::Value::Array(rows)
     }
 }
 
@@ -2424,7 +2619,12 @@ fn run_eval_sample_cache(args: &EvalSampleCacheArgs) -> Result<()> {
             .context("Failed to build rayon thread pool")?;
     }
 
-    let config = load_nufrost_config(args.config.as_deref())?;
+    let eval_config = match args.method.as_str() {
+        "nufrost" => EvalMethodConfig::Nufrost(load_nufrost_config(args.config.as_deref())?),
+        "hants" => EvalMethodConfig::Hants(load_hants_config(args.config.as_deref())?),
+        "zhu2015" => EvalMethodConfig::Zhu2015(load_zhu2015_config(args.config.as_deref())?),
+        other => bail!("Unsupported eval method: {other}"),
+    };
     let cache = open_sample_cache(&args.cache_dir)?;
     let n_eval = args.n_eval.min(cache.meta.n_samples);
     let mut rng = EvalRng::new(args.seed);
@@ -2436,7 +2636,8 @@ fn run_eval_sample_cache(args: &EvalSampleCacheArgs) -> Result<()> {
         .collect();
 
     eprintln!(
-        "sample cache eval: cache={}, n_eval={}, cache_samples={}, max_times={}, bands={}, threads={}",
+        "sample cache eval: method={}, cache={}, n_eval={}, cache_samples={}, max_times={}, bands={}, threads={}",
+        args.method,
         cache.dir.display(),
         n_eval,
         cache.meta.n_samples,
@@ -2451,7 +2652,7 @@ fn run_eval_sample_cache(args: &EvalSampleCacheArgs) -> Result<()> {
         .par_iter()
         .enumerate()
         .map(|(idx, task)| {
-            let result = evaluate_sample_holdout(&cache, *task, &config, args.min_joint_valid)
+            let result = evaluate_sample_holdout(&cache, *task, &eval_config, args.min_joint_valid)
                 .with_context(|| {
                     format!("failed to evaluate task {idx} sample {}", task.sample_idx)
                 })
@@ -2469,12 +2670,12 @@ fn run_eval_sample_cache(args: &EvalSampleCacheArgs) -> Result<()> {
                     format_duration(eta)
                 );
             }
-            let mut stats = EvalStats::new(cache.meta.n_bands);
+            let mut stats = EvalStats::new(cache.meta.n_bands, args.gap_bins);
             stats.add_attempt(result);
             stats
         })
         .reduce(
-            || EvalStats::new(cache.meta.n_bands),
+            || EvalStats::new(cache.meta.n_bands, args.gap_bins),
             |left, right| left.merge(right),
         );
 
@@ -2519,7 +2720,7 @@ fn run_eval_sample_cache(args: &EvalSampleCacheArgs) -> Result<()> {
     };
 
     let summary = serde_json::json!({
-        "method": "nufrost",
+        "method": args.method,
         "cache_dir": cache.dir.display().to_string(),
         "n_eval_requested": args.n_eval,
         "n_eval_used": n_eval,
@@ -2535,6 +2736,17 @@ fn run_eval_sample_cache(args: &EvalSampleCacheArgs) -> Result<()> {
             "count": total_count,
         },
         "bands": band_metrics,
+        "gap_indices": {
+            "definition": {
+                "gap_regular": "I_gap = sum(l_i^2) / N^2 over adjacent valid-observation gaps after holdout",
+                "gap_periodic": "I_periodic = |sum(l_i * exp(j*2*pi*tau_i))|^2 / N^2 over adjacent valid-observation gaps after holdout",
+                "l_i": "time interval between adjacent remaining valid observations",
+                "tau_i": "gap midpoint normalized to [0,1] over the sample time span"
+            },
+            "n_bins": args.gap_bins.max(1),
+            "gap_regular": stats.gap_regular.rows_json("gap_regular", &cache.meta.bands),
+            "gap_periodic": stats.gap_periodic.rows_json("gap_periodic", &cache.meta.bands),
+        },
         "elapsed_seconds": elapsed,
     });
 
@@ -2548,7 +2760,87 @@ fn run_eval_sample_cache(args: &EvalSampleCacheArgs) -> Result<()> {
         fs::write(path, serde_json::to_string_pretty(&summary)?)?;
         eprintln!("Sample cache evaluation written to {}", path.display());
     }
+    if let Some(path) = &args.output_gap_csv {
+        write_gap_curve_csv(path, &args.method, &cache.meta.bands, &stats)?;
+        eprintln!("Sample cache gap curves written to {}", path.display());
+    }
     Ok(())
+}
+
+fn write_gap_curve_csv(
+    path: &Path,
+    method: &str,
+    bands: &[String],
+    stats: &EvalStats,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let mut out = String::from(
+        "method,gap_index,bin,range_start,range_end,range_label,band,sample_count,count,rmse,mae\n",
+    );
+    append_gap_curve_csv_rows(&mut out, method, "gap_regular", bands, &stats.gap_regular);
+    append_gap_curve_csv_rows(&mut out, method, "gap_periodic", bands, &stats.gap_periodic);
+    fs::write(path, out)?;
+    Ok(())
+}
+
+fn append_gap_curve_csv_rows(
+    out: &mut String,
+    method: &str,
+    gap_name: &str,
+    bands: &[String],
+    curve: &GapCurveStats,
+) {
+    for bin in 0..curve.n_bins {
+        let (start, end) = curve.bin_bounds(bin);
+        let label = if bin + 1 == curve.n_bins {
+            format!(">= {start:.3}")
+        } else {
+            format!("{start:.3}-{end:.3}")
+        };
+        let mut total_sq = 0.0;
+        let mut total_abs = 0.0;
+        let mut total_count = 0usize;
+        for b in 0..curve.n_bands {
+            total_sq += curve.sum_sq[bin][b];
+            total_abs += curve.sum_abs[bin][b];
+            total_count += curve.count[bin][b];
+        }
+        let overall_rmse = if total_count > 0 {
+            (total_sq / total_count as f64).sqrt()
+        } else {
+            f64::NAN
+        };
+        let overall_mae = if total_count > 0 {
+            total_abs / total_count as f64
+        } else {
+            f64::NAN
+        };
+        out.push_str(&format!(
+            "{method},{gap_name},{bin},{start:.8},{end:.8},{label},overall,{},{},{overall_rmse:.8},{overall_mae:.8}\n",
+            curve.sample_count[bin], total_count
+        ));
+        for (b, band) in bands.iter().enumerate() {
+            let count = curve.count[bin][b];
+            let rmse = if count > 0 {
+                (curve.sum_sq[bin][b] / count as f64).sqrt()
+            } else {
+                f64::NAN
+            };
+            let mae = if count > 0 {
+                curve.sum_abs[bin][b] / count as f64
+            } else {
+                f64::NAN
+            };
+            out.push_str(&format!(
+                "{method},{gap_name},{bin},{start:.8},{end:.8},{label},{band},{},{},{rmse:.8},{mae:.8}\n",
+                curve.sample_count[bin], count
+            ));
+        }
+    }
 }
 
 fn open_sample_cache(dir: &Path) -> Result<SampleCacheView> {
@@ -2627,7 +2919,7 @@ fn mmap_file(path: &Path) -> Result<Mmap> {
 fn evaluate_sample_holdout(
     cache: &SampleCacheView,
     task: EvalTask,
-    config: &NufrostConfig,
+    config: &EvalMethodConfig,
     min_joint_valid: usize,
 ) -> Result<Option<EvalOne>> {
     let (scene_id, n_times) = read_sample_index(cache, task.sample_idx)?;
@@ -2649,6 +2941,10 @@ fn evaluate_sample_holdout(
     }
     let mut rng = EvalRng::new(task.holdout_seed);
     let holdout = valid_positions[rng.gen_range(valid_positions.len())];
+    let times = &cache.scene_times[scene.time_offset..scene.time_offset + n_times];
+    let mut fit_valid_positions = valid_positions;
+    fit_valid_positions.retain(|&i| i != holdout);
+    let (gap_regular, gap_periodic) = compute_gap_indices(times, &fit_valid_positions);
     let sample_start = task
         .sample_idx
         .checked_mul(cache.sample_record_bytes)
@@ -2677,9 +2973,86 @@ fn evaluate_sample_holdout(
     if truth.iter().any(|v| !v.is_finite()) {
         return Ok(None);
     }
-    let times = &cache.scene_times[scene.time_offset..scene.time_offset + n_times];
-    let pred = nufrost_pixel_vector(times, &obs, times[holdout], config);
-    Ok(Some(EvalOne { truth, pred }))
+    let pred = predict_eval_holdout(times, &obs, times[holdout], config);
+    Ok(Some(EvalOne {
+        truth,
+        pred,
+        gap_regular,
+        gap_periodic,
+    }))
+}
+
+fn compute_gap_indices(times: &[f64], valid_positions: &[usize]) -> (f64, f64) {
+    if valid_positions.len() < 2 || times.is_empty() {
+        return (f64::NAN, f64::NAN);
+    }
+    let first = times[0];
+    let last = times[times.len() - 1];
+    let span = last - first;
+    if !span.is_finite() || span <= 0.0 {
+        return (f64::NAN, f64::NAN);
+    }
+
+    let mut sum_l2 = 0.0;
+    let mut real = 0.0;
+    let mut imag = 0.0;
+    for pair in valid_positions.windows(2) {
+        let a = pair[0];
+        let b = pair[1];
+        if a >= times.len() || b >= times.len() || b <= a {
+            continue;
+        }
+        let ta = times[a];
+        let tb = times[b];
+        let l = tb - ta;
+        if !l.is_finite() || l <= 0.0 {
+            continue;
+        }
+        let tau = (((ta + tb) * 0.5) - first) / span;
+        let phase = std::f64::consts::TAU * tau;
+        sum_l2 += l * l;
+        real += l * phase.cos();
+        imag += l * phase.sin();
+    }
+
+    let denom = span * span;
+    let gap_regular = sum_l2 / denom;
+    let gap_periodic = (real * real + imag * imag) / denom;
+    (gap_regular.clamp(0.0, 1.0), gap_periodic.clamp(0.0, 1.0))
+}
+
+fn predict_eval_holdout(
+    times: &[f64],
+    obs: &[Vec<f64>],
+    target_time: f64,
+    config: &EvalMethodConfig,
+) -> Vec<f64> {
+    match config {
+        EvalMethodConfig::Nufrost(cfg) => nufrost_pixel_vector(times, obs, target_time, cfg),
+        EvalMethodConfig::Hants(cfg) => obs
+            .iter()
+            .map(|band_obs| {
+                hants_pixel(
+                    times,
+                    band_obs,
+                    target_time,
+                    cfg.nof,
+                    &cfg.sf,
+                    cfg.valid_min,
+                    cfg.valid_max,
+                    cfg.fet,
+                    cfg.dod,
+                    cfg.period,
+                )
+            })
+            .collect(),
+        EvalMethodConfig::Zhu2015(cfg) => obs
+            .iter()
+            .map(|band_obs| {
+                fit_predict_pixel(times, band_obs, target_time, cfg.lasso_alpha).prediction
+            })
+            .collect(),
+    }
 }
 
 fn read_sample_index(cache: &SampleCacheView, sample_idx: usize) -> Result<(usize, usize)> {
@@ -2783,13 +3156,13 @@ mod tests {
 
     /// Parse args and return the CLI struct.
     fn parse(args: &[&str]) -> Cli {
-        Cli::try_parse_from(std::iter::once("cli").chain(args.iter().copied()))
+        Cli::try_parse_from(std::iter::once("nufrost-cli").chain(args.iter().copied()))
             .expect("valid args should parse")
     }
 
     /// Parse args and expect failure.
     fn parse_fails(args: &[&str]) -> String {
-        Cli::try_parse_from(std::iter::once("cli").chain(args.iter().copied()))
+        Cli::try_parse_from(std::iter::once("nufrost-cli").chain(args.iter().copied()))
             .unwrap_err()
             .to_string()
     }

@@ -12,14 +12,13 @@
 - `crates/nufrost-core`: NUFROST algorithm and NUFFT/fitting logic.
 - `crates/hants-core`: HANTS baseline algorithm.
 - `crates/zhu2015-core`: Zhu2015 baseline algorithm.
-- `crates/cli`: command-line entrypoint.
-- `crates/nufrost-py`: optional PyO3 bindings.
+- `crates/nufrost-cli`: command-line entrypoint.
 
 Dependency direction:
 
 - `gdal` is independent and must not depend on algorithm crates.
 - `nufrost-core`, `hants-core`, and `zhu2015-core` may depend on `gdal`.
-- `cli` depends on `gdal` and all three algorithm crates.
+- `nufrost-cli` depends on `gdal` and all three algorithm crates.
 
 ## Config And Data
 

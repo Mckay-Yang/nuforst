@@ -506,11 +506,12 @@ The active Rust implementation is under `crates/`:
 crates/
   gdal/            # GeoTIFF/VRT I/O, timestamp parsing, full-scene helpers
   nufrost-core/    # NUFROST mathematical model and NUFFT/fitting logic
-  cli/             # command-line entrypoint
-  nufrost-py/      # optional PyO3 bindings
+  hants-core/      # HANTS comparison baseline
+  zhu2015-core/    # Zhu2015 comparison baseline
+  nufrost-cli/     # command-line entrypoint
 ```
 
-The repository may also contain baseline crates, but they are not part of the NUFROST mathematical model described here.
+The baseline crates are separate comparison algorithms and are not part of the NUFROST mathematical model described here.
 
 ## Build And Test
 
@@ -530,7 +531,7 @@ Useful NUFROST-focused commands:
 
 ```bash
 cargo test -p nufrost-core --lib
-cargo test -p cli --bin cli
+cargo test -p nufrost-cli --bin nufrost-cli
 ```
 
 ## CLI Examples
@@ -538,7 +539,7 @@ cargo test -p cli --bin cli
 Single NUFROST GeoTIFF reconstruction:
 
 ```bash
-cargo run -p cli -- nufrost \
+cargo run -p nufrost-cli -- nufrost \
   --input-geotiff input.tif \
   --output pred.tif
 ```
@@ -546,7 +547,7 @@ cargo run -p cli -- nufrost \
 Full-scene Sentinel-2 reconstruction:
 
 ```bash
-cargo run --release -p cli -- full-scene \
+cargo run --release -p nufrost-cli -- full-scene \
   --source-name sentinel-2 \
   --lon 94.2605 \
   --lat 29.7733 \
@@ -557,7 +558,7 @@ cargo run --release -p cli -- full-scene \
 One-pixel timing and RMSE smoke test:
 
 ```bash
-cargo run --release -p cli -- pixel-bench \
+cargo run --release -p nufrost-cli -- pixel-bench \
   --source-name sentinel-2 \
   --lon 94.2605 \
   --lat 29.7733 \
@@ -585,4 +586,3 @@ crates/nufrost-core/src/nufrost.rs
 `nufrost_pixel_vector` is the active multi-band pixel model. It performs robust standardization, shared frequency discovery, date-level vector Huber weighting, multi-output Ridge fitting, and final de-standardized prediction.
 
 `multi_output_tiered_ridge_solve` builds the shared normal equation and solves all band outputs together.
-
