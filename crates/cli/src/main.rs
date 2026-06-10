@@ -5,13 +5,14 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use clap::{Arg, ArgAction, Command};
+use memmap2::Mmap;
 use ndarray::Array3;
 use rayon::prelude::*;
 use serde::de::DeserializeOwned;
@@ -32,6 +33,8 @@ use nufrost_core::{
 };
 use zhu2015_core::{fit_predict_pixel, reconstruct_zhu2015_geotiff, Zhu2015Config};
 
+const SAMPLE_CACHE_EVAL_PROGRESS_INTERVAL: usize = 10_000;
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  CLI definition
 // ═══════════════════════════════════════════════════════════════════════════
@@ -49,6 +52,7 @@ enum Algorithm {
     FullScene(FullSceneArgs),
     BuildSceneCache(BuildSceneCacheArgs),
     BuildSampleCache(BuildSampleCacheArgs),
+    EvalSampleCache(EvalSampleCacheArgs),
     BatchFullScene(BatchFullSceneArgs),
     PixelBench(PixelBenchArgs),
 }
@@ -93,6 +97,17 @@ struct BuildSampleCacheArgs {
     seed: u64,
     max_attempts_multiplier: usize,
     limit_scenes: Option<usize>,
+}
+
+#[derive(Debug)]
+struct EvalSampleCacheArgs {
+    cache_dir: PathBuf,
+    n_eval: usize,
+    seed: u64,
+    min_joint_valid: usize,
+    config: Option<PathBuf>,
+    output_json: Option<PathBuf>,
+    threads: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -214,6 +229,15 @@ impl Cli {
                 max_attempts_multiplier: *sub.get_one::<usize>("max_attempts_multiplier").unwrap(),
                 limit_scenes: sub.get_one::<usize>("limit_scenes").copied(),
             }),
+            "eval-sample-cache" => Algorithm::EvalSampleCache(EvalSampleCacheArgs {
+                cache_dir: sub.get_one::<PathBuf>("cache_dir").cloned().unwrap(),
+                n_eval: *sub.get_one::<usize>("n_eval").unwrap(),
+                seed: *sub.get_one::<u64>("seed").unwrap(),
+                min_joint_valid: *sub.get_one::<usize>("min_joint_valid").unwrap(),
+                config: sub.get_one::<PathBuf>("config").cloned(),
+                output_json: sub.get_one::<PathBuf>("output_json").cloned(),
+                threads: sub.get_one::<usize>("threads").copied(),
+            }),
             "batch-full-scene" => Algorithm::BatchFullScene(BatchFullSceneArgs {
                 source_name: sub.get_one::<String>("source_name").cloned().unwrap(),
                 output_root: sub.get_one::<PathBuf>("output_root").cloned().unwrap(),
@@ -265,6 +289,7 @@ impl Cli {
             .subcommand(full_scene_command())
             .subcommand(build_scene_cache_command())
             .subcommand(build_sample_cache_command())
+            .subcommand(eval_sample_cache_command())
             .subcommand(batch_full_scene_command())
             .subcommand(pixel_bench_command())
     }
@@ -531,6 +556,60 @@ fn build_sample_cache_command() -> Command {
                 .long("limit-scenes")
                 .value_name("N")
                 .help("Debug/smoke option: only use the first N aligned scene caches.")
+                .value_parser(clap::value_parser!(usize)),
+        )
+}
+
+fn eval_sample_cache_command() -> Command {
+    Command::new("eval-sample-cache")
+        .about("Evaluate NUFROST holdout RMSE on a mmap-ready sample cache.")
+        .arg(
+            Arg::new("cache_dir")
+                .long("cache-dir")
+                .value_name("DIR")
+                .default_value("data/cache/samples/sentinel-2_v1")
+                .value_parser(clap::value_parser!(PathBuf)),
+        )
+        .arg(
+            Arg::new("n_eval")
+                .long("n-eval")
+                .value_name("N")
+                .default_value("10000")
+                .help("Number of cached sample sequences to evaluate. Use the cache size for a full pass.")
+                .value_parser(clap::value_parser!(usize)),
+        )
+        .arg(
+            Arg::new("seed")
+                .long("seed")
+                .value_name("U64")
+                .default_value("20260609")
+                .value_parser(clap::value_parser!(u64)),
+        )
+        .arg(
+            Arg::new("min_joint_valid")
+                .long("min-joint-valid")
+                .value_name("N")
+                .default_value("12")
+                .help("Minimum joint-valid dates required after one holdout is removed.")
+                .value_parser(clap::value_parser!(usize)),
+        )
+        .arg(
+            Arg::new("config")
+                .short('c')
+                .long("config")
+                .value_name("PATH")
+                .value_parser(clap::value_parser!(PathBuf)),
+        )
+        .arg(
+            Arg::new("output_json")
+                .long("output-json")
+                .value_name("PATH")
+                .value_parser(clap::value_parser!(PathBuf)),
+        )
+        .arg(
+            Arg::new("threads")
+                .long("threads")
+                .value_name("N")
                 .value_parser(clap::value_parser!(usize)),
         )
 }
@@ -2246,6 +2325,423 @@ fn run_batch_full_scene(args: &BatchFullSceneArgs) -> Result<()> {
     Ok(())
 }
 
+struct SampleCacheView {
+    dir: PathBuf,
+    meta: sample_cache::SampleCacheMeta,
+    samples: Mmap,
+    mask: Mmap,
+    index: Mmap,
+    scene_times: Vec<f64>,
+    sample_record_bytes: usize,
+    mask_record_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EvalTask {
+    sample_idx: usize,
+    holdout_seed: u64,
+}
+
+#[derive(Debug, Clone)]
+struct EvalStats {
+    attempted: usize,
+    evaluated: usize,
+    skipped: usize,
+    failed: usize,
+    sum_sq: Vec<f64>,
+    sum_abs: Vec<f64>,
+    count: Vec<usize>,
+}
+
+struct EvalOne {
+    truth: Vec<f64>,
+    pred: Vec<f64>,
+}
+
+impl EvalStats {
+    fn new(n_bands: usize) -> Self {
+        Self {
+            attempted: 0,
+            evaluated: 0,
+            skipped: 0,
+            failed: 0,
+            sum_sq: vec![0.0; n_bands],
+            sum_abs: vec![0.0; n_bands],
+            count: vec![0; n_bands],
+        }
+    }
+
+    fn add_attempt(&mut self, result: Option<EvalOne>) {
+        self.attempted += 1;
+        match result {
+            Some(eval) => {
+                let mut any = false;
+                for b in 0..self.count.len() {
+                    let truth = eval.truth[b];
+                    let pred = eval.pred[b];
+                    if truth.is_finite() && pred.is_finite() {
+                        let err = pred - truth;
+                        self.sum_sq[b] += err * err;
+                        self.sum_abs[b] += err.abs();
+                        self.count[b] += 1;
+                        any = true;
+                    }
+                }
+                if any {
+                    self.evaluated += 1;
+                } else {
+                    self.failed += 1;
+                }
+            }
+            None => {
+                self.skipped += 1;
+            }
+        }
+    }
+
+    fn merge(mut self, other: Self) -> Self {
+        self.attempted += other.attempted;
+        self.evaluated += other.evaluated;
+        self.skipped += other.skipped;
+        self.failed += other.failed;
+        for b in 0..self.count.len() {
+            self.sum_sq[b] += other.sum_sq[b];
+            self.sum_abs[b] += other.sum_abs[b];
+            self.count[b] += other.count[b];
+        }
+        self
+    }
+}
+
+fn run_eval_sample_cache(args: &EvalSampleCacheArgs) -> Result<()> {
+    if args.n_eval == 0 {
+        bail!("--n-eval must be > 0");
+    }
+    if let Some(n) = args.threads {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build_global()
+            .context("Failed to build rayon thread pool")?;
+    }
+
+    let config = load_nufrost_config(args.config.as_deref())?;
+    let cache = open_sample_cache(&args.cache_dir)?;
+    let n_eval = args.n_eval.min(cache.meta.n_samples);
+    let mut rng = EvalRng::new(args.seed);
+    let tasks: Vec<EvalTask> = (0..n_eval)
+        .map(|_| EvalTask {
+            sample_idx: rng.gen_range(cache.meta.n_samples),
+            holdout_seed: rng.next_u64(),
+        })
+        .collect();
+
+    eprintln!(
+        "sample cache eval: cache={}, n_eval={}, cache_samples={}, max_times={}, bands={}, threads={}",
+        cache.dir.display(),
+        n_eval,
+        cache.meta.n_samples,
+        cache.meta.max_times,
+        cache.meta.n_bands,
+        rayon::current_num_threads()
+    );
+
+    let started = Instant::now();
+    let progress = AtomicUsize::new(0);
+    let stats = tasks
+        .par_iter()
+        .enumerate()
+        .map(|(idx, task)| {
+            let result = evaluate_sample_holdout(&cache, *task, &config, args.min_joint_valid)
+                .with_context(|| {
+                    format!("failed to evaluate task {idx} sample {}", task.sample_idx)
+                })
+                .ok()
+                .flatten();
+            let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
+            if done % SAMPLE_CACHE_EVAL_PROGRESS_INTERVAL == 0 || done == n_eval {
+                let elapsed = started.elapsed().as_secs_f64();
+                let rate = done as f64 / elapsed.max(1.0e-9);
+                let eta = (n_eval - done) as f64 / rate.max(1.0e-9);
+                eprintln!(
+                    "sample cache eval progress: {done}/{n_eval} ({:.2}%), rate={rate:.1} samples/s, elapsed={}, eta={}",
+                    done as f64 * 100.0 / n_eval as f64,
+                    format_duration(elapsed),
+                    format_duration(eta)
+                );
+            }
+            let mut stats = EvalStats::new(cache.meta.n_bands);
+            stats.add_attempt(result);
+            stats
+        })
+        .reduce(
+            || EvalStats::new(cache.meta.n_bands),
+            |left, right| left.merge(right),
+        );
+
+    let elapsed = started.elapsed().as_secs_f64();
+    let mut band_metrics = serde_json::Map::new();
+    let mut total_sq = 0.0;
+    let mut total_abs = 0.0;
+    let mut total_count = 0usize;
+    for (b, band) in cache.meta.bands.iter().enumerate() {
+        let count = stats.count[b];
+        let rmse = if count > 0 {
+            (stats.sum_sq[b] / count as f64).sqrt()
+        } else {
+            f64::NAN
+        };
+        let mae = if count > 0 {
+            stats.sum_abs[b] / count as f64
+        } else {
+            f64::NAN
+        };
+        total_sq += stats.sum_sq[b];
+        total_abs += stats.sum_abs[b];
+        total_count += count;
+        band_metrics.insert(
+            band.clone(),
+            serde_json::json!({
+                "rmse": rmse,
+                "mae": mae,
+                "count": count,
+            }),
+        );
+    }
+    let overall_rmse = if total_count > 0 {
+        (total_sq / total_count as f64).sqrt()
+    } else {
+        f64::NAN
+    };
+    let overall_mae = if total_count > 0 {
+        total_abs / total_count as f64
+    } else {
+        f64::NAN
+    };
+
+    let summary = serde_json::json!({
+        "method": "nufrost",
+        "cache_dir": cache.dir.display().to_string(),
+        "n_eval_requested": args.n_eval,
+        "n_eval_used": n_eval,
+        "seed": args.seed,
+        "min_joint_valid_after_holdout": args.min_joint_valid,
+        "attempted": stats.attempted,
+        "evaluated": stats.evaluated,
+        "skipped": stats.skipped,
+        "failed": stats.failed,
+        "overall": {
+            "rmse": overall_rmse,
+            "mae": overall_mae,
+            "count": total_count,
+        },
+        "bands": band_metrics,
+        "elapsed_seconds": elapsed,
+    });
+
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    if let Some(path) = &args.output_json {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        fs::write(path, serde_json::to_string_pretty(&summary)?)?;
+        eprintln!("Sample cache evaluation written to {}", path.display());
+    }
+    Ok(())
+}
+
+fn open_sample_cache(dir: &Path) -> Result<SampleCacheView> {
+    let meta_path = dir.join("meta.json");
+    let meta: sample_cache::SampleCacheMeta = serde_json::from_slice(
+        &fs::read(&meta_path).with_context(|| format!("Cannot read {}", meta_path.display()))?,
+    )
+    .with_context(|| format!("Invalid sample cache meta {}", meta_path.display()))?;
+    let sample_record_bytes = meta
+        .max_times
+        .checked_mul(meta.n_bands)
+        .and_then(|v| v.checked_mul(4))
+        .context("sample record byte size overflow")?;
+    let mask_record_bytes = meta.max_times;
+    let samples = mmap_file(&dir.join(&meta.sample_file))?;
+    let mask = mmap_file(&dir.join(&meta.mask_file))?;
+    let index = mmap_file(&dir.join(&meta.index_file))?;
+    let scene_time_mmap = mmap_file(&dir.join(&meta.scene_time_file))?;
+    if scene_time_mmap.len() % 8 != 0 {
+        bail!("scene time file length is not divisible by 8");
+    }
+    let scene_times = scene_time_mmap
+        .chunks_exact(8)
+        .map(|chunk| f64::from_le_bytes(chunk.try_into().expect("chunk length checked")))
+        .collect();
+    let expected_sample_bytes = meta
+        .n_samples
+        .checked_mul(sample_record_bytes)
+        .context("sample file byte size overflow")?;
+    let expected_mask_bytes = meta
+        .n_samples
+        .checked_mul(mask_record_bytes)
+        .context("mask file byte size overflow")?;
+    let expected_index_bytes = meta
+        .n_samples
+        .checked_mul(4 * 8)
+        .context("index file byte size overflow")?;
+    if samples.len() != expected_sample_bytes {
+        bail!(
+            "sample file has wrong size: expected {}, got {}",
+            expected_sample_bytes,
+            samples.len()
+        );
+    }
+    if mask.len() != expected_mask_bytes {
+        bail!(
+            "mask file has wrong size: expected {}, got {}",
+            expected_mask_bytes,
+            mask.len()
+        );
+    }
+    if index.len() != expected_index_bytes {
+        bail!(
+            "index file has wrong size: expected {}, got {}",
+            expected_index_bytes,
+            index.len()
+        );
+    }
+    Ok(SampleCacheView {
+        dir: dir.to_path_buf(),
+        meta,
+        samples,
+        mask,
+        index,
+        scene_times,
+        sample_record_bytes,
+        mask_record_bytes,
+    })
+}
+
+fn mmap_file(path: &Path) -> Result<Mmap> {
+    let file = File::open(path).with_context(|| format!("Cannot open {}", path.display()))?;
+    unsafe { Mmap::map(&file).with_context(|| format!("Cannot mmap {}", path.display())) }
+}
+
+fn evaluate_sample_holdout(
+    cache: &SampleCacheView,
+    task: EvalTask,
+    config: &NufrostConfig,
+    min_joint_valid: usize,
+) -> Result<Option<EvalOne>> {
+    let (scene_id, n_times) = read_sample_index(cache, task.sample_idx)?;
+    if scene_id >= cache.meta.scenes.len() || n_times == 0 || n_times > cache.meta.max_times {
+        return Ok(None);
+    }
+    let scene = &cache.meta.scenes[scene_id];
+    if scene.time_offset + n_times > cache.scene_times.len() {
+        bail!("sample scene time axis exceeds scene_times file");
+    }
+    let mask_start = task
+        .sample_idx
+        .checked_mul(cache.mask_record_bytes)
+        .context("mask offset overflow")?;
+    let mask = &cache.mask[mask_start..mask_start + cache.mask_record_bytes];
+    let valid_positions: Vec<usize> = (0..n_times).filter(|&i| mask[i] != 0).collect();
+    if valid_positions.len() <= min_joint_valid {
+        return Ok(None);
+    }
+    let mut rng = EvalRng::new(task.holdout_seed);
+    let holdout = valid_positions[rng.gen_range(valid_positions.len())];
+    let sample_start = task
+        .sample_idx
+        .checked_mul(cache.sample_record_bytes)
+        .context("sample offset overflow")?;
+    let sample = &cache.samples[sample_start..sample_start + cache.sample_record_bytes];
+    let mut obs = vec![vec![f64::NAN; n_times]; cache.meta.n_bands];
+    let mut truth = vec![f64::NAN; cache.meta.n_bands];
+    for t in 0..n_times {
+        if mask[t] == 0 {
+            continue;
+        }
+        for b in 0..cache.meta.n_bands {
+            let offset = t
+                .checked_mul(cache.meta.n_bands)
+                .and_then(|v| v.checked_add(b))
+                .and_then(|v| v.checked_mul(4))
+                .context("sample value offset overflow")?;
+            let value = f32::from_le_bytes(sample[offset..offset + 4].try_into().unwrap()) as f64;
+            if t == holdout {
+                truth[b] = value;
+            } else {
+                obs[b][t] = value;
+            }
+        }
+    }
+    if truth.iter().any(|v| !v.is_finite()) {
+        return Ok(None);
+    }
+    let times = &cache.scene_times[scene.time_offset..scene.time_offset + n_times];
+    let pred = nufrost_pixel_vector(times, &obs, times[holdout], config);
+    Ok(Some(EvalOne { truth, pred }))
+}
+
+fn read_sample_index(cache: &SampleCacheView, sample_idx: usize) -> Result<(usize, usize)> {
+    let start = sample_idx
+        .checked_mul(4 * 8)
+        .context("sample index offset overflow")?;
+    let index = &cache.index[start..start + 4 * 8];
+    let scene_id = read_u64_le(&index[0..8]) as usize;
+    let n_times = read_u64_le(&index[24..32]) as usize;
+    Ok((scene_id, n_times))
+}
+
+fn read_u64_le(bytes: &[u8]) -> u64 {
+    u64::from_le_bytes(bytes.try_into().expect("u64 slice length"))
+}
+
+fn format_duration(seconds: f64) -> String {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return "unknown".to_string();
+    }
+    if seconds >= 3600.0 {
+        format!("{:.2} h", seconds / 3600.0)
+    } else if seconds >= 60.0 {
+        format!("{:.1} min", seconds / 60.0)
+    } else {
+        format!("{seconds:.1} s")
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EvalRng {
+    state: u64,
+}
+
+impl EvalRng {
+    fn new(seed: u64) -> Self {
+        Self {
+            state: if seed == 0 {
+                0x9e37_79b9_7f4a_7c15
+            } else {
+                seed
+            },
+        }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self
+            .state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.state
+    }
+
+    fn gen_range(&mut self, upper: usize) -> usize {
+        if upper <= 1 {
+            0
+        } else {
+            (self.next_u64() % upper as u64) as usize
+        }
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Main
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2269,6 +2765,7 @@ fn main() -> Result<()> {
         Algorithm::FullScene(args) => run_full_scene(args),
         Algorithm::BuildSceneCache(args) => run_build_scene_cache(args),
         Algorithm::BuildSampleCache(args) => run_build_sample_cache(args),
+        Algorithm::EvalSampleCache(args) => run_eval_sample_cache(args),
         Algorithm::BatchFullScene(args) => run_batch_full_scene(args),
         Algorithm::PixelBench(args) => run_pixel_bench(args),
     }
