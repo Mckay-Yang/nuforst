@@ -38,6 +38,11 @@ pub struct NufrostConfig {
     #[serde(alias = "ridge_lam", alias = "ridge")]
     pub ridge_lam: f64,
     pub freq_weight: f64,
+    /// Extra ridge penalty on band-specific coefficient deviations from the
+    /// across-band mean trajectory.  This is a multiband-periodogram style
+    /// shrinkage term; 0 disables it.
+    #[serde(default = "default_multiband_shrinkage")]
+    pub multiband_shrinkage: f64,
     pub huber_iters: u32,
     pub huber_delta: f64,
     pub min_obs: u32,
@@ -98,6 +103,9 @@ fn default_private_freq_penalty_mult() -> f64 {
 }
 fn default_outlier_sigma() -> f64 {
     2.5
+}
+fn default_multiband_shrinkage() -> f64 {
+    0.0
 }
 fn default_outlier_reject_iters() -> u32 {
     2
@@ -170,6 +178,12 @@ impl NufrostConfig {
                 reason: "must be in [0, 1)".into(),
             });
         }
+        if self.multiband_shrinkage < 0.0 {
+            return Err(NufrostError::InvalidConfigValue {
+                field: "multiband_shrinkage".into(),
+                reason: "must be >= 0".into(),
+            });
+        }
         Ok(())
     }
 }
@@ -205,6 +219,7 @@ mod tests {
         assert_eq!(cfg.min_obs, 12);
         // Defaults kick in for omitted fields
         assert_eq!(cfg.frequency_selection, "spectral");
+        assert_eq!(cfg.multiband_shrinkage, 0.0);
         assert_eq!(cfg.outlier_sigma, 2.5);
         assert_eq!(cfg.outlier_reject_iters, 2);
     }

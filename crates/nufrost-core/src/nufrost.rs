@@ -1179,6 +1179,7 @@ fn multi_output_tiered_ridge_solve(
     include_dc: bool,
     include_trend: bool,
     unpenalized_freqs: &[f64],
+    multiband_shrinkage: f64,
 ) -> Option<Array2<f64>> {
     let n = x.nrows();
     let p = x.ncols();
@@ -1223,6 +1224,52 @@ fn multi_output_tiered_ridge_solve(
         a[[c1, c1]] += lam_diag[c1].max(1e-12);
     }
 
+    let shrink = multiband_shrinkage.max(0.0);
+    if shrink > 0.0 && b > 1 {
+        let solve_with_jitter = |system: &Array2<f64>, y: &Array2<f64>| {
+            if let Some(l) = cholesky_decompose(system) {
+                return cholesky_solve_matrix(&l, y);
+            }
+            let mut jittered = system.clone();
+            for j in 0..p {
+                jittered[[j, j]] += 1e-6;
+            }
+            cholesky_decompose(&jittered).and_then(|l| cholesky_solve_matrix(&l, y))
+        };
+
+        let mut rhs_mean = Array2::<f64>::zeros((p, 1));
+        for c in 0..p {
+            let mut sum = 0.0;
+            for band in 0..b {
+                sum += rhs[[c, band]];
+            }
+            rhs_mean[[c, 0]] = sum / b as f64;
+        }
+        let theta_mean = solve_with_jitter(&a, &rhs_mean)?;
+
+        let mut a_contrast = a.clone();
+        let shrink_diag = multiband_shrinkage_diag(freqs, p, include_dc, include_trend, shrink);
+        for c in 0..p {
+            a_contrast[[c, c]] += shrink_diag[c];
+        }
+
+        let mut rhs_contrast = Array2::<f64>::zeros((p, b));
+        for c in 0..p {
+            for band in 0..b {
+                rhs_contrast[[c, band]] = rhs[[c, band]] - rhs_mean[[c, 0]];
+            }
+        }
+        let theta_contrast = solve_with_jitter(&a_contrast, &rhs_contrast)?;
+
+        let mut theta = Array2::<f64>::zeros((p, b));
+        for c in 0..p {
+            for band in 0..b {
+                theta[[c, band]] = theta_mean[[c, 0]] + theta_contrast[[c, band]];
+            }
+        }
+        return Some(theta);
+    }
+
     if let Some(l) = cholesky_decompose(&a) {
         return cholesky_solve_matrix(&l, &rhs);
     }
@@ -1231,6 +1278,36 @@ fn multi_output_tiered_ridge_solve(
         a[[j, j]] += 1e-6;
     }
     cholesky_decompose(&a).and_then(|l| cholesky_solve_matrix(&l, &rhs))
+}
+
+fn multiband_shrinkage_diag(
+    freqs: &[f64],
+    p: usize,
+    include_dc: bool,
+    include_trend: bool,
+    lambda: f64,
+) -> Vec<f64> {
+    let mut diag = vec![0.0; p];
+    let mut col = 0usize;
+    if include_dc && col < p {
+        diag[col] = 0.0;
+        col += 1;
+    }
+    if include_trend && col < p {
+        diag[col] = lambda;
+        col += 1;
+    }
+    for _ in freqs {
+        if col < p {
+            diag[col] = lambda;
+            col += 1;
+        }
+        if col < p {
+            diag[col] = lambda;
+            col += 1;
+        }
+    }
+    diag
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2269,6 +2346,7 @@ pub fn nufrost_pixel_vector(
             true,
             config.include_trend,
             &phenology_freqs,
+            config.multiband_shrinkage,
         )?;
 
         for _ in 0..iters {
@@ -2306,6 +2384,7 @@ pub fn nufrost_pixel_vector(
                 true,
                 config.include_trend,
                 &phenology_freqs,
+                config.multiband_shrinkage,
             ) {
                 theta = next_theta;
             }
@@ -3560,6 +3639,174 @@ mod tests {
         assert!(lam[3] > 0.0);
         assert!(lam[6] > 0.0);
         assert!(lam[7] > 0.0);
+    }
+
+    #[test]
+    fn test_multiband_shrinkage_reduces_band_contrast() {
+        let x =
+            Array2::from_shape_vec((4, 2), vec![1.0, -1.5, 1.0, -0.5, 1.0, 0.5, 1.0, 1.5]).unwrap();
+        let z =
+            Array2::from_shape_vec((4, 2), vec![1.0, 1.0, 2.0, 4.0, 3.0, 7.0, 4.0, 10.0]).unwrap();
+        let weights = vec![1.0; 4];
+        let theta_free = multi_output_tiered_ridge_solve(
+            &x,
+            &z,
+            &[],
+            &weights,
+            1e-6,
+            0.0,
+            60.0,
+            2.0,
+            true,
+            true,
+            &[],
+            0.0,
+        )
+        .unwrap();
+        let theta_shrunk = multi_output_tiered_ridge_solve(
+            &x,
+            &z,
+            &[],
+            &weights,
+            1e-6,
+            0.0,
+            60.0,
+            2.0,
+            true,
+            true,
+            &[],
+            10.0,
+        )
+        .unwrap();
+
+        let free_slope_gap = (theta_free[[1, 1]] - theta_free[[1, 0]]).abs();
+        let shrunk_slope_gap = (theta_shrunk[[1, 1]] - theta_shrunk[[1, 0]]).abs();
+        assert!(shrunk_slope_gap < free_slope_gap);
+
+        let free_mean = 0.5 * (theta_free[[1, 0]] + theta_free[[1, 1]]);
+        let shrunk_mean = 0.5 * (theta_shrunk[[1, 0]] + theta_shrunk[[1, 1]]);
+        assert!((free_mean - shrunk_mean).abs() < 1e-8);
+    }
+
+    #[test]
+    fn test_multiband_shrinkage_zero_matches_unshrunken_path() {
+        let x = Array2::from_shape_vec(
+            (5, 3),
+            vec![
+                1.0, -2.0, 0.5, 1.0, -1.0, -0.2, 1.0, 0.0, 0.1, 1.0, 1.0, -0.4, 1.0, 2.0, 0.3,
+            ],
+        )
+        .unwrap();
+        let z = Array2::from_shape_vec(
+            (5, 3),
+            vec![
+                1.0, 1.5, 2.5, 1.8, 2.4, 3.1, 2.6, 3.2, 3.9, 3.3, 3.9, 4.7, 4.1, 4.8, 5.4,
+            ],
+        )
+        .unwrap();
+        let weights = vec![1.0, 0.7, 1.0, 0.9, 0.8];
+        let theta_a = multi_output_tiered_ridge_solve(
+            &x,
+            &z,
+            &[],
+            &weights,
+            0.01,
+            0.0,
+            60.0,
+            2.0,
+            true,
+            true,
+            &[],
+            0.0,
+        )
+        .unwrap();
+        let theta_b = multi_output_tiered_ridge_solve(
+            &x,
+            &z,
+            &[],
+            &weights,
+            0.01,
+            0.0,
+            60.0,
+            2.0,
+            true,
+            true,
+            &[],
+            -1.0,
+        )
+        .unwrap();
+
+        for (a, b) in theta_a.iter().zip(theta_b.iter()) {
+            assert!((a - b).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn test_multiband_shrinkage_single_band_no_effect() {
+        let x =
+            Array2::from_shape_vec((4, 2), vec![1.0, -1.5, 1.0, -0.5, 1.0, 0.5, 1.0, 1.5]).unwrap();
+        let z = Array2::from_shape_vec((4, 1), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let weights = vec![1.0; 4];
+        let theta_free = multi_output_tiered_ridge_solve(
+            &x,
+            &z,
+            &[],
+            &weights,
+            0.001,
+            0.0,
+            60.0,
+            2.0,
+            true,
+            true,
+            &[],
+            0.0,
+        )
+        .unwrap();
+        let theta_shrunk = multi_output_tiered_ridge_solve(
+            &x,
+            &z,
+            &[],
+            &weights,
+            0.001,
+            0.0,
+            60.0,
+            2.0,
+            true,
+            true,
+            &[],
+            100.0,
+        )
+        .unwrap();
+
+        for (a, b) in theta_free.iter().zip(theta_shrunk.iter()) {
+            assert!((a - b).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn test_multiband_shrinkage_large_value_remains_finite() {
+        let x =
+            Array2::from_shape_vec((4, 2), vec![1.0, -1.5, 1.0, -0.5, 1.0, 0.5, 1.0, 1.5]).unwrap();
+        let z =
+            Array2::from_shape_vec((4, 2), vec![1.0, 1.0, 2.0, 4.0, 3.0, 7.0, 4.0, 10.0]).unwrap();
+        let weights = vec![1.0; 4];
+        let theta = multi_output_tiered_ridge_solve(
+            &x,
+            &z,
+            &[],
+            &weights,
+            1e-6,
+            0.0,
+            60.0,
+            2.0,
+            true,
+            true,
+            &[],
+            100.0,
+        )
+        .unwrap();
+
+        assert!(theta.iter().all(|v| v.is_finite()));
     }
 
     #[test]
