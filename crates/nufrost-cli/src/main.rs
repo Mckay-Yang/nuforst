@@ -3629,7 +3629,7 @@ mod tests {
             .parent()
             .unwrap()
             .to_path_buf();
-        let data_root = workspace.join("data/test_data");
+        let data_root = workspace.join("tests/data");
         let output_root = data_root.join("output/full_pipeline_test");
         let cache_dir = data_root
             .join("cache/scenes/sentinel-2")

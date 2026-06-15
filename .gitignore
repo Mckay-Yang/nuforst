@@ -68,7 +68,9 @@ missfont.log
 *.log
 
 # ===== Data & Cache =====
-data/
+/data/
+tests/data/cache/
+tests/data/output/
 cache/
 bak/
 database/
