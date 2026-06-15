@@ -1,54 +1,65 @@
 # NUFROST
 
-NUFROST is a Rust-first research workspace for optical remote-sensing time-series
-reconstruction from irregular satellite observations. The active implementation
-lives under `crates/` and focuses on Sentinel-2 style multi-band trajectories.
+NUFROST is a Rust-first research implementation for reconstructing optical remote-sensing time series from irregular satellite observations. The active method is a vector-valued, non-uniform Fourier reconstruction model: it first estimates a shared spectral support from non-uniform observation times, then fits a stable multi-band trajectory with a date-level robust multi-output ridge model.
 
-The repository contains three reconstruction algorithms:
+This README documents the current NUFROST mathematical model only.
 
-- `NUFROST`: the research method developed in this project.
-- `HANTS`: a harmonic-analysis baseline.
-- `Zhu2015`: a Landsat-style harmonic/LASSO baseline.
+## Problem
 
-`HANTS` and `Zhu2015` are comparison baselines. They are not submodules or
-variants of NUFROST.
+For one pixel, assume there are $B$ optical bands observed at irregular timestamps
 
-## Current Method
+$$
+t_1,t_2,\dots,t_T.
+$$
 
-The active NUFROST path is a vector-valued reconstruction model. For one pixel,
-the observation at time `t_i` is a multi-band vector:
+At time $t_i$, the multi-band observation is treated as a vector
 
-```math
+$$
 \mathbf y_i =
 \begin{bmatrix}
 y_{i,1} & y_{i,2} & \cdots & y_{i,B}
 \end{bmatrix}
-\in \mathbb R^B .
-```
+\in \mathbb R^B.
+$$
 
-For the Sentinel-2 workflow, the current band order is:
+The pixel trajectory is therefore a vector-valued curve
 
-```text
-B2, B3, B4, B8, B11, B12
-```
+$$
+\mathbf y(t): \mathbb R \rightarrow \mathbb R^B.
+$$
 
-so usually `B = 6`.
+The reconstruction task is to predict the missing or held-out vector value
 
-NUFROST models each pixel as a vector-valued curve:
+$$
+\hat{\mathbf y}(t_\star)
+$$
 
-```math
-\mathbf y(t): \mathbb R \rightarrow \mathbb R^B
-```
+at a target time $t_\star$, while preserving temporal stability and cross-band consistency.
 
-and predicts a held-out or missing target vector:
+In the Sentinel-2 full-scene workflow, the usual band order is:
 
-```math
-\hat{\mathbf y}(t_\star).
-```
+$$
+B2,\ B3,\ B4,\ B8,\ B11,\ B12.
+$$
 
-At a high level, the current model is:
+So $B=6$ for the current multi-band NUFROST path.
 
-```math
+## Overview
+
+NUFROST has two main stages:
+
+1. **Vector NUFFT frequency discovery**
+
+   Estimate a shared frequency set from the irregular multi-band time series.
+
+2. **Vector Huber-IRLS multi-output Ridge fitting**
+
+   Fit all bands together with one design matrix and one date-level robust weight sequence.
+
+The current active multi-band model can be summarized as:
+
+$$
+\boxed{
 \mathbf y(t)
 \approx
 \boldsymbol\mu
@@ -56,61 +67,72 @@ At a high level, the current model is:
 \mathbf s \odot
 \left(
 \mathbf x(t)^\top \Theta
-\right),
-```
+\right)
+}
+$$
 
 where:
 
-- `mu in R^B` is the per-band robust center.
-- `s in R^B` is the per-band robust scale.
-- `x(t) in R^P` is the shared harmonic/trend basis.
-- `Theta in R^(P x B)` is the multi-output coefficient matrix.
-- `odot` is elementwise multiplication.
+- $\boldsymbol\mu\in\mathbb R^B$ is a per-band robust center.
+- $\mathbf s\in\mathbb R^B$ is a per-band robust scale.
+- $\mathbf x(t)\in\mathbb R^P$ is the harmonic/trend basis vector.
+- $\Theta\in\mathbb R^{P\times B}$ is the multi-output coefficient matrix.
+- $\odot$ denotes element-wise multiplication.
 
-### Robust Standardization
+## Robust Standardization
 
-Each band is standardized before frequency discovery and fitting:
+Before spectral estimation and fitting, each band is robustly standardized. For band $b$:
 
-```math
+$$
 \mu_b = \operatorname{median}_i(y_{i,b})
-```
+$$
 
-```math
+and
+
+$$
 s_b =
-1.4826
+1.4826\,
 \operatorname{median}_i
+\left(
 \left|y_{i,b}-\mu_b\right|
-```
+\right).
+$$
 
-```math
-Z_{i,b} =
+The standardized observation matrix is:
+
+$$
+Z_{i,b}
+=
 \frac{y_{i,b}-\mu_b}{s_b+\epsilon}.
-```
+$$
 
-This keeps the robust loss and penalties in a common standardized space without
-forcing the raw reflectance levels of different bands to be equal. If the MAD is
-degenerate, the implementation falls back to a standard-deviation scale and a
-small positive floor.
+Equivalently:
 
-### Vector NUFFT
+$$
+Z\in\mathbb R^{T\times B}.
+$$
 
-Observation dates are irregular because cloud, snow, shadow, orbit, and quality
-filters remove many acquisitions. NUFROST estimates a spectrum directly from
-non-uniform time samples.
+This normalization is important because optical bands have different reflectance ranges. The robust Huber threshold is then applied in a common standardized space rather than raw DN space.
 
-For band `b`:
+If MAD is degenerate for a band, the implementation falls back to standard deviation. A small positive floor prevents division by zero.
 
-```math
+## Vector NUFFT
+
+The observation times are generally non-uniform because clouds, snow, shadows, orbit geometry, and quality filters remove many dates. NUFROST therefore avoids assuming a uniform temporal grid.
+
+For each standardized band trajectory $z_b(t_i)$, the type-1 non-uniform Fourier transform is:
+
+$$
 F_b(f_k)
 =
 \sum_{i=1}^{T}
 z_b(t_i)
 \exp(-\mathrm{i}\,2\pi f_k t_i).
-```
+$$
 
-The implementation computes a vector-valued NUFFT on the shared timestamp grid:
+The current implementation computes this as a vector-valued NUFFT on the shared timestamp grid:
 
-```math
+$$
 \mathbf F(f_k)
 =
 \begin{bmatrix}
@@ -119,385 +141,448 @@ F_2(f_k)\\
 \vdots\\
 F_B(f_k)
 \end{bmatrix}
-\in \mathbb C^B.
-```
+\in\mathbb C^B.
+$$
 
-The Rust NUFFT implementation is in `crates/nufrost-core/src/nufft.rs`. It uses:
+All bands share:
 
-- Kaiser-Bessel spreading onto an oversampled uniform grid.
-- A radix-2 FFT on that grid.
-- Deconvolution by the periodized kernel spectrum.
-- A joint vector power spectrum:
+- the same non-uniform time coordinates,
+- the same Kaiser-Bessel spreading positions,
+- the same oversampled FFT grid,
+- the same kernel deconvolution,
+- the same output frequency bins.
 
-```math
+For frequency selection, NUFROST compresses the vector spectrum into a joint power spectrum:
+
+$$
 P(f_k)
 =
-\|\mathbf F(f_k)\|_2^2
+\left\|\mathbf F(f_k)\right\|_2^2
 =
-\sum_{b=1}^{B} |F_b(f_k)|^2 .
-```
+\sum_{b=1}^{B}
+\left|F_b(f_k)\right|^2.
+$$
 
-All bands share the same non-uniform time coordinates, spreading positions, FFT
-grid, deconvolution, and output frequency bins.
+Thus the frequency discovery step is vector-valued in computation, while the selected support is shared across all bands.
 
-### Frequency Set
+## Frequency Selection
 
-The current default NUFROST config uses:
+NUFROST selects a compact set of harmonic frequencies
 
-```json
-"frequency_selection": "all",
-"preferred_periods_days": "365.25,182.625,91.3125,30.4375",
-"preferred_top_k": 4,
-"spectral_top_k": 8,
-"modes": 64
-```
+$$
+\mathcal F
+=
+\{f_1,\dots,f_m\}
+$$
 
-`all` keeps the available positive NUFFT frequency modes and relies on strong
-frequency-weighted ridge penalties to suppress unstable high frequencies.
-Preferred phenology frequencies are treated as low-penalty frequencies.
+from the joint power spectrum $P(f)$.
 
-Other supported modes in code include `spectral`, `preferred`, and
-`hybrid`/`shared_spectral`.
+The selection process uses the configured mode:
 
-### Design Matrix
+- `spectral`: use dominant peaks from the estimated spectrum.
+- `preferred`: use configured physically meaningful periods.
+- `shared_spectral` / `hybrid`: combine preferred periods with spectral peaks.
 
-Given selected frequencies:
+Preferred periods are expressed in days. For example:
 
-```math
-\mathcal F = \{f_1,\dots,f_m\},
-```
+$$
+365.25,\quad 182.625,\quad 91.3125,\quad 30.4375
+$$
 
-NUFROST builds one shared design matrix:
+correspond to annual, semiannual, quarterly, and monthly-like components:
 
-```math
-X \in \mathbb R^{T \times P}.
-```
+$$
+f = \frac{1}{p\cdot 86400}.
+$$
 
-With intercept and trend enabled:
+When peak refinement is enabled, selected peaks are locally refined by fitting a parabola around neighboring spectral bins. Nearby selected frequencies are merged using a relative tolerance.
 
-```math
+The result is one shared frequency set:
+
+$$
+\mathcal F
+$$
+
+used by all bands.
+
+## Design Matrix
+
+Given selected frequencies $\mathcal F$, NUFROST builds a harmonic design matrix:
+
+$$
+X\in\mathbb R^{T\times P}.
+$$
+
+With DC and trend enabled, each row is:
+
+$$
 \mathbf x(t_i)
 =
 \begin{bmatrix}
 1,\,
 t_i-\bar t,\,
-\cos(2\pi f_1t_i),\,
-\sin(2\pi f_1t_i),\,
+\cos(2\pi f_1 t_i),\,
+\sin(2\pi f_1 t_i),\,
 \dots,\,
-\cos(2\pi f_mt_i),\,
-\sin(2\pi f_mt_i)
+\cos(2\pi f_m t_i),\,
+\sin(2\pi f_m t_i)
 \end{bmatrix}.
-```
+$$
 
 The number of columns is:
 
-```math
-P = 1 + \mathbf 1_{\mathrm{trend}} + 2m.
-```
+$$
+P = 1 + \mathbf 1_{\text{trend}} + 2m.
+$$
 
-### Multi-Output Ridge
+This matrix is shared by all bands.
 
-The standardized reconstruction model is:
+## Vector Huber-IRLS Multi-Output Ridge
 
-```math
+After frequency discovery, NUFROST fits the standardized multi-band trajectory:
+
+$$
 Z \approx X\Theta,
-```
+$$
 
 where:
 
-```math
-Z\in\mathbb R^{T\times B},\quad
-X\in\mathbb R^{T\times P},\quad
+$$
+Z\in\mathbb R^{T\times B},
+\quad
+X\in\mathbb R^{T\times P},
+\quad
 \Theta\in\mathbb R^{P\times B}.
-```
+$$
 
-For fixed date weights, the core objective is:
+The current objective is:
 
-```math
-\min_\Theta
-\frac{1}{2}
+$$
+\boxed{
+\min_{\Theta}
+\frac12
 \left\|
-W^{1/2}(Z-X\Theta)
+W^{1/2}
+(Z-X\Theta)
 \right\|_F^2
 +
-\frac{1}{2}
+\frac12
 \left\|
 \Lambda^{1/2}\Theta
-\right\|_F^2 .
-```
+\right\|_F^2
+}
+$$
 
-The normal equation is:
+where:
 
-```math
+- $W=\operatorname{diag}(w_1,\dots,w_T)$ is a date-level robust weight matrix.
+- $\Lambda\in\mathbb R^{P\times P}$ is a diagonal frequency-weighted ridge penalty.
+- $\|\cdot\|_F$ is the Frobenius norm.
+
+This is a multi-output regression problem: all bands are solved together.
+
+For fixed weights $W$, the normal equation is:
+
+$$
 \left(
-X^\top W X+\Lambda
-\right)\Theta
+X^\top W X + \Lambda
+\right)
+\Theta
 =
-X^\top WZ.
-```
+X^\top W Z.
+$$
 
-The Rust solver builds the left-hand matrix once and solves all band right-hand
-sides together. This is not six independent IRLS fits.
+Let
 
-### Date-Level Vector Huber IRLS
+$$
+A = X^\top W X + \Lambda,
+\quad
+C = X^\top W Z.
+$$
 
-NUFROST uses a date-level robust residual. At date `i`:
+Then:
 
-```math
-\mathbf r_i = \mathbf z_i - \mathbf x_i^\top\Theta.
-```
+$$
+A\Theta=C.
+$$
 
-The residual magnitude is the RMS vector residual:
+The implementation factorizes $A$ once and solves all $B$ right-hand sides together. This is the main difference from band-wise fitting: one pixel uses one shared linear system per IRLS round, rather than one system per band.
 
-```math
-e_i =
+## Date-Level Vector Huber Weights
+
+NUFROST does not assign independent Huber weights to each band. Instead, it treats one date as one multi-band observation and computes a vector residual:
+
+$$
+\mathbf r_i
+=
+\mathbf z_i
+-
+\mathbf x(t_i)^\top\Theta
+\in\mathbb R^B.
+$$
+
+The residual magnitude is the band-averaged RMS:
+
+$$
+e_i
+=
 \sqrt{
 \frac{1}{B}
-\sum_{b=1}^{B} r_{i,b}^2
+\sum_{b=1}^{B}
+r_{i,b}^2
 }.
-```
+$$
 
-Huber weights are updated as:
+The date-level Huber weight is:
 
-```math
-w_i =
-\begin{cases}
-1, & e_i \leq \delta,\\
-\delta/(e_i+\epsilon), & e_i > \delta.
-\end{cases}
-```
-
-The current implementation damps the weight update and keeps a small minimum
-weight to avoid unstable systems when few dates remain. After Huber fitting,
-optional joint outlier rejection can remove high-residual dates and refit.
-
-### Frequency-Weighted Ridge
-
-High-frequency coefficients receive stronger penalties. Preferred phenology
-frequencies can be exempted from the high-frequency penalty. The default config
-currently uses:
-
-```json
-"ridge": 2.0,
-"freq_weight": 256.0,
-"lambda_high": 0.005,
-"low_freq_period_days": 60.0
-```
-
-This makes the full-frequency model possible while strongly discouraging noisy
-high-frequency oscillations.
-
-### Multiband Coefficient Shrinkage
-
-The current default config enables:
-
-```json
-"multiband_shrinkage": 1.0
-```
-
-The solver decomposes each coefficient row into an across-band mean component
-and a band-specific contrast component:
-
-```math
-\Theta_{j,b}
+$$
+w_i
 =
-\bar{\Theta}_j + \Delta_{j,b}.
-```
+\begin{cases}
+1, & e_i \le \delta,\\
+\frac{\delta}{e_i+\epsilon}, & e_i > \delta.
+\end{cases}
+$$
 
-The shrinkage term penalizes the contrast component:
+This means a polluted acquisition date is down-weighted as a whole. That matches the remote-sensing failure mode: clouds, haze, shadows, snow contamination, and atmospheric artifacts usually affect the observation date, not only one isolated band.
 
-```math
-\lambda_s
-\sum_{j,b}
+The implementation also applies damping:
+
+$$
+w_i^{(k+1)}
+\leftarrow
+\rho w_i^{(k)}
++
+(1-\rho)\tilde w_i^{(k+1)}
+$$
+
+and a small minimum weight:
+
+$$
+w_i \ge w_{\min}.
+$$
+
+This avoids unstable weight oscillation and keeps the ridge system numerically well-conditioned under sparse observations.
+
+## Frequency-Weighted Ridge
+
+The ridge penalty is diagonal:
+
+$$
+\Lambda
+=
+\operatorname{diag}(\lambda_1,\dots,\lambda_P).
+$$
+
+DC and trend terms receive ordinary ridge weights. Harmonic terms receive frequency-dependent penalties. For frequency $f_k$, the base multiplier is:
+
+$$
+d_k
+=
 \left(
-\Theta_{j,b}-\bar{\Theta}_j
-\right)^2 .
-```
+\frac{f_k}{f_{\min}}
+\right)^\alpha,
+$$
 
-This does not force raw bands to have the same reflectance. It only discourages
-unnecessary divergence in standardized temporal coefficient structure.
+where $\alpha$ is controlled by `freq_weight`.
 
-## Workspace Layout
+Cosine and sine columns for the same frequency share the same penalty:
+
+$$
+\lambda_{\cos,k}
+=
+\lambda_{\sin,k}
+=
+\lambda_\beta d_k^2.
+$$
+
+This suppresses high-frequency noise and improves conditioning when the selected harmonic basis is nearly collinear, especially across long temporal gaps.
+
+The configuration also supports a high-frequency tier through:
+
+- `lambda_high`
+- `low_freq_period_days`
+
+Frequencies whose periods are shorter than the configured low-frequency threshold can receive additional ridge penalty.
+
+## Prediction
+
+At target time $t_\star$, NUFROST builds the same basis vector:
+
+$$
+\mathbf x_\star = \mathbf x(t_\star).
+$$
+
+The standardized prediction is:
+
+$$
+\hat{\mathbf z}_\star
+=
+\mathbf x_\star^\top\Theta.
+$$
+
+The final prediction is transformed back to the original band scale:
+
+$$
+\boxed{
+\hat{\mathbf y}_\star
+=
+\boldsymbol\mu
++
+\mathbf s \odot \hat{\mathbf z}_\star
+}
+$$
+
+This gives one reconstructed value per band.
+
+## Current Active Multi-Band Model
+
+The active NUFROST full-scene path is:
+
+$$
+\mathbf y_i
+\rightarrow
+Z
+\rightarrow
+\mathbf F(f)
+\rightarrow
+P(f)
+\rightarrow
+\mathcal F
+\rightarrow
+X
+\rightarrow
+\Theta
+\rightarrow
+\hat{\mathbf y}(t_\star).
+$$
+
+In words:
+
+1. Build a valid joint timestamp mask for the pixel.
+2. Robustly standardize each band.
+3. Run vector-valued NUFFT on the shared non-uniform timestamp grid.
+4. Convert the vector spectrum to a joint power spectrum.
+5. Select shared harmonic frequencies.
+6. Build one harmonic/trend design matrix.
+7. Fit all bands with vector Huber-IRLS and multi-output frequency-weighted Ridge.
+8. Predict the target multi-band vector and de-standardize.
+
+This is the current high-dimensional vector trajectory model.
+
+## Configuration
+
+NUFROST defaults live in:
 
 ```text
-.
-├── Cargo.toml
-├── AGENTS.md
-├── README.md
-├── config/
-├── crates/
-│   ├── gdal/
-│   ├── nufrost-core/
-│   ├── hants-core/
-│   ├── zhu2015-core/
-│   └── nufrost-cli/
-├── tests/data/
-├── data -> /Volumes/T7/nufrost-data
-└── .agents/
+config/nufrost.json
 ```
 
-Crates:
+Important fields:
 
-| Crate | Role |
-|---|---|
-| `gdal` | Project raster I/O, timestamp parsing, scene cache, sample cache, full-scene helpers. Uses external `libgdal` through Rust GDAL bindings. |
-| `nufrost-core` | NUFROST algorithm, NUFFT, vector fitting, prediction, and tests. |
-| `hants-core` | HANTS comparison baseline. |
-| `zhu2015-core` | Zhu2015 comparison baseline. |
-| `nufrost-cli` | CLI entrypoint for single-pixel, full-scene, cache, and sample-cache workflows. |
+- `modes`: number of NUFFT modes before positive-frequency selection.
+- `frequency_selection`: `spectral`, `preferred`, or `shared_spectral`.
+- `preferred_periods_days`: comma-separated periods used by the hybrid/preferred modes.
+- `preferred_top_k`: number of preferred components to keep.
+- `spectral_top_k`: number of spectral peaks to keep.
+- `spectral_merge_tol`: relative tolerance for merging nearby frequencies.
+- `refine_peaks`: enable parabolic local peak refinement.
+- `include_trend`: include the centered linear trend column.
+- `ridge`: base ridge coefficient $\lambda_\beta$.
+- `freq_weight`: exponent $\alpha$ for frequency-weighted ridge.
+- `lambda_high`: extra high-frequency ridge level.
+- `low_freq_period_days`: period threshold for high-frequency classification.
+- `huber_iters`: maximum vector Huber-IRLS iterations.
+- `huber_delta`: configured Huber threshold; the vector path applies a standardized residual lower bound internally.
+- `min_obs`: minimum valid observations needed for a fit.
 
-Dependency direction:
+Some older configuration keys for step/fused-lasso experiments remain in the JSON for compatibility, but the current vector NUFROST path described above uses the multi-output Huber-Ridge trajectory model.
+
+## Rust Workspace
+
+The active Rust implementation is under `crates/`:
 
 ```text
-gdal
-  ↑
-  ├── nufrost-core
-  ├── hants-core
-  └── zhu2015-core
-
-gdal + nufrost-core + hants-core + zhu2015-core
-  ↑
-  └── nufrost-cli
+crates/
+  gdal/            # GeoTIFF/VRT I/O, timestamp parsing, full-scene helpers
+  nufrost-core/    # NUFROST mathematical model and NUFFT/fitting logic
+  hants-core/      # HANTS comparison baseline
+  zhu2015-core/    # Zhu2015 comparison baseline
+  nufrost-cli/     # command-line entrypoint
 ```
 
-`gdal` must remain independent of algorithm crates.
+The baseline crates are separate comparison algorithms and are not part of the NUFROST mathematical model described here.
 
-## Data Layout
+## Build And Test
 
-Root `data/` is intentionally not tracked by git. On this machine it is a
-symlink to:
+The workspace requires Rust 1.85+ and a system GDAL runtime.
 
-```text
-/Volumes/T7/nufrost-data
-```
-
-Real imagery, generated reconstructions, figures, scene caches, and sample
-caches should stay under `data/`.
-
-Small committed test fixtures live under:
-
-```text
-tests/data/
-```
-
-`tests/data/cache/` and `tests/data/output/` are ignored because tests may
-create them during execution.
-
-## GDAL Runtime
-
-The project uses system GDAL through the Rust `gdal`/`gdal-sys` bindings. On
-this machine, GDAL-linked commands usually need:
-
-```sh
-export DYLD_LIBRARY_PATH=/opt/homebrew/Caskroom/miniforge/base/envs/geo-science/lib:$DYLD_LIBRARY_PATH
-```
-
-Long-term, GDAL should remain an import/export boundary. Hot loops should use
-the internal scene cache and sample cache formats rather than repeatedly reading
-GeoTIFF stacks.
-
-## Build And Verify
-
-```sh
+```bash
 cargo check --workspace
 ```
 
-Run the local project `gdal` crate tests explicitly because the workspace also
-depends on the upstream Rust crate named `gdal`:
+On this machine, GDAL-linked tests may need:
 
-```sh
-DYLD_LIBRARY_PATH=/opt/homebrew/Caskroom/miniforge/base/envs/geo-science/lib \
-cargo test -p gdal@0.1.0 --lib
+```bash
+export DYLD_LIBRARY_PATH=/opt/homebrew/Caskroom/miniforge/base/envs/geo-science/lib
 ```
 
-Run the full-scene test-data smoke test:
+Useful NUFROST-focused commands:
 
-```sh
-DYLD_LIBRARY_PATH=/opt/homebrew/Caskroom/miniforge/base/envs/geo-science/lib \
-cargo test -p nufrost-cli full_scene_test_data_runs_end_to_end_with_auto_cache -- --nocapture
+```bash
+cargo test -p nufrost-core --lib
+cargo test -p nufrost-cli --bin nufrost-cli
 ```
 
-## Common CLI Workflows
+## CLI Examples
 
-Build a release binary:
+Single NUFROST GeoTIFF reconstruction:
 
-```sh
-cargo build --release -p nufrost-cli
+```bash
+cargo run -p nufrost-cli -- nufrost \
+  --input-geotiff input.tif \
+  --output pred.tif
 ```
 
-Build or refresh one scene cache:
+Full-scene Sentinel-2 reconstruction:
 
-```sh
-DYLD_LIBRARY_PATH=/opt/homebrew/Caskroom/miniforge/base/envs/geo-science/lib \
-target/release/nufrost-cli build-scene-cache \
+```bash
+cargo run --release -p nufrost-cli -- full-scene \
   --source-name sentinel-2 \
   --lon 94.2605 \
   --lat 29.7733 \
   --data-root data \
-  --cache-root data/cache/scenes
+  --output-root data/output
 ```
 
-Run one full scene:
+One-pixel timing and RMSE smoke test:
 
-```sh
-DYLD_LIBRARY_PATH=/opt/homebrew/Caskroom/miniforge/base/envs/geo-science/lib \
-target/release/nufrost-cli full-scene \
+```bash
+cargo run --release -p nufrost-cli -- pixel-bench \
   --source-name sentinel-2 \
   --lon 94.2605 \
   --lat 29.7733 \
-  --methods nufrost \
   --data-root data \
-  --output-root data/output \
-  --n-jobs 8
+  --row 513 \
+  --col 587 \
+  --repeats 50
 ```
 
-Run all available scenes:
+## Implementation Notes
 
-```sh
-DYLD_LIBRARY_PATH=/opt/homebrew/Caskroom/miniforge/base/envs/geo-science/lib \
-target/release/nufrost-cli batch-full-scene \
-  --source-name sentinel-2 \
-  --methods nufrost \
-  --data-root data \
-  --output-root data/output \
-  --n-jobs 8 \
-  --continue-on-error
+The key implementation entry points are:
+
+```text
+crates/nufrost-core/src/nufft.rs
+  type1_vector_power_kb
+
+crates/nufrost-core/src/nufrost.rs
+  nufrost_pixel_vector
+  multi_output_tiered_ridge_solve
 ```
 
-Build a global sample cache:
+`type1_vector_power_kb` performs the vector-valued gridded NUFFT and returns the shared frequency grid with joint power.
 
-```sh
-DYLD_LIBRARY_PATH=/opt/homebrew/Caskroom/miniforge/base/envs/geo-science/lib \
-target/release/nufrost-cli build-sample-cache \
-  --source-name sentinel-2 \
-  --scene-cache-root data/cache/scenes \
-  --output data/cache/samples/sentinel-2_v1 \
-  --n-samples 1000000 \
-  --min-joint-valid 12 \
-  --seed 20260608
-```
+`nufrost_pixel_vector` is the active multi-band pixel model. It performs robust standardization, shared frequency discovery, date-level vector Huber weighting, multi-output Ridge fitting, and final de-standardized prediction.
 
-Evaluate a method on the sample cache:
-
-```sh
-DYLD_LIBRARY_PATH=/opt/homebrew/Caskroom/miniforge/base/envs/geo-science/lib \
-target/release/nufrost-cli eval-sample-cache \
-  --method nufrost \
-  --cache-dir data/cache/samples/sentinel-2_v1 \
-  --n-eval 1000000 \
-  --config config/nufrost.json \
-  --output-json data/output/sample_cache_predictions/nufrost_holdout_1000000.json \
-  --output-prediction-csv data/output/sample_cache_predictions/nufrost_holdout_1000000_predictions.csv
-```
-
-## Notes For Future Work
-
-- Keep NUFROST method changes in `nufrost-core`; do not put algorithm logic in
-  `nufrost-cli`.
-- Keep raster/cache mechanics in `gdal`; do not make `gdal` depend on algorithm
-  crates.
-- Keep root `data/` untracked. Store committed smoke-test data only in
-  `tests/data/`.
-- Prefer sample-cache evaluation for global parameter decisions. Single-region
-  full-scene tests are useful for inspection but can be extreme cases.
-- Preserve `HANTS` and `Zhu2015` as baselines unless explicitly told otherwise.
+`multi_output_tiered_ridge_solve` builds the shared normal equation and solves all band outputs together.
