@@ -2226,36 +2226,44 @@ pub fn nufrost_pixel_vector(
         let mut z_mat = Array2::<f64>::zeros((n_use, n_bands));
         for b in 0..n_bands {
             let col: Vec<f64> = y_mat.column(b).iter().copied().collect();
-            let center = nanmedian(&col);
-            let abs_dev: Vec<f64> = col
-                .iter()
-                .map(|&v| {
-                    if v.is_finite() {
-                        (v - center).abs()
-                    } else {
-                        f64::NAN
-                    }
-                })
-                .collect();
-            let mut scale = 1.4826 * nanmedian(&abs_dev);
-            if !scale.is_finite() || scale <= 1e-6 {
-                let mu = nanmean(&col);
-                let var = col
-                    .iter()
-                    .filter(|v| v.is_finite())
-                    .map(|&v| {
-                        let d = v - mu;
-                        d * d
-                    })
-                    .sum::<f64>()
-                    / (n_use as f64).max(1.0);
-                scale = var.sqrt();
-            }
-            centers[b] = if center.is_finite() {
-                center
+            let (center, scale) = if config.normalization_mode == "reflectance" {
+                (0.0, 10_000.0)
             } else {
-                nanmean(&col)
+                let center = nanmedian(&col);
+                let abs_dev: Vec<f64> = col
+                    .iter()
+                    .map(|&v| {
+                        if v.is_finite() {
+                            (v - center).abs()
+                        } else {
+                            f64::NAN
+                        }
+                    })
+                    .collect();
+                let mut scale = 1.4826 * nanmedian(&abs_dev);
+                if !scale.is_finite() || scale <= 1e-6 {
+                    let mu = nanmean(&col);
+                    let var = col
+                        .iter()
+                        .filter(|v| v.is_finite())
+                        .map(|&v| {
+                            let d = v - mu;
+                            d * d
+                        })
+                        .sum::<f64>()
+                        / (n_use as f64).max(1.0);
+                    scale = var.sqrt();
+                }
+                (
+                    if center.is_finite() {
+                        center
+                    } else {
+                        nanmean(&col)
+                    },
+                    scale.max(1e-6),
+                )
             };
+            centers[b] = center;
             scales[b] = scale.max(1e-6);
             for i in 0..n_use {
                 z_mat[[i, b]] = (y_mat[[i, b]] - centers[b]) / scales[b];
@@ -2330,7 +2338,11 @@ pub fn nufrost_pixel_vector(
         }
 
         let mut weights = vec![1.0f64; n_use];
-        let delta = config.huber_delta.max(1.5);
+        let delta = if config.normalization_mode == "reflectance" {
+            config.huber_delta.max(1e-6)
+        } else {
+            config.huber_delta.max(1.5)
+        };
         let damping = 0.5;
         let min_weight = 0.03;
         let iters = (config.huber_iters as usize).clamp(1, 5);
@@ -2456,8 +2468,13 @@ pub fn nufrost_pixel_vector(
                 / (rms.len() as f64).max(1.0);
             scale = var.sqrt();
         }
-        let threshold = (center + config.outlier_reject_sigma.max(0.0) * scale)
-            .max(config.huber_delta.max(1.5));
+        let threshold_floor = if config.normalization_mode == "reflectance" {
+            config.huber_delta.max(1e-6)
+        } else {
+            config.huber_delta.max(1.5)
+        };
+        let threshold =
+            (center + config.outlier_reject_sigma.max(0.0) * scale).max(threshold_floor);
         let mut candidates: Vec<(usize, f64)> = rms
             .iter()
             .copied()

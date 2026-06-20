@@ -43,6 +43,10 @@ pub struct NufrostConfig {
     /// shrinkage term; 0 disables it.
     #[serde(default = "default_multiband_shrinkage")]
     pub multiband_shrinkage: f64,
+    /// Multi-band fitting normalization. `robust` uses per-pixel band median/MAD;
+    /// `reflectance` uses fixed Sentinel-2 reflectance scaling Y / 10000.
+    #[serde(default = "default_normalization_mode")]
+    pub normalization_mode: String,
     pub huber_iters: u32,
     pub huber_delta: f64,
     pub min_obs: u32,
@@ -106,6 +110,9 @@ fn default_outlier_sigma() -> f64 {
 }
 fn default_multiband_shrinkage() -> f64 {
     0.0
+}
+fn default_normalization_mode() -> String {
+    "robust".into()
 }
 fn default_outlier_reject_iters() -> u32 {
     2
@@ -184,6 +191,12 @@ impl NufrostConfig {
                 reason: "must be >= 0".into(),
             });
         }
+        if self.normalization_mode != "robust" && self.normalization_mode != "reflectance" {
+            return Err(NufrostError::InvalidConfigValue {
+                field: "normalization_mode".into(),
+                reason: "must be robust or reflectance".into(),
+            });
+        }
         Ok(())
     }
 }
@@ -220,6 +233,7 @@ mod tests {
         // Defaults kick in for omitted fields
         assert_eq!(cfg.frequency_selection, "spectral");
         assert_eq!(cfg.multiband_shrinkage, 0.0);
+        assert_eq!(cfg.normalization_mode, "robust");
         assert_eq!(cfg.outlier_sigma, 2.5);
         assert_eq!(cfg.outlier_reject_iters, 2);
     }
