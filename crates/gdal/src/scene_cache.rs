@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 use memmap2::Mmap;
@@ -75,8 +76,8 @@ pub fn load_or_build_scene_cache(
     lat: f64,
 ) -> Result<LoadedScene> {
     let cache_dir = default_scene_cache_dir(cache_root, source_name, lon, lat);
-    let band_stacks = resolve_full_scene_band_stacks(data_root, source_name, lon, lat)?;
-    let source_fingerprint = source_fingerprint_for_band_stacks(&band_stacks)?;
+    let raw_band_stacks = discover_full_scene_band_stacks(data_root, source_name, lon, lat)?;
+    let source_fingerprint = source_fingerprint_for_band_stacks(&raw_band_stacks)?;
     if is_valid_scene_cache(&cache_dir, &source_fingerprint)? {
         eprintln!("Loading scene from cache: {}", cache_dir.display());
         return load_scene_cache(&cache_dir);
@@ -110,8 +111,9 @@ pub fn build_scene_cache(
     fs::create_dir_all(&cache_dir)
         .with_context(|| format!("Cannot create cache dir {}", cache_dir.display()))?;
 
+    let raw_band_stacks = discover_full_scene_band_stacks(data_root, source_name, lon, lat)?;
+    let source_fingerprint = source_fingerprint_for_band_stacks(&raw_band_stacks)?;
     let band_stacks = resolve_full_scene_band_stacks(data_root, source_name, lon, lat)?;
-    let source_fingerprint = source_fingerprint_for_band_stacks(&band_stacks)?;
     let ordered_bands: Vec<String> = sorted_band_names(&band_stacks)
         .into_iter()
         .map(str::to_string)
@@ -476,17 +478,7 @@ fn resolve_full_scene_band_stacks(
     lon: f64,
     lat: f64,
 ) -> Result<BTreeMap<String, Vec<PathBuf>>> {
-    let source_dir = data_root.join(source_name);
-    let mut band_stacks = discover_sentinel_band_stacks(&source_dir, lon, lat)?;
-    if band_stacks.is_empty() {
-        bail!(
-            "No band stacks found for lon={}, lat={} in {}",
-            lon,
-            lat,
-            source_dir.display()
-        );
-    }
-
+    let mut band_stacks = discover_full_scene_band_stacks(data_root, source_name, lon, lat)?;
     let vrt_dir = data_root.join("cache").join("local").join("vrts");
     let loc_token6 = full_scene::location_output_token(lon, lat);
     for (band_name, paths) in band_stacks.iter_mut() {
@@ -495,24 +487,76 @@ fn resolve_full_scene_band_stacks(
         }
 
         let vrt_path = vrt_dir.join(format!("sentinel_{band_name}_{loc_token6}.vrt"));
-        if vrt_path.exists() {
-            eprintln!(
-                "Band {band_name}: using cached mosaic VRT {} for {} source chunks",
-                vrt_path.display(),
-                paths.len()
-            );
-            *paths = vec![vrt_path];
-        } else {
-            bail!(
-                "Band {band_name} has {} source chunks but no cached mosaic VRT at {}. \
-                 Build or restore the VRT before full-scene reconstruction.",
-                paths.len(),
-                vrt_path.display()
-            );
-        }
+        ensure_mosaic_vrt(&vrt_path, paths)?;
+        eprintln!(
+            "Band {band_name}: using mosaic VRT {} for {} source chunks",
+            vrt_path.display(),
+            paths.len()
+        );
+        *paths = vec![vrt_path];
     }
 
     Ok(band_stacks)
+}
+
+fn discover_full_scene_band_stacks(
+    data_root: &Path,
+    source_name: &str,
+    lon: f64,
+    lat: f64,
+) -> Result<BTreeMap<String, Vec<PathBuf>>> {
+    let source_dir = data_root.join(source_name);
+    let band_stacks = discover_sentinel_band_stacks(&source_dir, lon, lat)?;
+    if band_stacks.is_empty() {
+        bail!(
+            "No band stacks found for lon={}, lat={} in {}",
+            lon,
+            lat,
+            source_dir.display()
+        );
+    }
+    Ok(band_stacks)
+}
+
+fn ensure_mosaic_vrt(vrt_path: &Path, source_paths: &[PathBuf]) -> Result<()> {
+    if vrt_path.exists() {
+        return Ok(());
+    }
+    if source_paths.len() <= 1 {
+        bail!(
+            "Cannot build mosaic VRT {} from fewer than two source chunks",
+            vrt_path.display()
+        );
+    }
+    let parent = vrt_path
+        .parent()
+        .with_context(|| format!("VRT path has no parent: {}", vrt_path.display()))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("Cannot create VRT directory {}", parent.display()))?;
+
+    let mut cmd = Command::new("gdalbuildvrt");
+    cmd.arg("-overwrite").arg(vrt_path);
+    for path in source_paths {
+        cmd.arg(path);
+    }
+    eprintln!(
+        "Building mosaic VRT {} from {} source chunks...",
+        vrt_path.display(),
+        source_paths.len()
+    );
+    let output = cmd
+        .output()
+        .with_context(|| "Failed to run gdalbuildvrt. Ensure GDAL is available on PATH.")?;
+    if !output.status.success() {
+        bail!(
+            "gdalbuildvrt failed for {} with status {:?}\nstdout:\n{}\nstderr:\n{}",
+            vrt_path.display(),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
 }
 
 fn merge_band_chunks(
