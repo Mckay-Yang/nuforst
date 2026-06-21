@@ -44,7 +44,9 @@ pub struct NufrostConfig {
     #[serde(default = "default_multiband_shrinkage")]
     pub multiband_shrinkage: f64,
     /// Multi-band fitting normalization. `robust` uses per-pixel band median/MAD;
-    /// `reflectance` uses fixed Sentinel-2 reflectance scaling Y / 10000.
+    /// `reflectance` uses fixed Sentinel-2 reflectance scaling Y / 10000;
+    /// `centered_reflectance` subtracts the per-pixel band median and then
+    /// applies fixed Sentinel-2 reflectance scaling.
     #[serde(default = "default_normalization_mode")]
     pub normalization_mode: String,
     pub huber_iters: u32,
@@ -191,10 +193,13 @@ impl NufrostConfig {
                 reason: "must be >= 0".into(),
             });
         }
-        if self.normalization_mode != "robust" && self.normalization_mode != "reflectance" {
+        if self.normalization_mode != "robust"
+            && self.normalization_mode != "reflectance"
+            && self.normalization_mode != "centered_reflectance"
+        {
             return Err(NufrostError::InvalidConfigValue {
                 field: "normalization_mode".into(),
-                reason: "must be robust or reflectance".into(),
+                reason: "must be robust, reflectance, or centered_reflectance".into(),
             });
         }
         Ok(())
@@ -280,5 +285,12 @@ mod tests {
         }"#;
         let cfg = NufrostConfig::from_json(json_with_ridge.as_bytes()).unwrap();
         assert!((cfg.ridge_lam - 0.005).abs() < 1e-10);
+    }
+
+    #[test]
+    fn centered_reflectance_normalization_is_valid() {
+        let mut cfg = NufrostConfig::from_json(NUFROST_JSON.as_bytes()).unwrap();
+        cfg.normalization_mode = "centered_reflectance".into();
+        cfg.validate().unwrap();
     }
 }

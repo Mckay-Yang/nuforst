@@ -2228,6 +2228,16 @@ pub fn nufrost_pixel_vector(
             let col: Vec<f64> = y_mat.column(b).iter().copied().collect();
             let (center, scale) = if config.normalization_mode == "reflectance" {
                 (0.0, 10_000.0)
+            } else if config.normalization_mode == "centered_reflectance" {
+                let center = nanmedian(&col);
+                (
+                    if center.is_finite() {
+                        center
+                    } else {
+                        nanmean(&col)
+                    },
+                    10_000.0,
+                )
             } else {
                 let center = nanmedian(&col);
                 let abs_dev: Vec<f64> = col
