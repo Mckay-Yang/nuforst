@@ -519,44 +519,95 @@ fn discover_full_scene_band_stacks(
 }
 
 fn ensure_mosaic_vrt(vrt_path: &Path, source_paths: &[PathBuf]) -> Result<()> {
-    if vrt_path.exists() {
-        return Ok(());
-    }
     if source_paths.len() <= 1 {
         bail!(
             "Cannot build mosaic VRT {} from fewer than two source chunks",
             vrt_path.display()
         );
     }
-    let parent = vrt_path
-        .parent()
-        .with_context(|| format!("VRT path has no parent: {}", vrt_path.display()))?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("Cannot create VRT directory {}", parent.display()))?;
+    if !vrt_path.exists() {
+        let parent = vrt_path
+            .parent()
+            .with_context(|| format!("VRT path has no parent: {}", vrt_path.display()))?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Cannot create VRT directory {}", parent.display()))?;
 
-    let mut cmd = Command::new("gdalbuildvrt");
-    cmd.arg("-overwrite").arg(vrt_path);
-    for path in source_paths {
-        cmd.arg(path);
-    }
-    eprintln!(
-        "Building mosaic VRT {} from {} source chunks...",
-        vrt_path.display(),
-        source_paths.len()
-    );
-    let output = cmd
-        .output()
-        .with_context(|| "Failed to run gdalbuildvrt. Ensure GDAL is available on PATH.")?;
-    if !output.status.success() {
-        bail!(
-            "gdalbuildvrt failed for {} with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        let mut cmd = Command::new("gdalbuildvrt");
+        cmd.arg("-overwrite").arg(vrt_path);
+        for path in source_paths {
+            cmd.arg(path);
+        }
+        eprintln!(
+            "Building mosaic VRT {} from {} source chunks...",
             vrt_path.display(),
-            output.status.code(),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            source_paths.len()
         );
+        let output = cmd
+            .output()
+            .with_context(|| "Failed to run gdalbuildvrt. Ensure GDAL is available on PATH.")?;
+        if !output.status.success() {
+            bail!(
+                "gdalbuildvrt failed for {} with status {:?}\nstdout:\n{}\nstderr:\n{}",
+                vrt_path.display(),
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
+    let first_source = source_paths
+        .first()
+        .with_context(|| format!("No source chunks for VRT {}", vrt_path.display()))?;
+    let reader = RasterReader::open(first_source)?;
+    let descriptions = extract_raw_band_descriptions(&reader)?;
+    write_vrt_band_descriptions(vrt_path, &descriptions)?;
     Ok(())
+}
+
+fn write_vrt_band_descriptions(vrt_path: &Path, descriptions: &[String]) -> Result<()> {
+    let mut xml = fs::read_to_string(vrt_path)
+        .with_context(|| format!("Cannot read generated VRT {}", vrt_path.display()))?;
+    let mut search_from = 0usize;
+    for desc in descriptions {
+        let Some(rel_start) = xml[search_from..].find("<VRTRasterBand") else {
+            break;
+        };
+        let tag_start = search_from + rel_start;
+        let Some(rel_tag_end) = xml[tag_start..].find('>') else {
+            break;
+        };
+        let insert_at = tag_start + rel_tag_end + 1;
+        let next_band = xml[insert_at..]
+            .find("<VRTRasterBand")
+            .map(|offset| insert_at + offset)
+            .unwrap_or(xml.len());
+        if !desc.is_empty() && !xml[insert_at..next_band].contains("<Description>") {
+            let escaped = escape_xml_text(desc);
+            let insertion = format!("\n    <Description>{escaped}</Description>");
+            xml.insert_str(insert_at, &insertion);
+            search_from = insert_at + insertion.len();
+        } else {
+            search_from = insert_at;
+        }
+    }
+    fs::write(vrt_path, xml)
+        .with_context(|| format!("Cannot write generated VRT {}", vrt_path.display()))?;
+    Ok(())
+}
+
+fn escape_xml_text(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 fn merge_band_chunks(
