@@ -18,6 +18,7 @@ use memmap2::Mmap;
 use ndarray::Array3;
 use rayon::prelude::*;
 use serde::de::DeserializeOwned;
+use serde::Deserialize;
 
 use gdal::{
     collapse_duplicate_timestamps, extract_raw_band_descriptions,
@@ -36,6 +37,9 @@ use nufrost_core::{
 use zhu2015_core::{fit_predict_pixel, reconstruct_zhu2015_geotiff, Zhu2015Config};
 
 const SAMPLE_CACHE_EVAL_PROGRESS_INTERVAL: usize = 10_000;
+const FULL_SCENE_VALID_RATIO_SUBSAMPLE_STEP: usize = 8;
+const SENTINEL2_VALID_MIN: f64 = 0.0;
+const SENTINEL2_VALID_MAX: f64 = 10000.0;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  CLI definition
@@ -1406,6 +1410,591 @@ fn reconstruct_nufrost_vector_scene(
         .collect())
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+struct CliSceneCacheMeta {
+    version: u32,
+    source_name: String,
+    lon: f64,
+    lat: f64,
+    rows: usize,
+    cols: usize,
+    layout: String,
+    dtype: String,
+    bands: Vec<String>,
+    band_meta: Vec<CliSceneCacheBandMeta>,
+    total_values: usize,
+    geo_transform: [f64; 6],
+    crs_wkt: Option<String>,
+    nodata: Option<f64>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+struct CliSceneCacheBandMeta {
+    name: String,
+    timestamps: Vec<String>,
+    time_len: usize,
+    offset_values: usize,
+}
+
+struct CliSceneCacheView {
+    meta: CliSceneCacheMeta,
+    mmap: Mmap,
+    band_index: BTreeMap<String, usize>,
+}
+
+impl CliSceneCacheView {
+    fn open(cache_dir: &Path) -> Result<Self> {
+        let meta_path = cache_dir.join("meta.json");
+        let bin_path = cache_dir.join("cube.f32.bin");
+        let meta: CliSceneCacheMeta =
+            serde_json::from_slice(&fs::read(&meta_path).with_context(|| {
+                format!("Cannot read scene cache meta {}", meta_path.display())
+            })?)?;
+        if meta.version != 1 || meta.layout != "band_time_row_col" || meta.dtype != "f32_le" {
+            bail!(
+                "Unsupported scene cache metadata: version={}, layout={}, dtype={}",
+                meta.version,
+                meta.layout,
+                meta.dtype
+            );
+        }
+        let file = File::open(&bin_path)
+            .with_context(|| format!("Cannot open scene cache data {}", bin_path.display()))?;
+        let expected_bytes = meta
+            .total_values
+            .checked_mul(4)
+            .context("Scene cache byte size overflow")?;
+        let actual_bytes = file.metadata()?.len() as usize;
+        if actual_bytes != expected_bytes {
+            bail!(
+                "Scene cache data size mismatch: expected {expected_bytes} bytes, got {actual_bytes}"
+            );
+        }
+        let mmap = unsafe { Mmap::map(&file)? };
+        let band_index = meta
+            .band_meta
+            .iter()
+            .enumerate()
+            .map(|(idx, band)| (band.name.clone(), idx))
+            .collect();
+        Ok(Self {
+            meta,
+            mmap,
+            band_index,
+        })
+    }
+
+    fn raster_meta(&self) -> RasterMetadata {
+        RasterMetadata {
+            geo_transform: self.meta.geo_transform,
+            crs_wkt: self.meta.crs_wkt.clone(),
+            nodata: self.meta.nodata,
+        }
+    }
+
+    fn band(&self, band_name: &str) -> Result<(usize, &CliSceneCacheBandMeta)> {
+        let idx = self
+            .band_index
+            .get(band_name)
+            .copied()
+            .with_context(|| format!("Band {band_name} missing from scene cache"))?;
+        Ok((idx, &self.meta.band_meta[idx]))
+    }
+
+    fn value_at(&self, band_idx: usize, time_idx: usize, row: usize, col: usize) -> f64 {
+        let band = &self.meta.band_meta[band_idx];
+        let spatial = self.meta.rows * self.meta.cols;
+        let value_idx = band.offset_values + time_idx * spatial + row * self.meta.cols + col;
+        let byte_idx = value_idx * 4;
+        if byte_idx + 4 > self.mmap.len() {
+            return f64::NAN;
+        }
+        let raw = [
+            self.mmap[byte_idx],
+            self.mmap[byte_idx + 1],
+            self.mmap[byte_idx + 2],
+            self.mmap[byte_idx + 3],
+        ];
+        let value = f32::from_le_bytes(raw) as f64;
+        if is_valid_sentinel2_value(value) {
+            value
+        } else {
+            f64::NAN
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DedupBandPlan {
+    band_name: String,
+    band_idx: usize,
+    timestamps: Vec<String>,
+    groups: Vec<Vec<usize>>,
+    target_idx: usize,
+}
+
+impl DedupBandPlan {
+    fn value_at(&self, view: &CliSceneCacheView, dedup_idx: usize, row: usize, col: usize) -> f64 {
+        let mut sum = 0.0;
+        let mut count = 0usize;
+        for &time_idx in &self.groups[dedup_idx] {
+            let value = view.value_at(self.band_idx, time_idx, row, col);
+            if value.is_finite() {
+                sum += value;
+                count += 1;
+            }
+        }
+        if count == 0 {
+            f64::NAN
+        } else {
+            sum / count as f64
+        }
+    }
+}
+
+fn is_valid_sentinel2_value(value: f64) -> bool {
+    value.is_finite() && value > SENTINEL2_VALID_MIN && value < SENTINEL2_VALID_MAX
+}
+
+fn dedup_plan_for_band(
+    view: &CliSceneCacheView,
+    band_name: &str,
+    target_time: &str,
+) -> Result<DedupBandPlan> {
+    let (band_idx, band) = view.band(band_name)?;
+    let mut group_map: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (idx, ts) in band.timestamps.iter().enumerate() {
+        group_map.entry(ts.as_str()).or_default().push(idx);
+    }
+    let timestamps: Vec<String> = group_map.keys().map(|ts| (*ts).to_string()).collect();
+    let groups: Vec<Vec<usize>> = group_map.values().cloned().collect();
+    let target_idx = timestamps
+        .iter()
+        .position(|ts| ts == target_time)
+        .with_context(|| format!("Target timestamp {target_time} missing for band {band_name}"))?;
+    Ok(DedupBandPlan {
+        band_name: band_name.to_string(),
+        band_idx,
+        timestamps,
+        groups,
+        target_idx,
+    })
+}
+
+fn choose_target_timestamp_from_cache(
+    view: &CliSceneCacheView,
+    min_valid_ratio: f64,
+    late_fraction: f64,
+) -> Result<String> {
+    let mut shared: Option<BTreeSet<String>> = None;
+    for band in &view.meta.band_meta {
+        let current: BTreeSet<String> = band.timestamps.iter().cloned().collect();
+        shared = match shared {
+            None => Some(current),
+            Some(existing) => Some(existing.intersection(&current).cloned().collect()),
+        };
+    }
+    let candidates: Vec<String> = shared.unwrap_or_default().into_iter().collect();
+    if candidates.is_empty() {
+        bail!("No shared timestamps exist across selected bands.");
+    }
+
+    let sampled_rows: Vec<usize> = (0..view.meta.rows)
+        .step_by(FULL_SCENE_VALID_RATIO_SUBSAMPLE_STEP)
+        .collect();
+    let sampled_cols: Vec<usize> = (0..view.meta.cols)
+        .step_by(FULL_SCENE_VALID_RATIO_SUBSAMPLE_STEP)
+        .collect();
+    let total = sampled_rows.len() * sampled_cols.len();
+    let mut completeness_by_band: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
+    for (band_idx, band) in view.meta.band_meta.iter().enumerate() {
+        let mut index_by_ts = BTreeMap::new();
+        for (idx, ts) in band.timestamps.iter().enumerate() {
+            index_by_ts.insert(ts.as_str(), idx);
+        }
+        let mut scores = BTreeMap::new();
+        for candidate in &candidates {
+            if let Some(&time_idx) = index_by_ts.get(candidate.as_str()) {
+                let mut valid = 0usize;
+                for &row in &sampled_rows {
+                    for &col in &sampled_cols {
+                        if view.value_at(band_idx, time_idx, row, col).is_finite() {
+                            valid += 1;
+                        }
+                    }
+                }
+                scores.insert(
+                    candidate.clone(),
+                    if total == 0 {
+                        0.0
+                    } else {
+                        valid as f64 / total as f64
+                    },
+                );
+            }
+        }
+        completeness_by_band.insert(band.name.clone(), scores);
+    }
+
+    full_scene::select_shared_target_timestamp(
+        &candidates,
+        &completeness_by_band,
+        min_valid_ratio,
+        late_fraction,
+    )
+}
+
+fn time_axis_days(masked_timestamps: &[String], target_epoch: f64) -> Result<(Vec<f64>, f64)> {
+    let mut epochs: Vec<f64> = masked_timestamps
+        .iter()
+        .map(|s| {
+            parse_iso8601_to_epoch_seconds(s)
+                .with_context(|| format!("Failed to parse timestamp {s}"))
+        })
+        .collect::<Result<_>>()?;
+    epochs.push(target_epoch);
+    epochs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let origin = epochs[0];
+    let target_day = (target_epoch - origin) / 86400.0;
+    let masked_days: Vec<f64> = epochs
+        .iter()
+        .copied()
+        .filter(|&epoch| (epoch - target_epoch).abs() > 1e-6)
+        .map(|epoch| (epoch - origin) / 86400.0)
+        .collect();
+    if masked_days.len() != masked_timestamps.len() {
+        bail!(
+            "Timestamp count mismatch: {} masked days for {} timestamps",
+            masked_days.len(),
+            masked_timestamps.len()
+        );
+    }
+    Ok((masked_days, target_day))
+}
+
+fn run_full_scene_from_cache_streaming(args: &FullSceneArgs, cache_dir: &Path) -> Result<()> {
+    let methods = validate_full_scene_methods(&args.methods)?;
+    let load_start = Instant::now();
+    eprintln!("Opening scene cache for streaming: {}", cache_dir.display());
+    let view = Arc::new(CliSceneCacheView::open(cache_dir)?);
+    let scene_load_seconds = load_start.elapsed().as_secs_f64();
+    eprintln!("Scene cache opened in {scene_load_seconds:.3}s");
+
+    let ordered_bands = view.meta.bands.clone();
+    let meta = view.raster_meta();
+    let rows = view.meta.rows;
+    let cols = view.meta.cols;
+
+    let target_time_str = if let Some(target) = scene_cache::load_cached_target_timestamp(
+        cache_dir,
+        args.min_valid_ratio,
+        args.late_fraction,
+    )? {
+        eprintln!("Using cached shared target timestamp: {target}");
+        target
+    } else {
+        eprintln!("Selecting shared target timestamp from mmap cache...");
+        let target =
+            choose_target_timestamp_from_cache(&view, args.min_valid_ratio, args.late_fraction)?;
+        scene_cache::store_cached_target_timestamp(
+            cache_dir,
+            args.min_valid_ratio,
+            args.late_fraction,
+            &target,
+        )?;
+        target
+    };
+    eprintln!("Selected target timestamp: {target_time_str}");
+    let target_epoch = parse_iso8601_to_epoch_seconds(&target_time_str)
+        .context("Failed to parse target timestamp")?;
+
+    let band_plans: Vec<DedupBandPlan> = ordered_bands
+        .iter()
+        .map(|band_name| {
+            let raw_len = view.band(band_name)?.1.timestamps.len();
+            let plan = dedup_plan_for_band(&view, band_name, &target_time_str)?;
+            eprintln!(
+                "Band {band_name}: collapsed {} timestamp slices to {}",
+                raw_len,
+                plan.timestamps.len()
+            );
+            Ok(plan)
+        })
+        .collect::<Result<_>>()?;
+
+    let mut ground_truths: BTreeMap<String, ndarray::Array2<f64>> = BTreeMap::new();
+    for plan in &band_plans {
+        let mut gt = ndarray::Array2::<f64>::from_elem((rows, cols), f64::NAN);
+        gt.axis_iter_mut(ndarray::Axis(0))
+            .into_par_iter()
+            .enumerate()
+            .for_each(|(row, mut row_out)| {
+                for col in 0..cols {
+                    row_out[col] = plan.value_at(&view, plan.target_idx, row, col);
+                }
+            });
+        ground_truths.insert(plan.band_name.clone(), gt);
+    }
+
+    let nufrost_config_path = args
+        .nufrost_config
+        .as_deref()
+        .unwrap_or_else(|| std::path::Path::new("config/nufrost.json"));
+    let mut nufrost_conf =
+        load_nufrost_config(Some(nufrost_config_path)).unwrap_or_else(|_| default_nufrost_config());
+    if let Some(mode) = &args.frequency_selection {
+        nufrost_conf.frequency_selection = mode.clone();
+    }
+    let hants_conf = default_hants_config();
+    let zhu2015_conf = default_zhu2015_config();
+
+    let source_name = &args.source_name;
+    let output_root = &args.output_root;
+    let loc_token = full_scene::location_token(args.lon, args.lat);
+
+    let mut prediction_outputs = serde_json::Map::new();
+    let mut metrics_by_method = serde_json::Map::new();
+
+    for method in &methods {
+        let method_str = method.as_str();
+        eprintln!("Reconstructing with {method_str} using mmap streaming...");
+        let mut predictions: BTreeMap<String, ndarray::Array2<f64>> = ordered_bands
+            .iter()
+            .map(|band| {
+                (
+                    band.clone(),
+                    ndarray::Array2::<f64>::from_elem((rows, cols), f64::NAN),
+                )
+            })
+            .collect();
+
+        match method_str {
+            "nufrost" => {
+                let ts_sets: Vec<BTreeSet<&str>> = band_plans
+                    .iter()
+                    .map(|plan| {
+                        plan.timestamps
+                            .iter()
+                            .enumerate()
+                            .filter(|(idx, _)| *idx != plan.target_idx)
+                            .map(|(_, ts)| ts.as_str())
+                            .collect()
+                    })
+                    .collect();
+                let common_ts: Vec<String> = band_plans[0]
+                    .timestamps
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, ts)| {
+                        *idx != band_plans[0].target_idx
+                            && ts_sets.iter().all(|set| set.contains(ts.as_str()))
+                    })
+                    .map(|(_, ts)| ts.clone())
+                    .collect();
+                if common_ts.is_empty() {
+                    bail!("NUFROST vector reconstruction found no common masked timestamps across bands");
+                }
+                let common_indices: Vec<Vec<usize>> = band_plans
+                    .iter()
+                    .map(|plan| {
+                        let index_by_ts: BTreeMap<&str, usize> = plan
+                            .timestamps
+                            .iter()
+                            .enumerate()
+                            .map(|(idx, ts)| (ts.as_str(), idx))
+                            .collect();
+                        common_ts
+                            .iter()
+                            .map(|ts| {
+                                index_by_ts.get(ts.as_str()).copied().with_context(|| {
+                                    format!("Timestamp {ts} missing for band {}", plan.band_name)
+                                })
+                            })
+                            .collect::<Result<Vec<_>>>()
+                    })
+                    .collect::<Result<_>>()?;
+                let (masked_days, target_day) = time_axis_days(&common_ts, target_epoch)?;
+                eprintln!(
+                    "NUFROST vector scene: {rows} rows x {cols} cols x {} bands",
+                    ordered_bands.len()
+                );
+                let progress = AtomicUsize::new(0);
+                let progress_step = (rows / 10).max(1);
+                let mut pred_cube =
+                    Array3::<f64>::from_elem((ordered_bands.len(), rows, cols), f64::NAN);
+                pred_cube
+                    .axis_iter_mut(ndarray::Axis(1))
+                    .into_par_iter()
+                    .enumerate()
+                    .for_each(|(row, mut row_out)| {
+                        let mut obs_by_band: Vec<Vec<f64>> = band_plans
+                            .iter()
+                            .map(|_| Vec::with_capacity(common_ts.len()))
+                            .collect();
+                        for col in 0..cols {
+                            for obs in obs_by_band.iter_mut() {
+                                obs.clear();
+                            }
+                            for (bi, plan) in band_plans.iter().enumerate() {
+                                for &dedup_idx in &common_indices[bi] {
+                                    obs_by_band[bi].push(plan.value_at(&view, dedup_idx, row, col));
+                                }
+                            }
+                            let pred = nufrost_pixel_vector(
+                                &masked_days,
+                                &obs_by_band,
+                                target_day,
+                                &nufrost_conf,
+                            );
+                            for (bi, &value) in pred.iter().enumerate() {
+                                row_out[[bi, col]] =
+                                    if value.is_finite() { value } else { f64::NAN };
+                            }
+                        }
+                        let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
+                        if done == rows || done % progress_step == 0 {
+                            eprintln!("  NUFROST rows: {done}/{rows}");
+                        }
+                    });
+                for (bi, band_name) in ordered_bands.iter().enumerate() {
+                    predictions.insert(
+                        band_name.clone(),
+                        pred_cube.index_axis(ndarray::Axis(0), bi).to_owned(),
+                    );
+                }
+            }
+            "hants" | "zhu2015" => {
+                for (band_pos, plan) in band_plans.iter().enumerate() {
+                    let masked_timestamps: Vec<String> = plan
+                        .timestamps
+                        .iter()
+                        .enumerate()
+                        .filter(|(idx, _)| *idx != plan.target_idx)
+                        .map(|(_, ts)| ts.clone())
+                        .collect();
+                    let masked_indices: Vec<usize> = (0..plan.timestamps.len())
+                        .filter(|idx| *idx != plan.target_idx)
+                        .collect();
+                    let (masked_days, target_day) =
+                        time_axis_days(&masked_timestamps, target_epoch)?;
+                    let n_times = masked_indices.len();
+                    let pred = predictions
+                        .get_mut(&plan.band_name)
+                        .with_context(|| format!("Prediction missing for {}", plan.band_name))?;
+                    eprintln!(
+                        "  {method_str}/{}: {rows} rows x {cols} cols, {n_times} time slices",
+                        plan.band_name
+                    );
+                    let progress = AtomicUsize::new(0);
+                    let progress_step = (rows / 10).max(1);
+                    pred.axis_iter_mut(ndarray::Axis(0))
+                        .into_par_iter()
+                        .enumerate()
+                        .for_each(|(row, mut row_out)| {
+                            let mut ts_buf = Vec::with_capacity(n_times);
+                            let mut obs_buf = Vec::with_capacity(n_times);
+                            for col in 0..cols {
+                                ts_buf.clear();
+                                obs_buf.clear();
+                                for (time_pos, &dedup_idx) in masked_indices.iter().enumerate() {
+                                    let value = plan.value_at(&view, dedup_idx, row, col);
+                                    if value.is_finite() {
+                                        ts_buf.push(masked_days[time_pos]);
+                                        obs_buf.push(value);
+                                    }
+                                }
+                                if !ts_buf.is_empty() {
+                                    row_out[col] = match method_str {
+                                        "hants" => hants_pixel(
+                                            &ts_buf,
+                                            &obs_buf,
+                                            target_day,
+                                            hants_conf.nof,
+                                            &hants_conf.sf,
+                                            hants_conf.valid_min,
+                                            hants_conf.valid_max,
+                                            hants_conf.fet,
+                                            hants_conf.dod,
+                                            hants_conf.period,
+                                        ),
+                                        "zhu2015" => {
+                                            let result = fit_predict_pixel(
+                                                &ts_buf,
+                                                &obs_buf,
+                                                target_day,
+                                                zhu2015_conf.lasso_alpha,
+                                            );
+                                            result.prediction
+                                        }
+                                        _ => f64::NAN,
+                                    };
+                                }
+                            }
+                            let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
+                            if done == rows || done % progress_step == 0 {
+                                eprintln!(
+                                    "    {method_str}/{} rows: {done}/{rows}",
+                                    ordered_bands[band_pos]
+                                );
+                            }
+                        });
+                }
+            }
+            _ => bail!("Unknown full-scene method {method_str}"),
+        }
+
+        let output_path = build_scene_stack_output_path(
+            output_root,
+            method_str,
+            source_name,
+            args.lon,
+            args.lat,
+            &target_time_str,
+            "prediction",
+        );
+        write_band_stack(&output_path, &predictions, &ordered_bands, &meta)?;
+        eprintln!("  Wrote {}", output_path.display());
+
+        let metrics = prediction_metrics_json(&predictions, &ground_truths, &ordered_bands)?;
+        if let Some(rmse) = metrics.get("overall_rmse").and_then(|v| v.as_f64()) {
+            eprintln!("  Overall RMSE: {rmse:.6}");
+        }
+        prediction_outputs.insert(
+            method.clone(),
+            serde_json::Value::String(output_path.display().to_string()),
+        );
+        metrics_by_method.insert(method.clone(), metrics);
+    }
+
+    let gt_path = build_ground_truth_output_path(
+        output_root,
+        source_name,
+        args.lon,
+        args.lat,
+        &target_time_str,
+    );
+    write_band_stack(&gt_path, &ground_truths, &ordered_bands, &meta)?;
+    eprintln!("Ground truth written to {}", gt_path.display());
+
+    write_full_scene_summary(
+        args,
+        source_name,
+        &loc_token,
+        &ordered_bands,
+        &target_time_str,
+        target_epoch,
+        scene_load_seconds,
+        Some(cache_dir),
+        prediction_outputs,
+        metrics_by_method,
+        &gt_path,
+    )?;
+    eprintln!("Full-scene reconstruction complete.");
+    Ok(())
+}
+
 fn validate_full_scene_methods(methods: &str) -> Result<Vec<String>> {
     let parsed: Vec<String> = methods
         .split(',')
@@ -1554,6 +2143,93 @@ fn prediction_metrics_json(
         "overall_rmse": overall_rmse,
         "bands": bands,
     }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_full_scene_summary(
+    args: &FullSceneArgs,
+    source_name: &str,
+    loc_token: &str,
+    ordered_bands: &[String],
+    target_time_str: &str,
+    target_epoch: f64,
+    scene_load_seconds: f64,
+    cache_dir: Option<&Path>,
+    prediction_outputs: serde_json::Map<String, serde_json::Value>,
+    metrics_by_method: serde_json::Map<String, serde_json::Value>,
+    gt_path: &Path,
+) -> Result<()> {
+    let summary_dir = args.output_root.join("run_summaries");
+    fs::create_dir_all(&summary_dir)?;
+    let safe_time = target_time_str.replace(':', "-");
+    let loc_token6 = full_scene::location_output_token(args.lon, args.lat);
+    let summary_path = summary_dir.join(format!(
+        "reconstruction_summary_{source_name}_{loc_token6}_{safe_time}.json"
+    ));
+
+    let mut merged_prediction_outputs = if let Ok(bytes) = fs::read(&summary_path) {
+        serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|v| {
+                v.get("prediction_outputs")
+                    .and_then(|m| m.as_object())
+                    .cloned()
+            })
+            .unwrap_or_default()
+    } else {
+        serde_json::Map::new()
+    };
+    for (method, output) in prediction_outputs {
+        merged_prediction_outputs.insert(method, output);
+    }
+
+    let mut merged_metrics = if let Ok(bytes) = fs::read(&summary_path) {
+        serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|v| v.get("metrics").and_then(|m| m.as_object()).cloned())
+            .unwrap_or_default()
+    } else {
+        serde_json::Map::new()
+    };
+    for (method, metric) in metrics_by_method {
+        merged_metrics.insert(method, metric);
+    }
+
+    let updated_methods = validate_full_scene_methods(&args.methods)?;
+    let mut merged_methods: Vec<String> = merged_metrics.keys().cloned().collect();
+    for method in &updated_methods {
+        if !merged_methods.iter().any(|m| m == method) {
+            merged_methods.push(method.clone());
+        }
+    }
+    merged_methods.sort();
+
+    let now_iso = chrono::Utc::now().to_rfc3339();
+    let summary: serde_json::Value = serde_json::json!({
+        "source_name": source_name,
+        "lon": args.lon,
+        "lat": args.lat,
+        "location_token": loc_token,
+        "target_time": target_time_str,
+        "target_epoch": target_epoch,
+        "methods_run": merged_methods,
+        "methods_updated": updated_methods,
+        "ordered_bands": ordered_bands,
+        "min_valid_ratio": args.min_valid_ratio,
+        "late_fraction": args.late_fraction,
+        "window_size": args.window_size,
+        "window_lon": args.window_lon,
+        "window_lat": args.window_lat,
+        "scene_cache": cache_dir.map(|p| p.display().to_string()),
+        "scene_load_seconds": scene_load_seconds,
+        "prediction_outputs": merged_prediction_outputs,
+        "ground_truth_output": gt_path.display().to_string(),
+        "metrics": merged_metrics,
+        "generated_at": now_iso,
+    });
+    fs::write(&summary_path, serde_json::to_string_pretty(&summary)?)?;
+    eprintln!("Summary written to {}", summary_path.display());
+    Ok(())
 }
 
 fn parse_sentinel_location_from_filename(name: &str) -> Option<(String, String, String)> {
@@ -1917,6 +2593,28 @@ fn run_full_scene(args: &FullSceneArgs) -> Result<()> {
     }
 
     let methods = validate_full_scene_methods(&args.methods)?;
+
+    if args.window_size.is_none() {
+        let cache_dir = args.scene_cache.clone().unwrap_or_else(|| {
+            scene_cache::default_scene_cache_dir(
+                &args.data_root.join("cache").join("scenes"),
+                &args.source_name,
+                args.lon,
+                args.lat,
+            )
+        });
+        if !cache_dir.join("meta.json").is_file() || !cache_dir.join("cube.f32.bin").is_file() {
+            scene_cache::build_scene_cache(
+                &args.data_root,
+                &args.data_root.join("cache").join("scenes"),
+                &args.source_name,
+                args.lon,
+                args.lat,
+                args.scene_cache.as_deref(),
+            )?;
+        }
+        return run_full_scene_from_cache_streaming(args, &cache_dir);
+    }
 
     let load_start = Instant::now();
     let scene_cache::LoadedScene {
