@@ -1561,8 +1561,29 @@ fn parse_sentinel_location_from_filename(name: &str) -> Option<(String, String, 
     let (band, rest) = rest.split_once("_lon")?;
     let (lon, lat_with_suffix) = rest.split_once("_lat")?;
     let lat_stem = lat_with_suffix.strip_suffix(".tif")?;
-    let lat = lat_stem.split('-').next().unwrap_or(lat_stem);
+    let lat = strip_earth_engine_chunk_suffix(lat_stem);
     Some((band.to_string(), lon.to_string(), lat.to_string()))
+}
+
+fn strip_earth_engine_chunk_suffix(value: &str) -> &str {
+    let bytes = value.as_bytes();
+    for idx in 1..bytes.len() {
+        if bytes[idx] != b'-' {
+            continue;
+        }
+        let suffix = &value[idx + 1..];
+        let Some((row, col)) = suffix.split_once('-') else {
+            continue;
+        };
+        if row.len() == 10
+            && col.len() == 10
+            && row.bytes().all(|b| b.is_ascii_digit())
+            && col.bytes().all(|b| b.is_ascii_digit())
+        {
+            return &value[..idx];
+        }
+    }
+    value
 }
 
 fn discover_complete_sentinel_locations(
@@ -3557,6 +3578,25 @@ mod tests {
             }
             _ => panic!("expected BatchFullScene"),
         }
+    }
+
+    #[test]
+    fn parse_sentinel_location_handles_negative_lat_and_chunks() {
+        let parsed = parse_sentinel_location_from_filename(
+            "COPERNICUS_S2_HARMONIZED_B2_lon-62.2159_lat-3.4653-0000000000-0000001024.tif",
+        )
+        .expect("chunked negative-lat filename should parse");
+        assert_eq!(parsed.0, "B2");
+        assert_eq!(parsed.1, "-62.2159");
+        assert_eq!(parsed.2, "-3.4653");
+
+        let parsed = parse_sentinel_location_from_filename(
+            "COPERNICUS_S2_HARMONIZED_B11_lon124.7115_lat52.3352-0000000000-0000001280.tif",
+        )
+        .expect("chunked positive-lat filename should parse");
+        assert_eq!(parsed.0, "B11");
+        assert_eq!(parsed.1, "124.7115");
+        assert_eq!(parsed.2, "52.3352");
     }
 
     #[test]
