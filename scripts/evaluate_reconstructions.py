@@ -6,6 +6,10 @@ Generated rasters:
 - NDVI_[method]_*: NDVI for ground_truth and each method
 - DIFF_NDVI_[method]_*: NDVI(prediction) - NDVI(ground_truth)
 - DIFF_EVI_[method]_*: EVI(prediction) - EVI(ground_truth)
+- DIFF_NDWI_[method]_*: NDWI(prediction) - NDWI(ground_truth)
+- DIFF_NDSI_[method]_*: NDSI(prediction) - NDSI(ground_truth)
+- DIFF_NDMI_[method]_*: NDMI(prediction) - NDMI(ground_truth)
+- DIFF_NBR_[method]_*: NBR(prediction) - NBR(ground_truth)
 
 Generated tables:
 - evaluation_summary.csv
@@ -29,8 +33,12 @@ import rasterio
 METHODS = ("nufrost", "hants", "zhu2015")
 TRUTH_METHOD = "ground_truth"
 BLUE_BAND_NAME = "B2"
+GREEN_BAND_NAME = "B3"
 RED_BAND_NAME = "B4"
 NIR_BAND_NAME = "B8"
+SWIR1_BAND_NAME = "B11"
+SWIR2_BAND_NAME = "B12"
+INDEX_NAMES = ("NDVI", "EVI", "NDWI", "NDSI", "NDMI", "NBR")
 
 RAW_ERROR_BINS = (
     ("<=50", 0.0, 50.0),
@@ -122,8 +130,13 @@ def diff_path(prediction_path: Path) -> Path:
     return prediction_path.with_name(f"DIFF_{name}")
 
 
+def index_path(source_path: Path, method: str, stem: str, index_name: str) -> Path:
+    lower = index_name.lower()
+    return source_path.with_name(f"{index_name}_[{method}]_{stem}_{lower}.tif")
+
+
 def ndvi_path(source_path: Path, method: str, stem: str) -> Path:
-    return source_path.with_name(f"NDVI_[{method}]_{stem}_ndvi.tif")
+    return index_path(source_path, method, stem, "NDVI")
 
 
 def ndvi_diff_path(prediction_path: Path) -> Path:
@@ -136,6 +149,13 @@ def evi_diff_path(prediction_path: Path) -> Path:
     method = method_from_prediction_path(prediction_path)
     stem = prediction_stem(prediction_path)
     return prediction_path.with_name(f"DIFF_EVI_[{method}]_{stem}_evi_diff.tif")
+
+
+def index_diff_path(prediction_path: Path, index_name: str) -> Path:
+    method = method_from_prediction_path(prediction_path)
+    stem = prediction_stem(prediction_path)
+    lower = index_name.lower()
+    return prediction_path.with_name(f"DIFF_{index_name}_[{method}]_{stem}_{lower}_diff.tif")
 
 
 def band_index(ds: rasterio.DatasetReader, band_name: str) -> int:
@@ -157,10 +177,14 @@ def band_index(ds: rasterio.DatasetReader, band_name: str) -> int:
 
 
 def ndvi(nir: np.ndarray, red: np.ndarray) -> np.ndarray:
-    denom = nir + red
-    out = np.full(nir.shape, np.nan, dtype="float32")
-    valid = np.isfinite(nir) & np.isfinite(red) & np.isfinite(denom) & (np.abs(denom) > 1.0e-6)
-    out[valid] = (nir[valid] - red[valid]) / denom[valid]
+    return normalized_difference(nir, red)
+
+
+def normalized_difference(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    denom = a + b
+    out = np.full(a.shape, np.nan, dtype="float32")
+    valid = np.isfinite(a) & np.isfinite(b) & np.isfinite(denom) & (np.abs(denom) > 1.0e-6)
+    out[valid] = (a[valid] - b[valid]) / denom[valid]
     return out
 
 
@@ -194,9 +218,24 @@ def multi_band_profile(ds: rasterio.DatasetReader) -> dict:
 
 def read_index_inputs(ds: rasterio.DatasetReader):
     blue = ds.read(band_index(ds, BLUE_BAND_NAME)).astype("float32", copy=False)
+    green = ds.read(band_index(ds, GREEN_BAND_NAME)).astype("float32", copy=False)
     red = ds.read(band_index(ds, RED_BAND_NAME)).astype("float32", copy=False)
     nir = ds.read(band_index(ds, NIR_BAND_NAME)).astype("float32", copy=False)
-    return blue, red, nir
+    swir1 = ds.read(band_index(ds, SWIR1_BAND_NAME)).astype("float32", copy=False)
+    swir2 = ds.read(band_index(ds, SWIR2_BAND_NAME)).astype("float32", copy=False)
+    return blue, green, red, nir, swir1, swir2
+
+
+def compute_indices(ds: rasterio.DatasetReader) -> dict[str, np.ndarray]:
+    blue, green, red, nir, swir1, swir2 = read_index_inputs(ds)
+    return {
+        "NDVI": ndvi(nir, red),
+        "EVI": evi(nir, red, blue),
+        "NDWI": normalized_difference(green, nir),
+        "NDSI": normalized_difference(green, swir1),
+        "NDMI": normalized_difference(nir, swir1),
+        "NBR": normalized_difference(nir, swir2),
+    }
 
 
 def finite_values(values: np.ndarray) -> np.ndarray:
@@ -429,21 +468,31 @@ def iter_prediction_pairs(recon_root: Path):
                     yield method, scene_dir.name, pred, truth
 
 
-def write_ndvi_raster(source_path: Path, method: str, stem: str, skip_existing: bool) -> Path:
-    out_path = ndvi_path(source_path, method, stem)
+def write_index_raster(
+    source_path: Path,
+    method: str,
+    stem: str,
+    index_name: str,
+    skip_existing: bool,
+) -> Path:
+    out_path = index_path(source_path, method, stem, index_name)
     if out_path.exists() and skip_existing:
         return out_path
     if out_path.exists():
         out_path.unlink()
 
     with rasterio.open(source_path) as ds:
-        _blue, red, nir = read_index_inputs(ds)
-        source_ndvi = ndvi(nir, red)
-        source_ndvi[~np.isfinite(source_ndvi)] = np.nan
+        source_index = compute_indices(ds)[index_name]
+        source_index[~np.isfinite(source_index)] = np.nan
         with rasterio.open(out_path, "w", **single_band_profile(ds)) as out_ds:
-            out_ds.write(source_ndvi, 1)
-            out_ds.set_band_description(1, "NDVI")
+            out_ds.write(source_index, 1)
+            out_ds.set_band_description(1, index_name)
     return out_path
+
+
+def write_all_index_rasters(source_path: Path, method: str, stem: str, skip_existing: bool) -> None:
+    for index_name in INDEX_NAMES:
+        write_index_raster(source_path, method, stem, index_name, skip_existing)
 
 
 def evaluate_pair(
@@ -508,17 +557,13 @@ def evaluate_pair(
             )
             accumulators[(method, "DIFF", desc)].update(diff)
 
-        pred_blue, pred_red, pred_nir = read_index_inputs(pred_ds)
-        truth_blue, truth_red, truth_nir = read_index_inputs(truth_ds)
-        pred_ndvi = ndvi(pred_nir, pred_red)
-        truth_ndvi = ndvi(truth_nir, truth_red)
-        pred_evi = evi(pred_nir, pred_red, pred_blue)
-        truth_evi = evi(truth_nir, truth_red, truth_blue)
+        pred_indices = compute_indices(pred_ds)
+        truth_indices = compute_indices(truth_ds)
 
-        for index_name, pred_index, truth_index, out_path in (
-            ("NDVI", pred_ndvi, truth_ndvi, ndvi_diff_path(prediction_path)),
-            ("EVI", pred_evi, truth_evi, evi_diff_path(prediction_path)),
-        ):
+        for index_name in INDEX_NAMES:
+            pred_index = pred_indices[index_name]
+            truth_index = truth_indices[index_name]
+            out_path = index_diff_path(prediction_path, index_name)
             index_diff = pred_index - truth_index
             index_diff[~np.isfinite(index_diff)] = np.nan
             if not (out_path.exists() and skip_existing):
@@ -557,24 +602,24 @@ def evaluate_pair(
             )
             accumulators[(method, f"DIFF_{index_name}", index_name)].update(index_diff)
 
-    write_ndvi_raster(prediction_path, method, prediction_stem(prediction_path), skip_existing)
+    write_all_index_rasters(prediction_path, method, prediction_stem(prediction_path), skip_existing)
 
 
 def evaluate_truth_ndvi(rows: list[dict[str, object]], scene: str, truth_path: Path, skip_existing: bool) -> None:
-    write_ndvi_raster(truth_path, TRUTH_METHOD, truth_stem(truth_path), skip_existing)
+    write_all_index_rasters(truth_path, TRUTH_METHOD, truth_stem(truth_path), skip_existing)
     with rasterio.open(truth_path) as truth_ds:
-        _blue, red, nir = read_index_inputs(truth_ds)
-        truth_ndvi = ndvi(nir, red)
-        add_stats_row(
-            rows,
-            section="prediction_distribution",
-            scene=scene,
-            method=TRUTH_METHOD,
-            product="NDVI",
-            band_or_index="NDVI",
-            values=truth_ndvi,
-            total_count=truth_ndvi.size,
-        )
+        truth_indices = compute_indices(truth_ds)
+        for index_name, truth_index in truth_indices.items():
+            add_stats_row(
+                rows,
+                section="prediction_distribution",
+                scene=scene,
+                method=TRUTH_METHOD,
+                product=index_name,
+                band_or_index=index_name,
+                values=truth_index,
+                total_count=truth_index.size,
+            )
 
 
 def write_csv(rows: list[dict[str, object]], csv_path: Path) -> None:
@@ -626,7 +671,7 @@ def write_markdown(rows: list[dict[str, object]], md_path: Path) -> None:
     index_bins = [
         row
         for row in rows
-        if row["section"] == "error_bin" and row["product"] in ("DIFF_NDVI", "DIFF_EVI")
+        if row["section"] == "error_bin" and row["product"] in {f"DIFF_{name}" for name in INDEX_NAMES}
     ]
     lines = [
         "# Reconstruction Evaluation Summary",
@@ -674,9 +719,8 @@ def write_markdown(rows: list[dict[str, object]], md_path: Path) -> None:
             "## Output Files",
             "",
             "- `DIFF_[method]_*_diff.tif`: per-band signed difference.",
-            "- `NDVI_[method]_*_ndvi.tif`: NDVI for ground truth and predictions.",
-            "- `DIFF_NDVI_[method]_*_ndvi_diff.tif`: signed NDVI difference.",
-            "- `DIFF_EVI_[method]_*_evi_diff.tif`: signed EVI difference.",
+            "- `INDEX_[method]_*_index.tif`: spectral indices for ground truth and predictions.",
+            "- `DIFF_INDEX_[method]_*_index_diff.tif`: signed spectral-index difference.",
         ]
     )
     md_path.parent.mkdir(parents=True, exist_ok=True)
