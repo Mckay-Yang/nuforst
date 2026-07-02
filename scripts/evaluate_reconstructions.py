@@ -39,6 +39,14 @@ NIR_BAND_NAME = "B8"
 SWIR1_BAND_NAME = "B11"
 SWIR2_BAND_NAME = "B12"
 INDEX_NAMES = ("NDVI", "EVI", "NDWI", "NDSI", "NDMI", "NBR")
+INDEX_VALID_RANGES = {
+    "NDVI": (-1.0, 1.0),
+    "EVI": (-1.0, 1.0),
+    "NDWI": (-1.0, 1.0),
+    "NDSI": (-1.0, 1.0),
+    "NDMI": (-1.0, 1.0),
+    "NBR": (-1.0, 1.0),
+}
 
 RAW_ERROR_BINS = (
     ("<=50", 0.0, 50.0),
@@ -228,7 +236,7 @@ def read_index_inputs(ds: rasterio.DatasetReader):
 
 def compute_indices(ds: rasterio.DatasetReader) -> dict[str, np.ndarray]:
     blue, green, red, nir, swir1, swir2 = read_index_inputs(ds)
-    return {
+    indices = {
         "NDVI": ndvi(nir, red),
         "EVI": evi(nir, red, blue),
         "NDWI": normalized_difference(green, nir),
@@ -236,6 +244,16 @@ def compute_indices(ds: rasterio.DatasetReader) -> dict[str, np.ndarray]:
         "NDMI": normalized_difference(nir, swir1),
         "NBR": normalized_difference(nir, swir2),
     }
+    return {name: mask_out_of_range_index(name, values) for name, values in indices.items()}
+
+
+def mask_out_of_range_index(index_name: str, values: np.ndarray) -> np.ndarray:
+    """Drop physically invalid index values before raster export/statistics."""
+    low, high = INDEX_VALID_RANGES[index_name]
+    out = values.astype("float32", copy=True)
+    valid = np.isfinite(out) & (out >= low) & (out <= high)
+    out[~valid] = np.nan
+    return out
 
 
 def finite_values(values: np.ndarray) -> np.ndarray:

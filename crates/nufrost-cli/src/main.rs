@@ -29,12 +29,18 @@ use gdal::{
     },
     read_all_bands_window_offset, sample_cache, scene_cache, RasterMetadata, RasterReader,
 };
-use hants_core::{hants_pixel, reconstruct_hants_geotiff, HantsConfig};
-use nufrost_core::{
-    nufrost_pixel, nufrost_pixel_vector, parse_iso8601_to_epoch_seconds,
-    reconstruct_nufrost_geotiff, NufrostConfig,
+use hants_core::{
+    hants_fit, hants_pixel, hants_predict, hants_predict_curve, reconstruct_hants_geotiff,
+    HantsConfig,
 };
-use zhu2015_core::{fit_predict_pixel, reconstruct_zhu2015_geotiff, Zhu2015Config};
+use nufrost_core::{
+    nufrost_fit_pixel_vector, nufrost_pixel, nufrost_pixel_vector, nufrost_predict_vector,
+    nufrost_predict_vector_curve, parse_iso8601_to_epoch_seconds, reconstruct_nufrost_geotiff,
+    NufrostConfig,
+};
+use zhu2015_core::{
+    fit_predict_pixel, fit_segment, reconstruct_zhu2015_geotiff, segment_predict, Zhu2015Config,
+};
 
 const SAMPLE_CACHE_EVAL_PROGRESS_INTERVAL: usize = 10_000;
 const FULL_SCENE_VALID_RATIO_SUBSAMPLE_STEP: usize = 8;
@@ -59,6 +65,7 @@ enum Algorithm {
     BuildSceneCache(BuildSceneCacheArgs),
     BuildSampleCache(BuildSampleCacheArgs),
     EvalSampleCache(EvalSampleCacheArgs),
+    SamplePixelCurve(SamplePixelCurveArgs),
     BatchFullScene(BatchFullSceneArgs),
     PixelBench(PixelBenchArgs),
 }
@@ -118,6 +125,17 @@ struct EvalSampleCacheArgs {
     output_prediction_csv: Option<PathBuf>,
     gap_bins: usize,
     threads: Option<usize>,
+}
+
+#[derive(Debug)]
+struct SamplePixelCurveArgs {
+    cache_dir: PathBuf,
+    sample_idx: usize,
+    min_joint_valid: usize,
+    nufrost_config: Option<PathBuf>,
+    hants_config: Option<PathBuf>,
+    zhu2015_config: Option<PathBuf>,
+    output_csv: PathBuf,
 }
 
 #[derive(Debug)]
@@ -252,6 +270,15 @@ impl Cli {
                 gap_bins: *sub.get_one::<usize>("gap_bins").unwrap(),
                 threads: sub.get_one::<usize>("threads").copied(),
             }),
+            "sample-pixel-curve" => Algorithm::SamplePixelCurve(SamplePixelCurveArgs {
+                cache_dir: sub.get_one::<PathBuf>("cache_dir").cloned().unwrap(),
+                sample_idx: *sub.get_one::<usize>("sample_idx").unwrap(),
+                min_joint_valid: *sub.get_one::<usize>("min_joint_valid").unwrap(),
+                nufrost_config: sub.get_one::<PathBuf>("nufrost_config").cloned(),
+                hants_config: sub.get_one::<PathBuf>("hants_config").cloned(),
+                zhu2015_config: sub.get_one::<PathBuf>("zhu2015_config").cloned(),
+                output_csv: sub.get_one::<PathBuf>("output_csv").cloned().unwrap(),
+            }),
             "batch-full-scene" => Algorithm::BatchFullScene(BatchFullSceneArgs {
                 source_name: sub.get_one::<String>("source_name").cloned().unwrap(),
                 output_root: sub.get_one::<PathBuf>("output_root").cloned().unwrap(),
@@ -304,6 +331,7 @@ impl Cli {
             .subcommand(build_scene_cache_command())
             .subcommand(build_sample_cache_command())
             .subcommand(eval_sample_cache_command())
+            .subcommand(sample_pixel_curve_command())
             .subcommand(batch_full_scene_command())
             .subcommand(pixel_bench_command())
     }
@@ -655,6 +683,58 @@ fn eval_sample_cache_command() -> Command {
                 .long("threads")
                 .value_name("N")
                 .value_parser(clap::value_parser!(usize)),
+        )
+}
+
+fn sample_pixel_curve_command() -> Command {
+    Command::new("sample-pixel-curve")
+        .about("Export a single-fit dense reconstruction curve for one cached multi-band sample.")
+        .arg(
+            Arg::new("cache_dir")
+                .long("cache-dir")
+                .value_name("DIR")
+                .default_value("data/cache/samples/sentinel-2_v1")
+                .value_parser(clap::value_parser!(PathBuf)),
+        )
+        .arg(
+            Arg::new("sample_idx")
+                .long("sample-idx")
+                .value_name("N")
+                .required(true)
+                .value_parser(clap::value_parser!(usize)),
+        )
+        .arg(
+            Arg::new("min_joint_valid")
+                .long("min-joint-valid")
+                .value_name("N")
+                .default_value("12")
+                .help("Minimum joint-valid dates required after one leave-one-out target is removed.")
+                .value_parser(clap::value_parser!(usize)),
+        )
+        .arg(
+            Arg::new("nufrost_config")
+                .long("nufrost-config")
+                .value_name("PATH")
+                .value_parser(clap::value_parser!(PathBuf)),
+        )
+        .arg(
+            Arg::new("hants_config")
+                .long("hants-config")
+                .value_name("PATH")
+                .value_parser(clap::value_parser!(PathBuf)),
+        )
+        .arg(
+            Arg::new("zhu2015_config")
+                .long("zhu2015-config")
+                .value_name("PATH")
+                .value_parser(clap::value_parser!(PathBuf)),
+        )
+        .arg(
+            Arg::new("output_csv")
+                .long("output-csv")
+                .value_name("PATH")
+                .required(true)
+                .value_parser(clap::value_parser!(PathBuf)),
         )
 }
 
@@ -3655,6 +3735,241 @@ fn run_eval_sample_cache(args: &EvalSampleCacheArgs) -> Result<()> {
     Ok(())
 }
 
+fn run_sample_pixel_curve(args: &SamplePixelCurveArgs) -> Result<()> {
+    let cache = open_sample_cache(&args.cache_dir)?;
+    if args.sample_idx >= cache.meta.n_samples {
+        bail!(
+            "--sample-idx {} is out of bounds for cache with {} samples",
+            args.sample_idx,
+            cache.meta.n_samples
+        );
+    }
+    let (scene_id, row, col, n_times) = read_sample_index_record(&cache, args.sample_idx)?;
+    if scene_id >= cache.meta.scenes.len() || n_times == 0 || n_times > cache.meta.max_times {
+        bail!(
+            "invalid sample index record: scene_id={scene_id}, n_times={n_times}, max_times={}",
+            cache.meta.max_times
+        );
+    }
+    let scene = &cache.meta.scenes[scene_id];
+    if scene.time_offset + n_times > cache.scene_times.len() {
+        bail!("sample scene time axis exceeds scene_times file");
+    }
+
+    let mask_start = args
+        .sample_idx
+        .checked_mul(cache.mask_record_bytes)
+        .context("mask offset overflow")?;
+    let mask = &cache.mask[mask_start..mask_start + cache.mask_record_bytes];
+    let valid_positions: Vec<usize> = (0..n_times).filter(|&i| mask[i] != 0).collect();
+    if valid_positions.len() <= args.min_joint_valid {
+        bail!(
+            "sample has only {} joint-valid dates, which is not enough for min_joint_valid={}",
+            valid_positions.len(),
+            args.min_joint_valid
+        );
+    }
+
+    let times = &cache.scene_times[scene.time_offset..scene.time_offset + n_times];
+    let sample_start = args
+        .sample_idx
+        .checked_mul(cache.sample_record_bytes)
+        .context("sample offset overflow")?;
+    let sample = &cache.samples[sample_start..sample_start + cache.sample_record_bytes];
+    let mut full_obs = vec![vec![f64::NAN; n_times]; cache.meta.n_bands];
+    for t in 0..n_times {
+        if mask[t] == 0 {
+            continue;
+        }
+        for b in 0..cache.meta.n_bands {
+            let offset = t
+                .checked_mul(cache.meta.n_bands)
+                .and_then(|v| v.checked_add(b))
+                .and_then(|v| v.checked_mul(4))
+                .context("sample value offset overflow")?;
+            full_obs[b][t] =
+                f32::from_le_bytes(sample[offset..offset + 4].try_into().unwrap()) as f64;
+        }
+    }
+
+    let nufrost = load_nufrost_config(args.nufrost_config.as_deref())?;
+    let hants = load_hants_config(args.hants_config.as_deref())?;
+    let zhu2015 = load_zhu2015_config(args.zhu2015_config.as_deref())?;
+
+    if let Some(parent) = args.output_csv.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let mut writer = BufWriter::new(
+        File::create(&args.output_csv)
+            .with_context(|| format!("Cannot create {}", args.output_csv.display()))?,
+    );
+    writeln!(
+        writer,
+        "sample_idx,scene_id,scene_lon,scene_lat,row,col,n_times,valid_count,target_index,kind,time_index,time_epoch,time_day,time_year,band,observed,nufrost,hants,zhu2015"
+    )?;
+
+    let time0 = times.iter().copied().fold(f64::INFINITY, f64::min);
+    if !time0.is_finite() {
+        bail!("sample has no finite time axis");
+    }
+    let rel_days: Vec<f64> = times.iter().map(|&t| (t - time0) / 86400.0).collect();
+    let valid_count = valid_positions.len();
+    let target = valid_positions[valid_positions.len() / 2];
+    let fit_valid_count = valid_count.saturating_sub(1);
+    if fit_valid_count < args.min_joint_valid {
+        bail!(
+            "sample has only {} training dates after holding out target {}, min_joint_valid={}",
+            fit_valid_count,
+            target,
+            args.min_joint_valid
+        );
+    }
+
+    let mut obs = full_obs.clone();
+    for band_obs in &mut obs {
+        band_obs[target] = f64::NAN;
+    }
+
+    let dense_n = 240usize;
+    let min_day = valid_positions
+        .iter()
+        .map(|&i| rel_days[i])
+        .fold(f64::INFINITY, f64::min);
+    let max_day = valid_positions
+        .iter()
+        .map(|&i| rel_days[i])
+        .fold(f64::NEG_INFINITY, f64::max);
+    let dense_days: Vec<f64> = if max_day > min_day {
+        (0..dense_n)
+            .map(|i| min_day + (max_day - min_day) * (i as f64) / ((dense_n - 1) as f64))
+            .collect()
+    } else {
+        vec![rel_days[target]]
+    };
+
+    let nufrost_fit = nufrost_fit_pixel_vector(&rel_days, &obs, &nufrost);
+    let nufrost_curves = nufrost_predict_vector_curve(&nufrost_fit, &dense_days);
+    let nufrost_target = nufrost_predict_vector(&nufrost_fit, rel_days[target]);
+
+    let mut hants_curves = vec![vec![f64::NAN; dense_days.len()]; cache.meta.n_bands];
+    let mut hants_target = vec![f64::NAN; cache.meta.n_bands];
+    let mut zhu_curves = vec![vec![f64::NAN; dense_days.len()]; cache.meta.n_bands];
+    let mut zhu_target = vec![f64::NAN; cache.meta.n_bands];
+    for b in 0..cache.meta.n_bands {
+        let h_fit = hants_fit(
+            &rel_days,
+            &obs[b],
+            hants.nof,
+            &hants.sf,
+            hants.valid_min,
+            hants.valid_max,
+            hants.fet,
+            hants.dod,
+            hants.period,
+        );
+        hants_curves[b] = hants_predict_curve(&h_fit, &dense_days);
+        hants_target[b] = hants_predict(&h_fit, rel_days[target]);
+
+        if let Some(z_fit) = fit_segment(&rel_days, &obs[b], 0, rel_days.len(), zhu2015.lasso_alpha)
+        {
+            for (i, &day) in dense_days.iter().enumerate() {
+                zhu_curves[b][i] = segment_predict(&z_fit, day);
+            }
+            zhu_target[b] = segment_predict(&z_fit, rel_days[target]);
+        }
+    }
+
+    for &i in &valid_positions {
+        let kind = if i == target { "target" } else { "observed" };
+        for (band_idx, band) in cache.meta.bands.iter().enumerate() {
+            let observed = full_obs[band_idx][i];
+            if !observed.is_finite() {
+                continue;
+            }
+            writeln!(
+                writer,
+                "{},{},{:.8},{:.8},{},{},{},{},{},{},{},{:.8},{:.8},{:.10},{},{:.8},{:.8},{:.8},{:.8}",
+                args.sample_idx,
+                scene_id,
+                scene.lon,
+                scene.lat,
+                row,
+                col,
+                n_times,
+                valid_count,
+                target,
+                kind,
+                i,
+                times[i],
+                rel_days[i],
+                rel_days[i] / 365.25,
+                band,
+                observed,
+                if i == target {
+                    nufrost_target.get(band_idx).copied().unwrap_or(f64::NAN)
+                } else {
+                    f64::NAN
+                },
+                if i == target {
+                    hants_target.get(band_idx).copied().unwrap_or(f64::NAN)
+                } else {
+                    f64::NAN
+                },
+                if i == target {
+                    zhu_target.get(band_idx).copied().unwrap_or(f64::NAN)
+                } else {
+                    f64::NAN
+                },
+            )?;
+        }
+    }
+
+    for (curve_idx, &day) in dense_days.iter().enumerate() {
+        let epoch = time0 + day * 86400.0;
+        for (band_idx, band) in cache.meta.bands.iter().enumerate() {
+            writeln!(
+                writer,
+                "{},{},{:.8},{:.8},{},{},{},{},{},curve,{},{:.8},{:.8},{:.10},{},,{:.8},{:.8},{:.8}",
+                args.sample_idx,
+                scene_id,
+                scene.lon,
+                scene.lat,
+                row,
+                col,
+                n_times,
+                valid_count,
+                target,
+                curve_idx,
+                epoch,
+                day,
+                day / 365.25,
+                band,
+                nufrost_curves
+                    .get(band_idx)
+                    .and_then(|v| v.get(curve_idx))
+                    .copied()
+                    .unwrap_or(f64::NAN),
+                hants_curves[band_idx][curve_idx],
+                zhu_curves[band_idx][curve_idx],
+            )?;
+        }
+    }
+    writer.flush()?;
+    eprintln!(
+        "single-fit sample pixel curve written: {}, sample_idx={}, scene_id={}, row={}, col={}, target_index={}, dense_points={}",
+        args.output_csv.display(),
+        args.sample_idx,
+        scene_id,
+        row,
+        col,
+        target,
+        dense_days.len()
+    );
+    Ok(())
+}
+
 fn create_prediction_csv_writer(path: &Path, bands: &[String]) -> Result<BufWriter<File>> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -3900,7 +4215,12 @@ fn evaluate_sample_holdout(
     if truth.iter().any(|v| !v.is_finite()) {
         return Ok(None);
     }
-    let pred = predict_eval_holdout(times, &obs, times[holdout], config);
+    let time0 = times.iter().copied().fold(f64::INFINITY, f64::min);
+    if !time0.is_finite() {
+        return Ok(None);
+    }
+    let rel_days: Vec<f64> = times.iter().map(|&t| (t - time0) / 86400.0).collect();
+    let pred = predict_eval_holdout(&rel_days, &obs, rel_days[holdout], config);
     Ok(Some(EvalOne {
         truth,
         pred,
@@ -4076,13 +4396,23 @@ fn valid_ratio_denominator(value: f64) -> Option<f64> {
 }
 
 fn read_sample_index(cache: &SampleCacheView, sample_idx: usize) -> Result<(usize, usize)> {
+    let (scene_id, _row, _col, n_times) = read_sample_index_record(cache, sample_idx)?;
+    Ok((scene_id, n_times))
+}
+
+fn read_sample_index_record(
+    cache: &SampleCacheView,
+    sample_idx: usize,
+) -> Result<(usize, usize, usize, usize)> {
     let start = sample_idx
         .checked_mul(4 * 8)
         .context("sample index offset overflow")?;
     let index = &cache.index[start..start + 4 * 8];
     let scene_id = read_u64_le(&index[0..8]) as usize;
+    let row = read_u64_le(&index[8..16]) as usize;
+    let col = read_u64_le(&index[16..24]) as usize;
     let n_times = read_u64_le(&index[24..32]) as usize;
-    Ok((scene_id, n_times))
+    Ok((scene_id, row, col, n_times))
 }
 
 fn read_u64_le(bytes: &[u8]) -> u64 {
@@ -4159,6 +4489,7 @@ fn main() -> Result<()> {
         Algorithm::BuildSceneCache(args) => run_build_scene_cache(args),
         Algorithm::BuildSampleCache(args) => run_build_sample_cache(args),
         Algorithm::EvalSampleCache(args) => run_eval_sample_cache(args),
+        Algorithm::SamplePixelCurve(args) => run_sample_pixel_curve(args),
         Algorithm::BatchFullScene(args) => run_batch_full_scene(args),
         Algorithm::PixelBench(args) => run_pixel_bench(args),
     }

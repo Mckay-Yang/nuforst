@@ -42,6 +42,45 @@ pub struct NufrostResult {
     pub y_scale: f64,
 }
 
+/// Result of a vector-valued NUFROST fit for one multi-band pixel.
+#[derive(Debug, Clone)]
+pub struct NufrostVectorResult {
+    /// Whether the fit succeeded.
+    pub valid: bool,
+    /// Number of input bands fitted jointly.
+    pub n_bands: usize,
+    /// Selected shared frequencies (Hz).
+    pub freqs: Vec<f64>,
+    /// Earliest valid timestamp in seconds.
+    pub t_min: f64,
+    /// Mean of relative timestamps used for trend centering.
+    pub t_rel_mean: f64,
+    /// Per-band center used before fitting.
+    pub centers: Vec<f64>,
+    /// Per-band scale used before fitting.
+    pub scales: Vec<f64>,
+    /// Multi-output coefficient matrix, shape = n_basis x n_bands.
+    pub theta: Array2<f64>,
+    /// `include_trend` flag used in fit.
+    pub include_trend: bool,
+}
+
+impl Default for NufrostVectorResult {
+    fn default() -> Self {
+        Self {
+            valid: false,
+            n_bands: 0,
+            freqs: Vec::new(),
+            t_min: f64::NAN,
+            t_rel_mean: f64::NAN,
+            centers: Vec::new(),
+            scales: Vec::new(),
+            theta: Array2::<f64>::zeros((0, 0)),
+            include_trend: true,
+        }
+    }
+}
+
 impl Default for NufrostResult {
     fn default() -> Self {
         Self {
@@ -2151,15 +2190,18 @@ pub fn nufrost_pixel(
 /// All bands share one timestamp grid, one vector NUFFT frequency set, one
 /// design matrix, and one date-level Huber weight sequence. The returned vector
 /// has one prediction per input band.
-pub fn nufrost_pixel_vector(
+pub fn nufrost_fit_pixel_vector(
     ts_days: &[f64],
     observations: &[Vec<f64>],
-    target_day: f64,
     config: &NufrostConfig,
-) -> Vec<f64> {
+) -> NufrostVectorResult {
     let n_times = ts_days.len();
     let n_bands = observations.len();
-    let mut result = vec![f64::NAN; n_bands];
+    let mut result = NufrostVectorResult {
+        n_bands,
+        include_trend: config.include_trend,
+        ..NufrostVectorResult::default()
+    };
 
     if n_times == 0 || n_bands == 0 {
         return result;
@@ -2170,7 +2212,7 @@ pub fn nufrost_pixel_vector(
         }
     }
 
-    let (ts_sec, target_sec) = maybe_days_to_seconds(ts_days, target_day);
+    let (ts_sec, _) = maybe_days_to_seconds(ts_days, ts_days[0]);
     let min_obs = config.min_obs as usize;
 
     let base_mask: Vec<bool> = (0..n_times)
@@ -2183,14 +2225,9 @@ pub fn nufrost_pixel_vector(
 
     struct VectorFit {
         row_indices: Vec<usize>,
-        t_min: f64,
-        t_rel_mean: f64,
-        freqs_sel: Vec<f64>,
         x: Array2<f64>,
         z_mat: Array2<f64>,
-        centers: Vec<f64>,
-        scales: Vec<f64>,
-        theta: Array2<f64>,
+        result: NufrostVectorResult,
     }
 
     let fit_active = |active_mask: &[bool]| -> Option<VectorFit> {
@@ -2414,14 +2451,19 @@ pub fn nufrost_pixel_vector(
 
         Some(VectorFit {
             row_indices,
-            t_min,
-            t_rel_mean,
-            freqs_sel,
             x,
             z_mat,
-            centers,
-            scales,
-            theta,
+            result: NufrostVectorResult {
+                valid: true,
+                n_bands,
+                freqs: freqs_sel,
+                t_min,
+                t_rel_mean,
+                centers,
+                scales,
+                theta,
+                include_trend: config.include_trend,
+            },
         })
     };
 
@@ -2443,7 +2485,7 @@ pub fn nufrost_pixel_vector(
             break;
         }
 
-        let z_hat = fit.x.dot(&fit.theta);
+        let z_hat = fit.x.dot(&fit.result.theta);
         let mut rms = vec![0.0f64; fit.z_mat.nrows()];
         for i in 0..fit.z_mat.nrows() {
             let mut ss = 0.0;
@@ -2511,22 +2553,54 @@ pub fn nufrost_pixel_vector(
         }
     }
 
-    let fit = match final_fit {
-        Some(fit) => fit,
+    result = match final_fit {
+        Some(fit) => fit.result,
         None => return result,
     };
 
-    let t_star_rel = target_sec - fit.t_min;
-    let mut basis = Array1::<f64>::zeros(fit.x.ncols());
+    result
+}
+
+/// Predict a multi-band NUFROST curve from a fitted vector model.
+pub fn nufrost_predict_vector_curve(
+    result: &NufrostVectorResult,
+    target_days: &[f64],
+) -> Vec<Vec<f64>> {
+    if !result.valid || result.n_bands == 0 {
+        return vec![vec![f64::NAN; target_days.len()]; result.n_bands];
+    }
+    if target_days.is_empty() {
+        return vec![Vec::new(); result.n_bands];
+    }
+    let (target_sec, _) = maybe_days_to_seconds(target_days, target_days[0]);
+    let mut curves = vec![vec![f64::NAN; target_days.len()]; result.n_bands];
+    for (t_idx, &target_sec) in target_sec.iter().enumerate() {
+        let pred = nufrost_predict_vector(result, target_sec);
+        for b in 0..result.n_bands {
+            curves[b][t_idx] = pred.get(b).copied().unwrap_or(f64::NAN);
+        }
+    }
+    curves
+}
+
+/// Predict one multi-band NUFROST value from a fitted vector model.
+pub fn nufrost_predict_vector(result: &NufrostVectorResult, target_day: f64) -> Vec<f64> {
+    if !result.valid || result.n_bands == 0 {
+        return vec![f64::NAN; result.n_bands];
+    }
+    let (_, target_sec) = maybe_days_to_seconds(&[target_day], target_day);
+    let t_star_rel = target_sec - result.t_min;
+    let ncols = result.theta.nrows();
+    let mut basis = Array1::<f64>::zeros(ncols);
     basis[0] = 1.0;
     let mut idx = 1usize;
-    if config.include_trend {
+    if result.include_trend {
         if idx < basis.len() {
-            basis[idx] = t_star_rel - fit.t_rel_mean;
+            basis[idx] = t_star_rel - result.t_rel_mean;
         }
         idx += 1;
     }
-    for &f in &fit.freqs_sel {
+    for &f in &result.freqs {
         let omega = 2.0 * PI * f;
         if idx < basis.len() {
             basis[idx] = (omega * t_star_rel).cos();
@@ -2537,13 +2611,30 @@ pub fn nufrost_pixel_vector(
         idx += 2;
     }
 
-    let z_pred = basis.dot(&fit.theta);
+    let z_pred = basis.dot(&result.theta);
 
-    for b in 0..n_bands {
-        result[b] = fit.centers[b] + z_pred[b] * fit.scales[b];
+    let mut out = vec![f64::NAN; result.n_bands];
+    for b in 0..result.n_bands {
+        out[b] = result.centers[b] + z_pred[b] * result.scales[b];
     }
 
-    result
+    out
+}
+
+/// Fit one vector-valued pixel and predict at a single target date.
+///
+/// `observations[b][i]` is the value of band `b` at timestamp `ts_days[i]`.
+/// All bands share one timestamp grid, one vector NUFFT frequency set, one
+/// design matrix, and one date-level Huber weight sequence. The returned vector
+/// has one prediction per input band.
+pub fn nufrost_pixel_vector(
+    ts_days: &[f64],
+    observations: &[Vec<f64>],
+    target_day: f64,
+    config: &NufrostConfig,
+) -> Vec<f64> {
+    let fit = nufrost_fit_pixel_vector(ts_days, observations, config);
+    nufrost_predict_vector(&fit, target_day)
 }
 
 /// Reconstruct a full raster using NUFROST.
