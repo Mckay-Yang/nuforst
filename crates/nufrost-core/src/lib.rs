@@ -2,18 +2,25 @@
 
 pub mod config;
 pub mod error;
-pub mod nufrost;
 pub mod nufft;
+pub mod nufrost;
 pub mod time;
 pub mod types;
 
 pub use config::NufrostConfig;
 pub use error::NufrostError;
-pub use nufrost::{NufrostResult, nufrost_fit_pixel, nufrost_predict, nufrost_predict_curve, nufrost_pixel, nufrost_pixel_vector,
-    compute_spectrum_direct, compute_spectrum_nufft, select_peaks_adaptive, refine_parabolic, next_even, select_frequencies,
-    reconstruct_nufrost_geotiff};
-pub use time::{find_timestamp_substring, parse_iso8601_to_epoch_seconds, to_seconds_since_start, parse_timestamps_to_epoch_seconds, parse_to_relative_days};
-pub use types::{Algorithm, TimeSeries, BandMetadata};
+pub use nufrost::{
+    compute_spectrum_direct, compute_spectrum_nufft, next_even, nufrost_fit_pixel,
+    nufrost_fit_pixel_vector, nufrost_pixel, nufrost_pixel_vector, nufrost_predict,
+    nufrost_predict_curve, nufrost_predict_vector, nufrost_predict_vector_curve,
+    reconstruct_nufrost_geotiff, refine_parabolic, select_frequencies, select_peaks_adaptive,
+    NufrostResult, NufrostVectorResult,
+};
+pub use time::{
+    find_timestamp_substring, parse_iso8601_to_epoch_seconds, parse_timestamps_to_epoch_seconds,
+    parse_to_relative_days, to_seconds_since_start,
+};
+pub use types::{Algorithm, BandMetadata, TimeSeries};
 
 /// Default valid reflectance range for Sentinel-2 L2A scaled DN values.
 ///

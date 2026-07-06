@@ -1,4 +1,6 @@
 pub mod full_scene;
+pub mod sample_cache;
+pub mod scene_cache;
 
 // gdal — raster I/O via GDAL bindings.
 // Requires libgdal system library (e.g. `brew install gdal` or conda).
@@ -11,9 +13,9 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use chrono::NaiveDateTime;
-use gdal_rs::{Dataset, DriverManager, GeoTransform, Metadata};
 use gdal_rs::raster::Buffer;
 use gdal_rs::spatial_ref::SpatialRef;
+use gdal_rs::{Dataset, DriverManager, GeoTransform, Metadata};
 use ndarray::Array2;
 
 /// Default valid reflectance range for Sentinel-2 L2A scaled DN values.
@@ -214,10 +216,13 @@ impl RasterReader {
                 (cols, rows),
                 None,
             )
-            .with_context(|| format!("Failed to read band {band_idx} window at offset ({r_off},{c_off})"))?;
+            .with_context(|| {
+                format!("Failed to read band {band_idx} window at offset ({r_off},{c_off})")
+            })?;
         let ((_bcols, _brows), data) = buf.into_shape_and_vec();
-        Array2::from_shape_vec((rows, cols), data)
-            .map_err(|e| anyhow::anyhow!("Shape mismatch reading band {band_idx} window offset: {e}"))
+        Array2::from_shape_vec((rows, cols), data).map_err(|e| {
+            anyhow::anyhow!("Shape mismatch reading band {band_idx} window offset: {e}")
+        })
     }
 
     /// Build a Sentinel-2 valid-pixel mask for a band.
@@ -272,13 +277,13 @@ impl RasterWriter {
         nodata: Option<f64>,
     ) -> Result<Self> {
         let driver = DriverManager::get_driver_by_name("GTiff")?;
-        let mut dataset = driver.create_with_band_type::<f32, _>(path.as_ref(), cols, rows, bands)?;
+        let mut dataset =
+            driver.create_with_band_type::<f32, _>(path.as_ref(), cols, rows, bands)?;
 
         dataset.set_geo_transform(geo_transform)?;
 
         if let Some(wkt) = crs_wkt {
-            let srs = SpatialRef::from_wkt(wkt)
-                .with_context(|| "Failed to parse CRS WKT")?;
+            let srs = SpatialRef::from_wkt(wkt).with_context(|| "Failed to parse CRS WKT")?;
             dataset.set_spatial_ref(&srs)?;
         }
 
@@ -356,27 +361,41 @@ pub enum RasterInputError {
     #[allow(dead_code)]
     EmptyRaster,
     /// The number of bands does not match the number of timestamps provided.
-    BandTimestampMismatch {
-        n_bands: usize,
-        n_timestamps: usize,
-    },
+    BandTimestampMismatch { n_bands: usize, n_timestamps: usize },
     /// The raster spatial dimensions are zero.
     ZeroSize { rows: usize, cols: usize },
     /// A band description could not be parsed as a timestamp.
     #[allow(dead_code)]
-    InvalidBandTimestamp { band_idx: usize, description: String },
+    InvalidBandTimestamp {
+        band_idx: usize,
+        description: String,
+    },
 }
 
 impl std::fmt::Display for RasterInputError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmptyRaster => write!(f, "raster has no bands"),
-            Self::BandTimestampMismatch { n_bands, n_timestamps } => {
-                write!(f, "band count ({n_bands}) != timestamp count ({n_timestamps})")
+            Self::BandTimestampMismatch {
+                n_bands,
+                n_timestamps,
+            } => {
+                write!(
+                    f,
+                    "band count ({n_bands}) != timestamp count ({n_timestamps})"
+                )
             }
-            Self::ZeroSize { rows, cols } => write!(f, "raster has zero spatial size ({rows}r × {cols}c)"),
-            Self::InvalidBandTimestamp { band_idx, description } => {
-                write!(f, "band {band_idx} description is not a valid timestamp: '{description}'")
+            Self::ZeroSize { rows, cols } => {
+                write!(f, "raster has zero spatial size ({rows}r × {cols}c)")
+            }
+            Self::InvalidBandTimestamp {
+                band_idx,
+                description,
+            } => {
+                write!(
+                    f,
+                    "band {band_idx} description is not a valid timestamp: '{description}'"
+                )
             }
         }
     }
@@ -403,13 +422,14 @@ pub fn extract_timestamps_from_band_descriptions(
 
     let mut epoch_secs = Vec::with_capacity(n);
     for b in 1..=n {
-        let band = reader
-            .dataset
-            .rasterband(b)
-            .map_err(|_| RasterInputError::InvalidBandTimestamp {
-                band_idx: b,
-                description: String::from("<unavailable>"),
-            })?;
+        let band =
+            reader
+                .dataset
+                .rasterband(b)
+                .map_err(|_| RasterInputError::InvalidBandTimestamp {
+                    band_idx: b,
+                    description: String::from("<unavailable>"),
+                })?;
         let desc = band.description().unwrap_or_default();
         let desc = desc.trim();
 
@@ -507,7 +527,9 @@ pub fn collapse_duplicate_timestamps(
 /// [`extract_timestamps_from_band_descriptions`] to parse real GDAL band
 /// descriptions.
 #[doc(hidden)]
-#[deprecated(note = "use extract_timestamps_from_band_descriptions for full-scene; this is test-only")]
+#[deprecated(
+    note = "use extract_timestamps_from_band_descriptions for full-scene; this is test-only"
+)]
 pub fn synthetic_timestamps_from_bands(n_bands: usize) -> (Vec<f64>, f64) {
     let days: Vec<f64> = (0..n_bands).map(|i| i as f64).collect();
     let target = days[days.len() - 1];
@@ -640,20 +662,22 @@ pub fn read_all_bands(reader: &RasterReader) -> Result<ndarray::Array3<f64>> {
             cols as i32,
             rows as i32,
             data.as_mut_ptr() as *mut std::ffi::c_void,
-            cols as i32,      // nBXSize — pixels per scanline in buffer
-            rows as i32,      // nBYSize — number of scanlines per band in buffer
+            cols as i32, // nBXSize — pixels per scanline in buffer
+            rows as i32, // nBYSize — number of scanlines per band in buffer
             gdal_sys::GDALDataType::GDT_Float64,
             n_bands as i32,
             band_map.as_ptr(),
-            std::mem::size_of::<f64>() as gdal_sys::GSpacing,           // nPixelSpace
-            (cols * std::mem::size_of::<f64>()) as gdal_sys::GSpacing,  // nLineSpace
+            std::mem::size_of::<f64>() as gdal_sys::GSpacing, // nPixelSpace
+            (cols * std::mem::size_of::<f64>()) as gdal_sys::GSpacing, // nLineSpace
             (rows * cols * std::mem::size_of::<f64>()) as gdal_sys::GSpacing, // nBandSpace
             std::ptr::null_mut(),
         )
     };
     if rv != gdal_sys::CPLErr::CE_None {
         // Don't leak: forget the set_len allocation
-        unsafe { data.set_len(0); }
+        unsafe {
+            data.set_len(0);
+        }
         anyhow::bail!("GDALDatasetRasterIOEx failed");
     }
     // data already has correct length from set_len
@@ -708,7 +732,9 @@ pub fn read_all_bands_window_offset(
     let r = window_rows.min(rows.saturating_sub(r_off));
     let c = window_cols.min(cols.saturating_sub(c_off));
     if r == 0 || c == 0 {
-        anyhow::bail!("window has zero dimensions ({r}r × {c}c) at offset ({row_offset},{col_offset})");
+        anyhow::bail!(
+            "window has zero dimensions ({r}r × {c}c) at offset ({row_offset},{col_offset})"
+        );
     }
     let mut cube = ndarray::Array3::<f64>::zeros((n_bands, r, c));
     for b in 0..n_bands {
@@ -840,14 +866,20 @@ mod tests {
         let cols = 3;
         // Write a band with known valid/invalid values
         {
-            let mut writer = RasterWriter::create(path, rows, cols, 1, &DEFAULT_GEO, None, None)
-                .unwrap();
+            let mut writer =
+                RasterWriter::create(path, rows, cols, 1, &DEFAULT_GEO, None, None).unwrap();
             let data = Array2::from_shape_vec(
                 (rows, cols),
                 vec![
-                    500.0, f64::NAN, 0.0,
-                    10000.0, 3000.0, -1.0,
-                    1.0, 9999.0, f64::INFINITY,
+                    500.0,
+                    f64::NAN,
+                    0.0,
+                    10000.0,
+                    3000.0,
+                    -1.0,
+                    1.0,
+                    9999.0,
+                    f64::INFINITY,
                 ],
             )
             .unwrap();
@@ -858,15 +890,15 @@ mod tests {
         let r = RasterReader::open(path).unwrap();
         let mask = r.read_valid_mask(1).unwrap();
 
-        assert!(mask[[0, 0]]);   // 500 — valid
-        assert!(!mask[[0, 1]]);  // NaN — invalid
-        assert!(!mask[[0, 2]]);  // 0 — invalid (<= 0)
-        assert!(!mask[[1, 0]]);  // 10000 — invalid (>= 10000)
-        assert!(mask[[1, 1]]);   // 3000 — valid
-        assert!(!mask[[1, 2]]);  // -1 — invalid
-        assert!(mask[[2, 0]]);   // 1 — valid
-        assert!(mask[[2, 1]]);   // 9999 — valid
-        assert!(!mask[[2, 2]]);  // inf — invalid
+        assert!(mask[[0, 0]]); // 500 — valid
+        assert!(!mask[[0, 1]]); // NaN — invalid
+        assert!(!mask[[0, 2]]); // 0 — invalid (<= 0)
+        assert!(!mask[[1, 0]]); // 10000 — invalid (>= 10000)
+        assert!(mask[[1, 1]]); // 3000 — valid
+        assert!(!mask[[1, 2]]); // -1 — invalid
+        assert!(mask[[2, 0]]); // 1 — valid
+        assert!(mask[[2, 1]]); // 9999 — valid
+        assert!(!mask[[2, 2]]); // inf — invalid
 
         let _ = fs::remove_file(path);
     }
@@ -895,12 +927,12 @@ mod tests {
         let geo = [100000.0, 30.0, 0.0, 5000000.0, 0.0, -30.0];
         let wkt = r#"GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563,AUTHORITY["EPSG","7030"]],AUTHORITY["EPSG","6326"]],PRIMEM["Greenwich",0,AUTHORITY["EPSG","8901"]],UNIT["degree",0.0174532925199433,AUTHORITY["EPSG","9122"]],AUTHORITY["EPSG","4326"]]"#;
 
-        let data = Array2::from_shape_vec((rows, cols), (0..(rows * cols)).map(|v| v as f64).collect()).unwrap();
+        let data =
+            Array2::from_shape_vec((rows, cols), (0..(rows * cols)).map(|v| v as f64).collect())
+                .unwrap();
 
-        let mut w = RasterWriter::create(
-            &path, rows, cols, 1, &geo, Some(wkt), Some(-9999.0),
-        )
-        .unwrap();
+        let mut w =
+            RasterWriter::create(&path, rows, cols, 1, &geo, Some(wkt), Some(-9999.0)).unwrap();
         w.write_band(1, &data).unwrap();
         w.flush().unwrap();
     }
@@ -929,14 +961,23 @@ mod tests {
         n_timestamps: usize,
     ) -> Result<()> {
         use std::f64::consts::PI;
-        let mut writer = RasterWriter::create(path, rows, cols, n_timestamps, &DEFAULT_GEO, None, Some(f64::NAN))?;
+        let mut writer = RasterWriter::create(
+            path,
+            rows,
+            cols,
+            n_timestamps,
+            &DEFAULT_GEO,
+            None,
+            Some(f64::NAN),
+        )?;
         for b in 0..n_timestamps {
             let t = b as f64;
             let mut arr = Array2::<f64>::zeros((rows, cols));
             for r in 0..rows {
                 for c in 0..cols {
                     let spatial = ((r + c) as f64) * 10.0;
-                    arr[[r, c]] = spatial + 100.0 * (2.0 * PI * t / n_timestamps as f64).sin() + 500.0;
+                    arr[[r, c]] =
+                        spatial + 100.0 * (2.0 * PI * t / n_timestamps as f64).sin() + 500.0;
                 }
             }
             writer.write_band(b + 1, &arr)?;
@@ -946,18 +987,19 @@ mod tests {
     }
 
     /// Verify output GeoTIFF band count and spatial shape.
-    fn _check_output(path: &Path, expected_rows: usize, expected_cols: usize, expected_bands: usize) {
+    fn _check_output(
+        path: &Path,
+        expected_rows: usize,
+        expected_cols: usize,
+        expected_bands: usize,
+    ) {
         let r = RasterReader::open(path).unwrap();
         assert_eq!(
             r.shape(),
             (expected_rows, expected_cols),
             "output shape mismatch"
         );
-        assert_eq!(
-            r.band_count(),
-            expected_bands,
-            "output band count mismatch"
-        );
+        assert_eq!(r.band_count(), expected_bands, "output band count mismatch");
     }
 
     #[allow(deprecated)]
@@ -980,16 +1022,24 @@ mod tests {
         let cube = read_all_bands(&reader).unwrap();
         let (t_days, target_t) = synthetic_test_timestamps(reader.band_count());
 
-        reconstruct_single_band(&cube, &t_days, target_t, output, &meta, |_ts, obs, _target| {
-            obs.iter().sum::<f64>() / obs.len() as f64
-        })
+        reconstruct_single_band(
+            &cube,
+            &t_days,
+            target_t,
+            output,
+            &meta,
+            |_ts, obs, _target| obs.iter().sum::<f64>() / obs.len() as f64,
+        )
         .unwrap();
 
         _check_output(output, 5, 5, 1);
         let out_r = RasterReader::open(output).unwrap();
         let out_data = out_r.read_band(1).unwrap();
         let n_finite = out_data.iter().filter(|v| v.is_finite()).count();
-        assert!(n_finite > 0, "generic output should have finite predictions; got {n_finite}");
+        assert!(
+            n_finite > 0,
+            "generic output should have finite predictions; got {n_finite}"
+        );
 
         let _ = fs::remove_file(input);
         let _ = fs::remove_file(output);
@@ -1006,12 +1056,23 @@ mod tests {
         }
 
         let reader = RasterReader::open(path).unwrap();
-        let meta = RasterMetadata { geo_transform: DEFAULT_GEO, crs_wkt: None, nodata: Some(f64::NAN) };
+        let meta = RasterMetadata {
+            geo_transform: DEFAULT_GEO,
+            crs_wkt: None,
+            nodata: Some(f64::NAN),
+        };
         let cube = read_all_bands(&reader).unwrap();
         let (t_days, target_t) = synthetic_test_timestamps(reader.band_count());
 
         let output = Path::new("test_out_empty.tif");
-        let result = reconstruct_single_band(&cube, &t_days, target_t, output, &meta, |_ts, _obs, _target| f64::NAN);
+        let result = reconstruct_single_band(
+            &cube,
+            &t_days,
+            target_t,
+            output,
+            &meta,
+            |_ts, _obs, _target| f64::NAN,
+        );
         assert!(result.is_ok(), "NAN-only input should still produce output");
 
         let out_r = RasterReader::open(output).unwrap();
@@ -1029,7 +1090,8 @@ mod tests {
         let cols = 9;
         // Write a single band where each pixel's value encodes its (row, col).
         {
-            let mut writer = RasterWriter::create(path, rows, cols, 1, &DEFAULT_GEO, None, None).unwrap();
+            let mut writer =
+                RasterWriter::create(path, rows, cols, 1, &DEFAULT_GEO, None, None).unwrap();
             let mut data = Array2::<f64>::zeros((rows, cols));
             for r in 0..rows {
                 for c in 0..cols {
@@ -1058,7 +1120,8 @@ mod tests {
             for wc in 0..ws {
                 let expected = ((row_off + wr) * 100 + (col_off + wc)) as f64;
                 assert_eq!(
-                    band[[wr, wc]], expected,
+                    band[[wr, wc]],
+                    expected,
                     "centered window mismatch at window ({wr},{wc})"
                 );
             }

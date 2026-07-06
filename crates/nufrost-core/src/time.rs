@@ -67,10 +67,7 @@ pub fn to_seconds_since_start(epoch_seconds: &[f64]) -> Vec<f64> {
     if epoch_seconds.is_empty() {
         return Vec::new();
     }
-    let t0 = epoch_seconds
-        .iter()
-        .copied()
-        .fold(f64::INFINITY, f64::min);
+    let t0 = epoch_seconds.iter().copied().fold(f64::INFINITY, f64::min);
     epoch_seconds.iter().map(|t| t - t0).collect()
 }
 
@@ -78,14 +75,11 @@ pub fn to_seconds_since_start(epoch_seconds: &[f64]) -> Vec<f64> {
 /// each entry that could be parsed, or an error if any entry fails.
 ///
 /// This is the Rust equivalent of Python's `timestamps_to_seconds()`.
-pub fn parse_timestamps_to_epoch_seconds(
-    timestamps: &[&str],
-) -> Result<Vec<f64>, NufrostError> {
+pub fn parse_timestamps_to_epoch_seconds(timestamps: &[&str]) -> Result<Vec<f64>, NufrostError> {
     let mut out = Vec::with_capacity(timestamps.len());
     for ts in timestamps {
-        let epoch = parse_iso8601_to_epoch_seconds(ts).ok_or_else(|| {
-            NufrostError::InvalidTimestamp(ts.to_string())
-        })?;
+        let epoch = parse_iso8601_to_epoch_seconds(ts)
+            .ok_or_else(|| NufrostError::InvalidTimestamp(ts.to_string()))?;
         out.push(epoch);
     }
     Ok(out)
@@ -95,9 +89,7 @@ pub fn parse_timestamps_to_epoch_seconds(
 ///
 /// Returns (epoch_seconds, relative_days) where relative_days is
 /// `(epoch_seconds - min(epoch_seconds)) / 86 400.0`.
-pub fn parse_to_relative_days(
-    timestamps: &[&str],
-) -> Result<(Vec<f64>, Vec<f64>), NufrostError> {
+pub fn parse_to_relative_days(timestamps: &[&str]) -> Result<(Vec<f64>, Vec<f64>), NufrostError> {
     let epoch = parse_timestamps_to_epoch_seconds(timestamps)?;
     if epoch.is_empty() {
         return Ok((vec![], vec![]));
@@ -154,10 +146,7 @@ mod tests {
 
     #[test]
     fn parse_to_relative_days_basic() {
-        let timestamps = &[
-            "20171221T035139",
-            "20180105T035139",
-        ];
+        let timestamps = &["20171221T035139", "20180105T035139"];
         let (epoch, rel_days) = parse_to_relative_days(timestamps).unwrap();
         assert!(rel_days[0].abs() < 1e-10);
         // 15 days difference (Dec 21 → Jan 5, same-second)

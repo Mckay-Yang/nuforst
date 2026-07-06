@@ -12,20 +12,26 @@
 - `crates/nufrost-core`: NUFROST algorithm and NUFFT/fitting logic.
 - `crates/hants-core`: HANTS baseline algorithm.
 - `crates/zhu2015-core`: Zhu2015 baseline algorithm.
-- `crates/cli`: command-line entrypoint.
-- `crates/nufrost-py`: optional PyO3 bindings.
+- `crates/nufrost-cli`: command-line entrypoint.
 
 Dependency direction:
 
 - `gdal` is independent and must not depend on algorithm crates.
 - `nufrost-core`, `hants-core`, and `zhu2015-core` may depend on `gdal`.
-- `cli` depends on `gdal` and all three algorithm crates.
+- `nufrost-cli` depends on `gdal` and all three algorithm crates.
 
 ## Config And Data
 
 - Runtime algorithm defaults are JSON files under `config/`.
 - Rust parity fixtures live under `tests/fixtures/rust_parity/`.
 - Real imagery and generated outputs live under `data/`.
+
+## Testing Layout
+
+- Keep source-level unit tests next to the source they exercise, inside `#[cfg(test)] mod tests`.
+- Put integration tests under the repository-level `tests/` directory.
+- Put integration-test input and output data under `tests/data/`.
+- Keep `tests/data/` structurally aligned with the runtime `data/` root. For example, Sentinel-2 raw fixtures should live under `tests/data/raw/sentinel-2/16-sites/`, cache outputs under `tests/data/cache/...`, and product-like outputs under `tests/data/products/...` or `tests/data/tests/...` depending on whether they are accepted fixtures or candidate test outputs.
 
 ## Output And Verification
 

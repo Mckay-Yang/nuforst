@@ -179,6 +179,91 @@ pub fn type1_spectrum_kb(
     (freqs, power)
 }
 
+/// Paper-style gridded type-1 NUFFT power for vector-valued observations.
+///
+/// `y_by_dim[d][j]` is dimension/band `d` at non-uniform time `t_rel[j]`.
+/// All dimensions share the same spread indices, Kaiser-Bessel weights, FFT
+/// grid size, and kernel deconvolution. The returned power is the squared
+/// vector spectrum norm:
+///
+/// ```text
+/// P_k = Σ_d |F_{k,d}|²
+/// ```
+pub fn type1_vector_power_kb(
+    t_rel: &[f64],
+    y_by_dim: &[Vec<f64>],
+    modes: usize,
+    opts: NufftOptions,
+) -> (Vec<f64>, Vec<f64>) {
+    let n = t_rel.len();
+    let dims = y_by_dim.len();
+    if n == 0 || dims == 0 || y_by_dim.iter().any(|y| y.len() != n) {
+        return (Vec::new(), Vec::new());
+    }
+
+    let t_min = t_rel.iter().copied().fold(f64::INFINITY, f64::min);
+    let t_max = t_rel.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let tspan = t_max - t_min;
+    if tspan <= 0.0 || !tspan.is_finite() {
+        return (vec![0.0], vec![0.0]);
+    }
+
+    let m = next_even(modes);
+    let nf = next_power_of_two_at_least(((m as f64) * opts.oversamp.max(1.25)).ceil() as usize);
+    let width = opts.kernel_width.max(2);
+    let half_width = 0.5 * width as f64;
+
+    let mut grids = vec![vec![C64::default(); nf]; dims];
+    for j in 0..n {
+        let ti = t_rel[j];
+        if !ti.is_finite() {
+            continue;
+        }
+        let x = 2.0 * PI * (ti - t_min) / tspan - PI;
+        let u = x * (nf as f64) / (2.0 * PI);
+        let center = u.round() as isize;
+
+        for offset in -(width as isize)..=(width as isize) {
+            let idx_i = center + offset;
+            let dist = u - idx_i as f64;
+            if dist.abs() > half_width {
+                continue;
+            }
+            let idx = idx_i.rem_euclid(nf as isize) as usize;
+            let w = kaiser_bessel(dist / half_width, opts.beta);
+            for d in 0..dims {
+                let y = y_by_dim[d][j];
+                if y.is_finite() {
+                    grids[d][idx] += C64::new(y, 0.0).scale(w);
+                }
+            }
+        }
+    }
+
+    let kernel_hat = kernel_fft(nf, width, opts.beta);
+    for grid in &mut grids {
+        fft_forward(grid);
+    }
+
+    let n_pos = m / 2;
+    let mut freqs = Vec::with_capacity(n_pos);
+    let mut power = vec![0.0; n_pos];
+
+    for k in 0..n_pos {
+        let kh = kernel_hat[k];
+        freqs.push(k as f64 / tspan);
+        if kh.abs2() <= 1e-24 {
+            continue;
+        }
+        for grid in &grids {
+            let fk = grid[k].div(kh);
+            power[k] += fk.abs2();
+        }
+    }
+
+    (freqs, power)
+}
+
 /// Direct type-1 non-uniform Fourier spectrum using Python/FINUFFT mode order.
 ///
 /// Python computes:
@@ -271,8 +356,7 @@ fn bessel_i0(x: f64) -> f64 {
         1.0 + y
             * (3.5156229
                 + y * (3.0899424
-                    + y * (1.2067492
-                        + y * (0.2659732 + y * (0.0360768 + y * 0.0045813)))))
+                    + y * (1.2067492 + y * (0.2659732 + y * (0.0360768 + y * 0.0045813)))))
     } else {
         let y = 3.75 / ax;
         (ax.exp() / ax.sqrt())
@@ -282,8 +366,7 @@ fn bessel_i0(x: f64) -> f64 {
                         + y * (-0.00157565
                             + y * (0.00916281
                                 + y * (-0.02057706
-                                    + y * (0.02635537
-                                        + y * (-0.01647633 + y * 0.00392377))))))))
+                                    + y * (0.02635537 + y * (-0.01647633 + y * 0.00392377))))))))
     }
 }
 
@@ -392,5 +475,28 @@ mod tests {
         let non_dc_peak = power.iter().skip(1).copied().fold(0.0, f64::max);
         assert!(non_dc_peak.is_finite());
         assert!(non_dc_peak > 0.0);
+    }
+
+    #[test]
+    fn vector_power_matches_sum_of_scalar_powers() {
+        let t: Vec<f64> = (0..32).map(|i| i as f64 * 86400.0 * 6.0).collect();
+        let y1: Vec<f64> = t
+            .iter()
+            .map(|&ti| (2.0 * PI * ti / (90.0 * 86400.0)).sin())
+            .collect();
+        let y2: Vec<f64> = t
+            .iter()
+            .map(|&ti| 0.5 * (2.0 * PI * ti / (120.0 * 86400.0)).cos())
+            .collect();
+        let opts = NufftOptions::default();
+        let (fv, pv) = type1_vector_power_kb(&t, &[y1.clone(), y2.clone()], 128, opts);
+        let (f1, p1) = type1_spectrum_kb(&t, &y1, 128, 1.0, opts);
+        let (f2, p2) = type1_spectrum_kb(&t, &y2, 128, 1.0, opts);
+
+        assert_eq!(fv, f1);
+        assert_eq!(fv, f2);
+        for i in 0..pv.len() {
+            assert!((pv[i] - (p1[i] + p2[i])).abs() < 1e-8);
+        }
     }
 }
