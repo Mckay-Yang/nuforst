@@ -761,13 +761,13 @@ def main() -> None:
     parser.add_argument(
         "--recon-root",
         type=Path,
-        default=Path("data/output/sentinel-2_recon"),
+        default=Path("data/products/reconstruction/sentinel-2_recon"),
         help="Root directory containing per-location reconstruction outputs.",
     )
     parser.add_argument(
         "--summary-root",
         type=Path,
-        default=Path("data/output/evaluation"),
+        default=Path("data/assets/records/reconstruction_evaluation"),
         help="Directory for evaluation_summary.csv and evaluation_summary.md.",
     )
     parser.add_argument(

@@ -5,7 +5,7 @@ for these sweeps.
 
 Sample cache:
 
-- `data/cache/samples/sentinel-2_v1_5m`
+- `data/cache/sentinel-2/100k`
 - seed: `20260609`
 - `min_joint_valid=12`
 - main validation size: `100000`

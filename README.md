@@ -552,7 +552,7 @@ cargo run --release -p nufrost-cli -- full-scene \
   --lon 94.2605 \
   --lat 29.7733 \
   --data-root data \
-  --output-root data/output
+  --output-root data/products/reconstruction
 ```
 
 One-pixel timing and RMSE smoke test:

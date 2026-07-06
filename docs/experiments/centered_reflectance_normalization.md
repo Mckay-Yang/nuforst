@@ -63,13 +63,13 @@ The centered-reflectance experiment was run on the previous full-scene validatio
 Experiment output root:
 
 ```text
-data/output/experiments/centered_reflectance_all_20260621
+data/tests/experiments/centered_reflectance_all_20260621
 ```
 
 Preview image:
 
 ```text
-data/output/experiments/centered_reflectance_all_20260621/preview_rgb_contact_sheet.png
+data/tests/experiments/centered_reflectance_all_20260621/preview_rgb_contact_sheet.png
 ```
 
 Overall weighted metrics across 14 scenes:
@@ -104,7 +104,7 @@ For `115.8977_33.0074`, centered reflectance reduced NUFROST error relative to p
 Negative and extreme-value diagnostics were saved at:
 
 ```text
-data/output/experiments/centered_reflectance_all_20260621/negative_extreme_stats.csv
+data/tests/experiments/centered_reflectance_all_20260621/negative_extreme_stats.csv
 ```
 
 Global negative ratios for centered reflectance:
@@ -122,13 +122,12 @@ Compared with plain reflectance scaling, centered reflectance substantially redu
 
 ## Cache Note After Imagery Replacement
 
-After the Sentinel-2 imagery was replaced under `data/sentinel-2`, old derived caches were removed:
+After the Sentinel-2 imagery was replaced under `data/raw/sentinel-2/16-sites`, old derived caches were removed:
 
 ```text
-data/cache/local/vrts
-data/cache/scenes/sentinel-2
-data/cache/samples
+data/cache/sentinel-2/16-sites/vrt
+data/cache/sentinel-2/16-sites
+data/cache/sentinel-2/100k
 ```
 
 The new imagery was not cached because the available GeoTIFF files did not have aligned band dimensions for any complete 6-band location. The cache should be rebuilt only after the imagery is re-exported with a consistent AOI and pixel grid across B2, B3, B4, B8, B11, and B12.
-

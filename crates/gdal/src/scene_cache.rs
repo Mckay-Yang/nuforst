@@ -63,9 +63,35 @@ pub fn default_scene_cache_dir(
     lon: f64,
     lat: f64,
 ) -> PathBuf {
-    cache_root
-        .join(safe_cache_component(source_name))
-        .join(full_scene::location_output_token(lon, lat))
+    let source_component = safe_cache_component(source_name);
+    let root = if cache_root
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        == Some(source_component.as_str())
+    {
+        cache_root.to_path_buf()
+    } else {
+        cache_root.join(source_component)
+    };
+    root.join(full_scene::location_output_token(lon, lat))
+}
+
+fn source_data_dir(data_root: &Path, source_name: &str) -> PathBuf {
+    let preferred = data_root.join("raw").join(source_name).join("16-sites");
+    if preferred.is_dir() {
+        preferred
+    } else {
+        data_root.join(source_name)
+    }
+}
+
+fn scene_vrt_dir(data_root: &Path, source_name: &str) -> PathBuf {
+    data_root
+        .join("cache")
+        .join(source_name)
+        .join("16-sites")
+        .join("vrt")
 }
 
 pub fn load_or_build_scene_cache(
@@ -479,7 +505,7 @@ fn resolve_full_scene_band_stacks(
     lat: f64,
 ) -> Result<BTreeMap<String, Vec<PathBuf>>> {
     let mut band_stacks = discover_full_scene_band_stacks(data_root, source_name, lon, lat)?;
-    let vrt_dir = data_root.join("cache").join("local").join("vrts");
+    let vrt_dir = scene_vrt_dir(data_root, source_name);
     let loc_token6 = full_scene::location_output_token(lon, lat);
     for (band_name, paths) in band_stacks.iter_mut() {
         if paths.len() <= 1 {
@@ -505,7 +531,7 @@ fn discover_full_scene_band_stacks(
     lon: f64,
     lat: f64,
 ) -> Result<BTreeMap<String, Vec<PathBuf>>> {
-    let source_dir = data_root.join(source_name);
+    let source_dir = source_data_dir(data_root, source_name);
     let band_stacks = discover_sentinel_band_stacks(&source_dir, lon, lat)?;
     if band_stacks.is_empty() {
         bail!(

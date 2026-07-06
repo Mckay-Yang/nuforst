@@ -70,7 +70,7 @@ missfont.log
 # ===== Data & Cache =====
 /data/
 tests/data/cache/
-tests/data/output/
+tests/data/tmp/
 cache/
 bak/
 database/

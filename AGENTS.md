@@ -26,6 +26,13 @@ Dependency direction:
 - Rust parity fixtures live under `tests/fixtures/rust_parity/`.
 - Real imagery and generated outputs live under `data/`.
 
+## Testing Layout
+
+- Keep source-level unit tests next to the source they exercise, inside `#[cfg(test)] mod tests`.
+- Put integration tests under the repository-level `tests/` directory.
+- Put integration-test input and output data under `tests/data/`.
+- Keep `tests/data/` structurally aligned with the runtime `data/` root. For example, Sentinel-2 raw fixtures should live under `tests/data/raw/sentinel-2/16-sites/`, cache outputs under `tests/data/cache/...`, and product-like outputs under `tests/data/products/...` or `tests/data/tests/...` depending on whether they are accepted fixtures or candidate test outputs.
+
 ## Output And Verification
 
 - Use `cargo check --workspace` for compile verification.

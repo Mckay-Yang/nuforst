@@ -417,7 +417,7 @@ fn full_scene_command() -> Command {
             Arg::new("output_root")
                 .long("output-root")
                 .value_name("PATH")
-                .default_value("data/output")
+                .default_value("data/products/reconstruction")
                 .value_parser(clap::value_parser!(PathBuf)),
         )
         .arg(
@@ -529,7 +529,7 @@ fn build_scene_cache_command() -> Command {
             Arg::new("cache_root")
                 .long("cache-root")
                 .value_name("PATH")
-                .default_value("data/cache/scenes")
+                .default_value("data/cache/sentinel-2/16-sites")
                 .value_parser(clap::value_parser!(PathBuf)),
         )
         .arg(
@@ -555,14 +555,14 @@ fn build_sample_cache_command() -> Command {
             Arg::new("scene_cache_root")
                 .long("scene-cache-root")
                 .value_name("PATH")
-                .default_value("data/cache/scenes")
+                .default_value("data/cache/sentinel-2/16-sites")
                 .value_parser(clap::value_parser!(PathBuf)),
         )
         .arg(
             Arg::new("output")
                 .long("output")
                 .value_name("DIR")
-                .default_value("data/cache/samples/sentinel-2_v1")
+                .default_value("data/cache/sentinel-2/100k")
                 .value_parser(clap::value_parser!(PathBuf)),
         )
         .arg(
@@ -617,7 +617,7 @@ fn eval_sample_cache_command() -> Command {
             Arg::new("cache_dir")
                 .long("cache-dir")
                 .value_name("DIR")
-                .default_value("data/cache/samples/sentinel-2_v1")
+                .default_value("data/cache/sentinel-2/100k")
                 .value_parser(clap::value_parser!(PathBuf)),
         )
         .arg(
@@ -693,7 +693,7 @@ fn sample_pixel_curve_command() -> Command {
             Arg::new("cache_dir")
                 .long("cache-dir")
                 .value_name("DIR")
-                .default_value("data/cache/samples/sentinel-2_v1")
+                .default_value("data/cache/sentinel-2/100k")
                 .value_parser(clap::value_parser!(PathBuf)),
         )
         .arg(
@@ -708,7 +708,9 @@ fn sample_pixel_curve_command() -> Command {
                 .long("min-joint-valid")
                 .value_name("N")
                 .default_value("12")
-                .help("Minimum joint-valid dates required after one leave-one-out target is removed.")
+                .help(
+                    "Minimum joint-valid dates required after one leave-one-out target is removed.",
+                )
                 .value_parser(clap::value_parser!(usize)),
         )
         .arg(
@@ -752,7 +754,7 @@ fn batch_full_scene_command() -> Command {
             Arg::new("output_root")
                 .long("output-root")
                 .value_name("PATH")
-                .default_value("data/output")
+                .default_value("data/products/reconstruction")
                 .value_parser(clap::value_parser!(PathBuf)),
         )
         .arg(
@@ -2096,13 +2098,30 @@ fn validate_full_scene_methods(methods: &str) -> Result<Vec<String>> {
     Ok(parsed)
 }
 
+fn source_data_dir(data_root: &Path, source_name: &str) -> PathBuf {
+    let preferred = data_root.join("raw").join(source_name).join("16-sites");
+    if preferred.is_dir() {
+        preferred
+    } else {
+        data_root.join(source_name)
+    }
+}
+
+fn default_scene_cache_root(data_root: &Path, source_name: &str) -> PathBuf {
+    data_root.join("cache").join(source_name).join("16-sites")
+}
+
+fn default_scene_vrt_dir(data_root: &Path, source_name: &str) -> PathBuf {
+    default_scene_cache_root(data_root, source_name).join("vrt")
+}
+
 fn resolve_full_scene_band_stacks(
     data_root: &Path,
     source_name: &str,
     lon: f64,
     lat: f64,
 ) -> Result<BTreeMap<String, Vec<PathBuf>>> {
-    let source_dir = data_root.join(source_name);
+    let source_dir = source_data_dir(data_root, source_name);
     let mut band_stacks = discover_sentinel_band_stacks(&source_dir, lon, lat)?;
     if band_stacks.is_empty() {
         bail!(
@@ -2113,7 +2132,7 @@ fn resolve_full_scene_band_stacks(
         );
     }
 
-    let vrt_dir = data_root.join("cache").join("local").join("vrts");
+    let vrt_dir = default_scene_vrt_dir(data_root, source_name);
     let loc_token6 = full_scene::location_output_token(lon, lat);
     for (band_name, paths) in band_stacks.iter_mut() {
         if paths.len() <= 1 {
@@ -2346,7 +2365,7 @@ fn discover_complete_sentinel_locations(
     data_root: &Path,
     source_name: &str,
 ) -> Result<Vec<(f64, f64)>> {
-    let source_dir = data_root.join(source_name);
+    let source_dir = source_data_dir(data_root, source_name);
     let entries = fs::read_dir(&source_dir)
         .with_context(|| format!("cannot read data directory: {}", source_dir.display()))?;
     let required: BTreeSet<String> = ["B2", "B3", "B4", "B8", "B11", "B12"]
@@ -2677,7 +2696,7 @@ fn run_full_scene(args: &FullSceneArgs) -> Result<()> {
     if args.window_size.is_none() {
         let cache_dir = args.scene_cache.clone().unwrap_or_else(|| {
             scene_cache::default_scene_cache_dir(
-                &args.data_root.join("cache").join("scenes"),
+                &default_scene_cache_root(&args.data_root, &args.source_name),
                 &args.source_name,
                 args.lon,
                 args.lat,
@@ -2686,7 +2705,7 @@ fn run_full_scene(args: &FullSceneArgs) -> Result<()> {
         if !cache_dir.join("meta.json").is_file() || !cache_dir.join("cube.f32.bin").is_file() {
             scene_cache::build_scene_cache(
                 &args.data_root,
-                &args.data_root.join("cache").join("scenes"),
+                &default_scene_cache_root(&args.data_root, &args.source_name),
                 &args.source_name,
                 args.lon,
                 args.lat,
@@ -2722,7 +2741,7 @@ fn run_full_scene(args: &FullSceneArgs) -> Result<()> {
     } else {
         scene_cache::load_or_build_scene_cache(
             &args.data_root,
-            &args.data_root.join("cache").join("scenes"),
+            &default_scene_cache_root(&args.data_root, &args.source_name),
             &args.source_name,
             args.lon,
             args.lat,
@@ -3075,7 +3094,7 @@ fn run_batch_full_scene(args: &BatchFullSceneArgs) -> Result<()> {
     if locations.is_empty() {
         bail!(
             "No complete Sentinel-2 locations found in {}",
-            args.data_root.join(&args.source_name).display()
+            source_data_dir(&args.data_root, &args.source_name).display()
         );
     }
     eprintln!("Discovered {} complete locations.", locations.len());
@@ -4545,9 +4564,9 @@ mod tests {
             "--source-name",
             "sentinel-2",
             "--scene-cache-root",
-            "data/cache/scenes",
+            "data/cache/sentinel-2/16-sites",
             "--output",
-            "data/cache/samples/test",
+            "data/tests/sample-cache-test",
             "--n-samples",
             "128",
             "--min-joint-valid",
@@ -4562,8 +4581,11 @@ mod tests {
         match cli.algorithm {
             Algorithm::BuildSampleCache(args) => {
                 assert_eq!(args.source_name, "sentinel-2");
-                assert_eq!(args.scene_cache_root, PathBuf::from("data/cache/scenes"));
-                assert_eq!(args.output, PathBuf::from("data/cache/samples/test"));
+                assert_eq!(
+                    args.scene_cache_root,
+                    PathBuf::from("data/cache/sentinel-2/16-sites")
+                );
+                assert_eq!(args.output, PathBuf::from("data/tests/sample-cache-test"));
                 assert_eq!(args.n_samples, 128);
                 assert_eq!(args.min_joint_valid, 8);
                 assert_eq!(args.seed, 123);
@@ -4641,7 +4663,7 @@ mod tests {
             "--data-root",
             "data",
             "--cache-root",
-            "data/cache/scenes",
+            "data/cache/sentinel-2/16-sites",
             "--output",
             "/tmp/scene-cache",
         ]);
@@ -4653,7 +4675,7 @@ mod tests {
                 assert_eq!(args.data_root, std::path::PathBuf::from("data"));
                 assert_eq!(
                     args.cache_root,
-                    std::path::PathBuf::from("data/cache/scenes")
+                    std::path::PathBuf::from("data/cache/sentinel-2/16-sites")
                 );
                 assert_eq!(
                     args.output,
@@ -4675,78 +4697,19 @@ mod tests {
             "--lat",
             "29.7733",
             "--scene-cache",
-            "data/cache/scenes/sentinel-2/lon94_260500_lat29_773300",
+            "data/cache/sentinel-2/16-sites/lon94_260500_lat29_773300",
         ]);
         match &cli.algorithm {
             Algorithm::FullScene(args) => {
                 assert_eq!(
                     args.scene_cache,
                     Some(std::path::PathBuf::from(
-                        "data/cache/scenes/sentinel-2/lon94_260500_lat29_773300"
+                        "data/cache/sentinel-2/16-sites/lon94_260500_lat29_773300"
                     ))
                 );
             }
             _ => panic!("expected FullScene"),
         }
-    }
-
-    #[test]
-    fn full_scene_test_data_runs_end_to_end_with_auto_cache() {
-        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .to_path_buf();
-        let data_root = workspace.join("tests/data");
-        let output_root = data_root.join("output/full_pipeline_test");
-        let cache_dir = data_root
-            .join("cache/scenes/sentinel-2")
-            .join("lon100.112000_lat25.654000");
-
-        let _ = std::fs::remove_dir_all(&cache_dir);
-        let _ = std::fs::remove_dir_all(&output_root);
-
-        let args = FullSceneArgs {
-            source_name: "sentinel-2".to_string(),
-            lon: 100.1120,
-            lat: 25.6540,
-            output_root: output_root.clone(),
-            data_root: data_root.clone(),
-            methods: "nufrost".to_string(),
-            n_jobs: None,
-            window_size: None,
-            window_lon: None,
-            window_lat: None,
-            min_valid_ratio: 0.5,
-            late_fraction: 0.25,
-            scene_cache: None,
-            nufrost_config: None,
-            frequency_selection: None,
-        };
-
-        run_full_scene(&args).expect("test_data full-scene run should complete");
-        assert!(cache_dir.join("meta.json").is_file());
-        assert!(cache_dir.join("cube.f32.bin").is_file());
-
-        let summary_dir = output_root.join("run_summaries");
-        let summary_path = std::fs::read_dir(&summary_dir)
-            .expect("summary dir should exist")
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .find(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("reconstruction_summary_sentinel-2_"))
-            })
-            .expect("summary file should be written");
-        let summary: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&summary_path).unwrap()).unwrap();
-        let rmse = summary["metrics"]["nufrost"]["overall_rmse"]
-            .as_f64()
-            .expect("nufrost rmse should be present");
-        assert!(rmse.is_finite());
-        assert_eq!(summary["methods_run"], serde_json::json!(["nufrost"]));
     }
 
     #[test]

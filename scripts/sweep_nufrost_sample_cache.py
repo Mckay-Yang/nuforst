@@ -199,7 +199,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--cli", type=Path, default=Path("target/release/nufrost-cli"))
     parser.add_argument("--base-config", type=Path, default=Path("config/nufrost.json"))
-    parser.add_argument("--cache-dir", type=Path, default=Path("data/cache/samples/sentinel-2_v1_5m"))
+    parser.add_argument("--cache-dir", type=Path, default=Path("data/cache/sentinel-2/100k"))
     parser.add_argument("--out-dir", type=Path, default=Path("target/parameter_sweeps_5m"))
     parser.add_argument("--result-csv", type=Path, required=True)
     parser.add_argument("--candidate-file", type=Path)

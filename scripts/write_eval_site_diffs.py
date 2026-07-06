@@ -91,12 +91,12 @@ def main() -> None:
     parser.add_argument(
         "--recon-root",
         type=Path,
-        default=Path("data/output/full_scene_all_methods_20260622_final/sentinel-2_recon"),
+        default=Path("data/products/reconstruction/sentinel-2_recon"),
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("data/output/full_scene_all_methods_20260622_final/diff_by_site_id"),
+        default=Path("data/tests/diff_by_site_id"),
     )
     args = parser.parse_args()
 

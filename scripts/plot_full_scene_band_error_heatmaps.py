@@ -30,13 +30,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input",
         type=Path,
-        default=Path("data/output/evaluation/evaluation_summary.csv"),
+        default=Path("data/assets/records/reconstruction_evaluation/evaluation_summary.csv"),
         help="Evaluation summary CSV path.",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("data/output/figures"),
+        default=Path("data/assets/figures"),
         help="Directory for output PNG and CSV files.",
     )
     parser.add_argument(

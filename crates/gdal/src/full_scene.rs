@@ -661,9 +661,9 @@ mod tests {
     fn test_discover_sentinel_bands_real_location() {
         // The test data directory relative to workspace root.
         // CI won't have this; skip gracefully if missing.
-        let data_dir = Path::new("../../data/sentinel-2");
+        let data_dir = Path::new("../../data/raw/sentinel-2/16-sites");
         if !data_dir.is_dir() {
-            eprintln!("Skipping test: data/sentinel-2 not found");
+            eprintln!("Skipping test: data/raw/sentinel-2/16-sites not found");
             return;
         }
 
@@ -844,9 +844,9 @@ mod tests {
 
     #[test]
     fn test_extract_timestamps_from_real_file() {
-        let data_dir = Path::new("../../data/sentinel-2");
+        let data_dir = Path::new("../../data/raw/sentinel-2/16-sites");
         if !data_dir.is_dir() {
-            eprintln!("Skipping test: data/sentinel-2 not found");
+            eprintln!("Skipping test: data/raw/sentinel-2/16-sites not found");
             return;
         }
         let path = data_dir.join("COPERNICUS_S2_HARMONIZED_B2_lon104.2595_lat31.2170.tif");
@@ -888,9 +888,9 @@ mod tests {
 
     #[test]
     fn test_extract_full_scene_timestamps_smoke() {
-        let data_dir = Path::new("../../data/sentinel-2");
+        let data_dir = Path::new("../../data/raw/sentinel-2/16-sites");
         if !data_dir.is_dir() {
-            eprintln!("Skipping test: data/sentinel-2 not found");
+            eprintln!("Skipping test: data/raw/sentinel-2/16-sites not found");
             return;
         }
         let path = data_dir.join("COPERNICUS_S2_HARMONIZED_B2_lon104.2595_lat31.2170.tif");
@@ -1196,9 +1196,9 @@ mod tests {
 
     #[test]
     fn test_choose_shared_target_matches_python_contract() {
-        let data_dir = Path::new("../../data/sentinel-2");
+        let data_dir = Path::new("../../data/raw/sentinel-2/16-sites");
         if !data_dir.is_dir() {
-            eprintln!("Skipping test: data/sentinel-2 not found");
+            eprintln!("Skipping test: data/raw/sentinel-2/16-sites not found");
             return;
         }
 
@@ -1372,9 +1372,9 @@ mod tests {
 
     #[test]
     fn test_b2_holdout_matches_python_contract() {
-        let data_dir = Path::new("../../data/sentinel-2");
+        let data_dir = Path::new("../../data/raw/sentinel-2/16-sites");
         if !data_dir.is_dir() {
-            eprintln!("Skipping test: data/sentinel-2 not found");
+            eprintln!("Skipping test: data/raw/sentinel-2/16-sites not found");
             return;
         }
         let path = data_dir.join("COPERNICUS_S2_HARMONIZED_B2_lon104.2595_lat31.2170.tif");

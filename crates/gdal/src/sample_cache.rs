@@ -144,7 +144,12 @@ pub fn build_sample_cache(options: &SampleCacheBuildOptions) -> Result<SampleCac
         bail!("max_attempts_multiplier must be > 0");
     }
 
-    let source_root = options.scene_cache_root.join(&options.source_name);
+    let nested_source_root = options.scene_cache_root.join(&options.source_name);
+    let source_root = if nested_source_root.is_dir() {
+        nested_source_root
+    } else {
+        options.scene_cache_root.clone()
+    };
     let mut scenes = discover_scene_sources(&source_root, &options.source_name)?;
     if let Some(limit) = options.limit_scenes {
         scenes.truncate(limit);
