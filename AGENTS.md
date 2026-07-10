@@ -6,6 +6,15 @@
 - Treat `NUFROST`, `Zhu2015`, and `HANTS` as three separate reconstruction algorithms. `Zhu2015` and `HANTS` are comparison baselines, not sub-parts of NUFROST.
 - In prose and docs, write the algorithm name as `NUFROST`; keep Rust crate identifiers lowercase/kebab-case (`nufrost-core`, `hants-core`, `zhu2015-core`).
 
+## Branch Policy
+
+- Always retain the long-lived branches `main`, `develop`, `paper`, and `feature/nufrost-cd`.
+- Name feature branches with the `feature/` prefix.
+- Name experimental branches with the `exp/` prefix.
+- Name temporary Codex branches with the `codex/` prefix.
+- Name backup or archived branches with the `archive/` prefix.
+- Do not delete or rename existing branches without explicit user approval.
+
 ## Rust Layout
 
 - `crates/gdal`: GeoTIFF/VRT I/O, timestamp parsing, full-scene helpers, generic raster traversal.
